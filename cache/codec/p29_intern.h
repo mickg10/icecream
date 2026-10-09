@@ -9,6 +9,7 @@
 #include <span>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace icecc::codec {
 
@@ -58,6 +59,20 @@ struct P29InternLayout {
 // Occupancy of the tables, in the units P29InternLayout sizes them in.
 // process() fails once an arena, or a hash table that cannot grow, is full.
 // Every Region also occupies one region-index slot.
+// One planned region: the canonical split's length and sampled hash, plus
+// the id the lock-free planning probe found (kNone-encoded as all-ones when
+// the region was not published at plan time).  Defined at namespace scope so
+// non-template callers can hold a plan across the lock boundary.
+struct P29RegionPlanEntry {
+    std::uint32_t len = 0;
+    std::uint64_t hash = 0;
+    // std::numeric_limits<std::uint32_t>::max() encodes "miss at plan time";
+    // keep it named so callers do not hardcode it.
+    static constexpr std::uint32_t kNone =
+        std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t id = kNone;
+};
+
 struct P29InternUsage {
     std::size_t tiny_slots = 0;
     std::size_t short_slots = 0;
@@ -138,13 +153,30 @@ inline constexpr unsigned kMaxLevels = 16;
 template <class Slot> struct Levels {
     Slot *slots[kMaxLevels] = {};
     std::size_t capacity[kMaxLevels] = {};
-    unsigned count = 0;
+    // Published count: the single writer sets slots[level]/capacity[level]
+    // BEFORE publishing count with release, so a concurrent reader that
+    // acquires count may safely iterate every level < count (slots and
+    // capacity below it are immutable once published; levels are only
+    // ever added, never removed).
+    std::atomic<unsigned> count{0};
     std::size_t occupied = 0;
     std::size_t newest_occupied = 0;
 
+    // Writer-side convenience: the plain count value.
+    [[nodiscard]] unsigned count_value() const noexcept {
+        return count.load(std::memory_order_relaxed);
+    }
+    void publish_count(unsigned value) noexcept {
+        count.store(value, std::memory_order_release);
+    }
+    [[nodiscard]] unsigned published_count() const noexcept {
+        return count.load(std::memory_order_acquire);
+    }
+
     [[nodiscard]] std::size_t total_capacity() const noexcept {
         std::size_t total = 0;
-        for (unsigned level = 0; level != count; ++level)
+        for (unsigned level = 0;
+             level != count.load(std::memory_order_relaxed); ++level)
             total += capacity[level];
         return total;
     }
@@ -532,6 +564,85 @@ template <P29InternProvider Provider> class P29Interner {
         provider_.report_interner_usage(reserved_bytes_, committed_bytes());
     }
 
+    // The committed half of the two-phase intern.  `plan` is the result of
+    // plan_regions(bytes) (built OUTSIDE the writer lock); this runs under
+    // it.  Hit entries (id != kNone) are pushed directly: their records
+    // are immutable after publish and were content-validated at plan
+    // time.  Miss entries run the same grow+find+add_region path
+    // process() runs -- RE-FIND, because the single writer may have added
+    // the same region between the plan and now.  Training is exactly
+    // process()'s (next1/next2 on the previous region id).
+    //
+    // The successor shortcut (next1/next2 lookup) is NOT taken here: it is
+    // only a shortcut, its output is the same id the hash path finds (the
+    // boundary check forces the same region length, and exact-content
+    // regions are unique), so `regions` and the training updates are
+    // identical.  The only observable difference is the successor_hits_
+    // diagnostic counter, which no correctness or wire behavior reads.
+    //
+    // Every other process() behavior is preserved: the empty-input early
+    // return still reports usage, occurrences are counted per push, and
+    // failures inside the guarded region propagate unchanged.
+    template <class RegionOutput>
+    void process_planned(std::span<const std::uint8_t> bytes,
+                          const std::vector<P29RegionPlanEntry> &plan,
+                          RegionOutput &regions, bool train = true) {
+        if (bytes.empty()) {
+            provider_.report_interner_usage(reserved_bytes_, committed_bytes());
+            return;
+        }
+        const std::uint8_t *position = bytes.data();
+        const std::uint8_t *end = position + bytes.size();
+        std::uint32_t previous = kNone;
+        for (const P29RegionPlanEntry &entry : plan) {
+            std::uint32_t region_id = entry.id;
+            if (region_id == kNone) {
+                // Miss at plan time: the full writer path (grow, find,
+                // add_region).  Another writer may have added this region
+                // since the plan was made; find() observes it.
+                grow(region_index_, P29InternAllocation::RegionIndex);
+                std::uint32_t *open_region_slot = nullptr;
+                if (const std::uint32_t *match = find(
+                        region_index_, entry.hash,
+                        [&](std::uint32_t encoded) {
+                            const auto &candidate = region_records_[encoded - 1];
+                            return candidate.hash == entry.hash &&
+                                   candidate.raw_len == entry.len &&
+                                   std::memcmp(region_bytes_ + candidate.raw_off,
+                                               position, entry.len) == 0;
+                        },
+                        open_region_slot)) {
+                    region_id = *match - 1;
+                } else {
+                    if (!open_region_slot)
+                        fail("P29 Region table is full");
+                    region_id = add_region(position, entry.len, entry.hash,
+                                           *open_region_slot);
+                }
+            }
+            regions.push_back(region_id);
+            ++region_occurrences_;
+            if (train && previous != kNone) {
+                auto &prior = region_records_[previous];
+                const std::uint32_t encoded = region_id + 1;
+                if (!prior.next1)
+                    prior.next1 = encoded;
+                else if (prior.next1 != encoded && !prior.next2)
+                    prior.next2 = encoded;
+            }
+            previous = region_id;
+            position += entry.len;
+        }
+        // The plan must describe exactly this byte span: the entries'
+        // lengths are the canonical split's, so consuming them all must
+        // land on end.  A plan for any other span is a caller bug, not a
+        // hashing subtlety, so it fails loudly rather than interning
+        // nonsense.
+        if (position != end)
+            fail("P29 planned region lengths differ from the input");
+        provider_.report_interner_usage(reserved_bytes_, committed_bytes());
+    }
+
     [[nodiscard]] std::uint32_t
     intern_line(std::span<const std::uint8_t> bytes) {
         if (bytes.size() > std::numeric_limits<std::uint32_t>::max())
@@ -586,6 +697,39 @@ template <P29InternProvider Provider> class P29Interner {
         return {region_bytes_ + record.raw_off, record.raw_len};
     }
 
+    // The read-only planning walk: the exact canonical split process()
+    // performs, with a hash-table probe per region.  The caller holds NO
+    // lock; the single writer may be interning concurrently.  Every hit id
+    // this phase emits was content-validated against a published region
+    // record (immutable after publish, validated with an acquire on
+    // region_count_), so process_planned() may push it without
+    // re-probing.  This phase NEVER touches the provider, next1/next2,
+    // stats, or any writer-only counter.
+    [[nodiscard]] std::vector<P29RegionPlanEntry>
+    plan_regions(std::span<const std::uint8_t> bytes) const {
+        std::vector<P29RegionPlanEntry> plan;
+        if (bytes.empty())
+            return plan;
+        const std::uint8_t *position = bytes.data();
+        const std::uint8_t *end = position + bytes.size();
+        while (position < end) {
+            const std::uint8_t *next =
+                p29_intern_detail::next_region(position, end);
+            const std::size_t wide_length = std::size_t(next - position);
+            if (wide_length > std::numeric_limits<std::uint32_t>::max())
+                fail("P29 Region exceeds u32 length");
+            const std::uint32_t raw_length =
+                static_cast<std::uint32_t>(wide_length);
+            const std::uint64_t hash =
+                p29_intern_detail::sampled_hash(position, raw_length) | 1ULL;
+            const std::uint32_t id =
+                find_published_region(hash, raw_length, position);
+            plan.push_back(P29RegionPlanEntry{raw_length, hash, id});
+            position = next;
+        }
+        return plan;
+    }
+
   private:
     static constexpr std::uint32_t kNone =
         std::numeric_limits<std::uint32_t>::max();
@@ -614,8 +758,13 @@ template <P29InternProvider Provider> class P29Interner {
     template <class Slot>
     void open_level(p29_intern_detail::Levels<Slot> &table,
                     P29InternAllocation kind, std::size_t capacity) {
-        table.slots[table.count] = allocate<Slot>(kind, capacity);
-        table.capacity[table.count++] = capacity;
+        const unsigned level = table.count_value();
+        table.slots[level] = allocate<Slot>(kind, capacity);
+        table.capacity[level] = capacity;
+        // Publish AFTER slots[level]/capacity[level] are stored, so a
+        // concurrent reader that acquires this count never sees a level
+        // whose slots/capacity are not yet written.
+        table.publish_count(level + 1);
         table.newest_occupied = 0;
     }
 
@@ -623,9 +772,9 @@ template <P29InternProvider Provider> class P29Interner {
     // provider's budget admits it; otherwise the newest level fills up.
     template <class Slot>
     void grow(p29_intern_detail::Levels<Slot> &table, P29InternAllocation kind) {
-        const std::size_t capacity = table.capacity[table.count - 1];
+        const std::size_t capacity = table.capacity[table.count_value() - 1];
         if (4 * table.newest_occupied < 3 * capacity ||
-            table.count == p29_intern_detail::kMaxLevels)
+            table.count_value() == p29_intern_detail::kMaxLevels)
             return;
         const std::size_t bytes =
             p29_intern_detail::checked_product(2 * capacity, sizeof(Slot));
@@ -641,13 +790,13 @@ template <P29InternProvider Provider> class P29Interner {
     [[nodiscard]] Slot *find(p29_intern_detail::Levels<Slot> &table,
                              std::uint64_t hash, Match match, Slot *&open) {
         open = nullptr;
-        for (unsigned level = 0; level != table.count; ++level) {
+        for (unsigned level = 0; level != table.count_value(); ++level) {
             const std::size_t mask = table.capacity[level] - 1;
             std::size_t slot = hash & mask;
             for (std::size_t probes = 0; probes <= mask; ++probes) {
                 Slot &candidate = table.slots[level][slot];
                 if (!p29_intern_detail::occupied(candidate)) {
-                    if (level + 1 == table.count)
+                    if (level + 1 == table.count_value())
                         open = &candidate;
                     break;
                 }
@@ -658,6 +807,44 @@ template <P29InternProvider Provider> class P29Interner {
         }
         return nullptr;
     }
+
+    // Read-only sibling of find() for the lock-free planning phase.
+    // Probes exactly the same levels/slots the writer's find() would, in
+    // the same order (oldest level first), with acquire loads on every
+    // slot so a slot published by a concurrent writer is observed whole.
+    // NEVER touches the provider, next1/next2, stats, or any writer-only
+    // counter.  Returns the region id (the slot value - 1) on a match, or
+    // kNone when no published slot matches.
+    [[nodiscard]] std::uint32_t
+    find_published_region(std::uint64_t hash, std::uint32_t raw_length,
+                          const std::uint8_t *position) const {
+        using namespace p29_intern_detail;
+        const std::size_t published = region_count_.load(std::memory_order_acquire);
+        for (unsigned level = 0; level != region_index_.published_count();
+             ++level) {
+            const std::size_t mask = region_index_.capacity[level] - 1;
+            std::size_t slot = hash & mask;
+            for (std::size_t probes = 0; probes <= mask; ++probes) {
+                const std::uint32_t encoded =
+                    std::atomic_ref<const std::uint32_t>(
+                        region_index_.slots[level][slot])
+                        .load(std::memory_order_acquire);
+                if (encoded == 0)
+                    break;  // free slot: nothing later in this level matches
+                if (encoded - 1 < published) {
+                    const auto &candidate = region_records_[encoded - 1];
+                    if (candidate.hash == hash &&
+                        candidate.raw_len == raw_length &&
+                        std::memcmp(region_bytes_ + candidate.raw_off,
+                                     position, raw_length) == 0)
+                        return encoded - 1;
+                }
+                slot = (slot + 1) & mask;
+            }
+        }
+        return kNone;
+    }
+
 
     template <class Slot> static void claim(p29_intern_detail::Levels<Slot> &table) {
         ++table.occupied;
@@ -814,7 +1001,13 @@ template <P29InternProvider Provider> class P29Interner {
             0,
             0,
         };
-        index_slot = region_id + 1;
+        // Publish the region-index slot with release so a concurrent
+        // planning reader that acquires the slot value also observes the
+        // fully-written record and arena bytes above (the acquire on
+        // region_count_ in find_published_region additionally validates the
+        // record id against the published count before it is used).
+        std::atomic_ref<std::uint32_t>(index_slot)
+            .store(region_id + 1, std::memory_order_release);
         claim(region_index_);
         region_count_.store(region_count + 1, std::memory_order_release);
         return region_id;

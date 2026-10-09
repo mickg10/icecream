@@ -4,6 +4,7 @@
 #include "protocol50.h"
 #include "codec/p29_online_s1.h"
 #include "codec/p29_need_expectation.h"
+#include "codec/p29_intern.h"
 
 #include <array>
 #include <chrono>
@@ -325,6 +326,22 @@ private:
     PreparedTUPtr intern_p29v1_locked(std::span<const uint8_t> exact_input,
                                       TuSeq tu_seq,
                                       Digest128 exact_digest);
+    // The read-only planning half of the two-phase intern: the canonical
+    // region split plus a lock-free probe of published regions.  Runs
+    // OUTSIDE the C-wide source mutex; the single writer may intern
+    // concurrently (no data race: the published count and index slots are
+    // release/acquire, and records/arenas never move).  Throws the same
+    // length_error a locked intern would for an over-long region.
+    std::vector<codec::P29RegionPlanEntry> plan_p29v1(
+        std::span<const uint8_t> exact_input) const;
+    // The locked half driven by a plan from plan_p29v1(): hits are pushed
+    // without re-probing, misses re-find (another writer may have added the
+    // region since the plan).  Same guarded region, same stats, same
+    // failure shape as intern_p29v1_locked.
+    PreparedTUPtr intern_p29v1_locked_planned(
+        std::span<const uint8_t> exact_input,
+        std::vector<codec::P29RegionPlanEntry> plan,
+        TuSeq tu_seq, Digest128 exact_digest);
     // The unlocked half of prepare_p29v1_at_seq: a pure read over the
     // interner's published regions (region_bytes() is concurrent-read
     // safe).  Throws exactly the same logic_error strings the combined

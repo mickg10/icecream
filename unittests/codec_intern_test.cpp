@@ -769,6 +769,118 @@ void check_next_region_differential() {
               << "trials)\n";
 }
 
+// Differential identity for the two-phase intern: process() (the locked
+// single-pass path) vs plan_regions() + process_planned() (the split path
+// the client now takes).  On a FRESH interner pair fed the same TU
+// sequence, every TU must produce the identical dense_regions, and the
+// two interners must end with identical state (region count, distinct
+// lines, occurrences, committed bytes).  Includes the stale-plan case
+// (plan TU2/TU3 against a snapshot taken BEFORE TU1 commits) and TUs
+// that repeat a brand-new region internally.
+void check_process_planned_differential() {
+    const auto make_interner = [] {
+        P29InternLayout layout = small_layout(64);
+        layout.region_capacity = 4096;
+        layout.line_reference_capacity = 16384;
+        layout.line_bytes_capacity = 1 << 18;
+        layout.region_bytes_capacity = 1 << 18;
+        layout.region_line_id_capacity = 1 << 14;
+        auto provider = std::make_unique<MmapProvider>(
+            independent_reservation(layout) + (1 << 20));
+        auto interner = std::make_unique<P29Interner<MmapProvider>>(
+            *provider, layout);
+        return std::pair{std::move(interner), std::move(provider)};
+    };
+
+    // Synthetic linemarker-heavy corpus: shared regions across TUs, TUs
+    // that repeat a new region internally, a TU with a trailing fragment,
+    // and a TU with no boundary at all.
+    const std::vector<std::string> tus = {
+        "# 1 \"a\"\nalpha\n# 2 \"b\"\nbeta beta\n# 3 \"c\"\ngamma\n",
+        "# 1 \"a\"\nalpha\n# 2 \"b\"\nbeta beta\n# 4 \"d\"\ndelta\n",
+        // Repeats a brand-new region twice internally.
+        "# 5 \"e\"\nepsilon\n# 5 \"e\"\nepsilon\n# 6 \"f\"\nzeta\n",
+        // No linemarker at all: one whole-TU region.
+        "just one region, no boundary inside\n",
+        // Trailing fragment after the last boundary (region end == TU end).
+        "# 7 \"g\"\neta tail without a final boundary marker\n",
+        // A '#' that is not a boundary ('#' without preceding newline).
+        "no newline before # here\n# 8 \"h\"\ntheta\n",
+    };
+
+    auto [plain_interner, plain_provider] = make_interner();
+    auto [planned_interner, planned_provider] = make_interner();
+
+    auto interned_state = [](P29Interner<MmapProvider> &interner) {
+        std::string state;
+        state += "regions=" + std::to_string(interner.distinct_regions());
+        state += " lines=" + std::to_string(interner.distinct_lines());
+        state += " occurrences=" +
+                 std::to_string(interner.region_occurrences());
+        state += " committed=" + std::to_string(interner.committed_bytes());
+        return state;
+    };
+
+    for (const std::string &text : tus) {
+        std::vector<std::uint32_t> plain_regions;
+        plain_interner->process(bytes(text), plain_regions);
+        // Fresh-plan the SAME input on the other interner: the plan is
+        // built against the state before this TU is interned there.
+        const std::vector<icecc::codec::P29RegionPlanEntry> plan =
+            planned_interner->plan_regions(bytes(text));
+        std::vector<std::uint32_t> planned_regions;
+        planned_interner->process_planned(bytes(text), plan, planned_regions);
+        require(plain_regions == planned_regions,
+                "process_planned dense_regions differ from process() for "
+                "input: \"" + text + "\"");
+        require(interned_state(*plain_interner) ==
+                    interned_state(*planned_interner),
+                "interner state diverged between process() and "
+                "process_planned() for input: \"" + text + "\" (" +
+                    interned_state(*plain_interner) + " vs " +
+                    interned_state(*planned_interner) + ")");
+    }
+
+    // Stale-plan case: plan TU2 and TU3 against a snapshot taken BEFORE
+    // TU1 commits, then commit in order.  TU2's plan may say "miss" for
+    // a region TU1 added meanwhile (the re-find under the writer lock
+    // must then hit), and TU3's plan may say "hit" for a region that was
+    // already published (still valid: records never move).
+    auto [stale_interner, stale_provider] = make_interner();
+    std::vector<std::uint32_t> stale_regions1;
+    stale_interner->process(bytes(tus[0]), stale_regions1);
+    // Snapshot plans for TU1(again) and TU2 against this state.
+    const std::vector<icecc::codec::P29RegionPlanEntry> stale_plan_tu1 =
+        stale_interner->plan_regions(bytes(tus[0]));
+    const std::vector<icecc::codec::P29RegionPlanEntry> stale_plan_tu2 =
+        stale_interner->plan_regions(bytes(tus[1]));
+    // A DIFFERENT interner interns TU0..TU2 the plain way for reference.
+    auto [ref_interner, ref_provider] = make_interner();
+    std::vector<std::uint32_t> ref1, ref2;
+    ref_interner->process(bytes(tus[0]), ref1);
+    ref_interner->process(bytes(tus[1]), ref2);
+    // Now consume the stale plans IN ORDER on the stale interner.
+    std::vector<std::uint32_t> stale1, stale2;
+    stale_interner->process_planned(bytes(tus[0]), stale_plan_tu1, stale1);
+    stale_interner->process_planned(bytes(tus[1]), stale_plan_tu2, stale2);
+    require(stale1 == ref1 && stale2 == ref2,
+            "stale-plan process_planned output differs from the process() "
+            "reference sequence");
+
+    // The SAME TU re-fed twice through the split path (warm-hit plan).
+    std::vector<std::uint32_t> warm1, warm2;
+    const std::vector<icecc::codec::P29RegionPlanEntry> warm_plan =
+        stale_interner->plan_regions(bytes(tus[2]));
+    stale_interner->process_planned(bytes(tus[2]), warm_plan, warm1);
+    const std::vector<icecc::codec::P29RegionPlanEntry> warm_plan2 =
+        stale_interner->plan_regions(bytes(tus[2]));
+    stale_interner->process_planned(bytes(tus[2]), warm_plan2, warm2);
+    require(warm1 == warm2 && !warm1.empty(),
+            "warm re-plan of the same TU differs");
+
+    std::cout << "codec_intern: process_planned differential check PASS\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -776,6 +888,7 @@ int main(int argc, char **argv) {
         check_match_extend_simd();
         allocation_controls();
         check_next_region_differential();
+        check_process_planned_differential();
         const std::size_t committed_first = accounting_control_once();
         const std::size_t committed_second = accounting_control_once();
         require(committed_first == committed_second,

@@ -1214,12 +1214,38 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
                 PreparedInputEnvelope{envelope.begin, envelope.body});
         } else if (route.profile == ProfileId::P29V1) {
             if (!shared->p29_source) {
+                // Owner-side fallback (rare: no prepared source was
+                // installed).  route_state() already enabled P29V1 for this
+                // route, so the interner exists; plan OUTSIDE the C-wide
+                // lock exactly as prepare_source does, then intern the plan
+                // under it.  The catch keeps today's translation: only the
+                // interner's own non-runnable marking becomes
+                // P29V1CapabilityUnavailable; the per-TU size check stays
+                // an ordinary length_error.
+                const std::vector<codec::P29RegionPlanEntry> fallback_plan =
+                    impl_->p29_authority->plan_p29v1(exact_input);
                 if (!source_lock.owns_lock())
                     source_lock.lock();
                 try {
                     shared->p29_source =
-                        impl_->p29_authority->prepare_p29v1_at_seq(
-                            exact_input, shared->tu_seq, shared->raw_digest);
+                        impl_->p29_authority->intern_p29v1_locked_planned(
+                            exact_input, fallback_plan, shared->tu_seq,
+                            shared->raw_digest);
+                    // Verify under this owner-side lock (the contended
+                    // per-transfer threads do not take this path).  A
+                    // verify failure marks non-runnable exactly as
+                    // prepare_p29v1_at_seq does, so the translation below
+                    // sees the same owner state either way.
+                    try {
+                        impl_->p29_authority->verify_p29v1_materialization(
+                            shared->p29_source->dense_regions, exact_input);
+                    } catch (const std::exception& error) {
+                        impl_->p29_authority->mark_p29v1_nonrunnable(error);
+                        throw;
+                    } catch (...) {
+                        impl_->p29_authority->mark_p29v1_nonrunnable_untyped();
+                        throw;
+                    }
                 } catch (...) {
                     /* The interner marks itself permanently non-runnable for
                        any failure after processing begins.  Translate only
@@ -1322,29 +1348,42 @@ P50PreparationAuthority::prepare_source(
     shared->raw_bytes = exact_input->size();
     shared->raw_digest = raw_digest;
     shared->raw = std::move(exact_input);
-    // Only the interner itself is serialized C-wide (single writer): the
-    // reserve/intern/commit triple runs under source_mutex, and the
-    // materialization-verify loop runs OUTSIDE it.  The verify is a pure
-    // read over already-published regions (region_bytes() is
-    // concurrent-read safe) and is the largest single term of the mutex
-    // hold, so holding the C-wide lock across it serialized the whole
-    // client.
+    // Only the interner's WRITE half is serialized C-wide (single writer).
+    // The O(raw) work -- the canonical split plus the hash probes -- runs
+    // OUTSIDE source_mutex (plan_p29v1, a lock-free read over published
+    // regions), the reserve/intern/commit triple runs INSIDE it, and the
+    // materialization-verify loop runs outside it too (a pure read over
+    // already-published regions).  Holding the C-wide lock across either
+    // read serialized the whole client.
+    //
+    // The plan phase needs the interner to exist: ensure_p29v1_locked()
+    // takes source_mutex itself, so it runs in its own short scope first.
     {
         std::lock_guard lock(impl_->source_mutex);
         impl_->ensure_p29v1_locked();
+    }
+    // Plan OUTSIDE the lock: the split walk + the read-only published
+    // probes.  The single writer may intern concurrently; every hit was
+    // content-validated against an immutable published record.
+    const std::vector<codec::P29RegionPlanEntry> plan =
+        impl_->p29_authority->plan_p29v1(*shared->raw);
+    {
+        std::lock_guard lock(impl_->source_mutex);
         const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
         shared->tu_seq = tu_seq;
         // Locked half of prepare_p29v1_at_seq: reserve, intern, stats.
-        // No verify loop here, and no catch here: intern_p29v1_locked
+        // No verify loop here, and no catch here: the planned intern
         // marks non-runnable itself for exactly the old guarded region
-        // (dense_regions.reserve + process + the injected failure), and
-        // its precondition throws stay ordinary typed exceptions, so a
-        // failed TU's reserved TU_SEQ is simply never committed.  That
-        // leaves a permanent TU_SEQ gap; that is legal (a reservation is
-        // committed only on success) and unobservable (the interner is
-        // non-runnable afterwards anyway, so no later TU can use the hole).
-        shared->p29_source = impl_->p29_authority->intern_p29v1_locked(
-            *shared->raw, tu_seq, raw_digest);
+        // (dense_regions.reserve + process_planned + the injected
+        // failure), and its precondition throws stay ordinary typed
+        // exceptions, so a failed TU's reserved TU_SEQ is simply never
+        // committed.  That leaves a permanent TU_SEQ gap; that is legal
+        // (a reservation is committed only on success) and unobservable
+        // (the interner is non-runnable afterwards anyway, so no later
+        // TU can use the hole).
+        shared->p29_source =
+            impl_->p29_authority->intern_p29v1_locked_planned(
+                *shared->raw, plan, tu_seq, raw_digest);
         impl_->p29_authority->commit_tu_seq(tu_seq);
     }
     // Verify OUTSIDE the C-wide mutex.  On failure, re-take the mutex and
