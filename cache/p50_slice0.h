@@ -401,7 +401,15 @@ public:
 
 private:
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
-    void record(ActionType action, const CActiveTx& active);
+    // queue_position is the emitting entry's 0-based index in active_queue_
+    // (0 = head/front).  Callers pass it explicitly: begin_v1 emits the back
+    // (size-1 after push), retire_locked_commits/abandon head records emit
+    // 0, and abandon_active enumerates the whole FIFO front-to-back.  The
+    // additive queue_position/queue_depth trace fields are stamped only
+    // when max_active_tx_ > 1 (route pipelining, P50_ROUTE_PIPELINING.md
+    // step 7); at depth 1 the ActionRecord bytes are unchanged.
+    void record(ActionType action, const CActiveTx& active,
+                size_t queue_position);
     void poison_v1() noexcept;
     void retire_locked_commits();
 

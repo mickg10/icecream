@@ -59,6 +59,17 @@ struct ActionRecord {
     // descriptor/component span (or materialized input span), rather than a
     // wall-clock or socket-buffer estimate.
     uint64_t stage_bytes = 0;
+    // Route-pipelining (P50_ROUTE_PIPELINING.md step 7): C-side-only,
+    // additive queue-position/depth of the emitting route's ACTIVE_TX FIFO.
+    // queue_position is the 0-based index of this transaction in C's
+    // active_queue_ at emit time (head = 0); queue_depth is the route's
+    // configured pipeline depth K.  Both stay unset at K == 1 (and on every
+    // F-side record), so a K=1 trace is byte-identical to a pre-pipelining
+    // trace and old fixtures parse unchanged.  Nothing wire-visible; only
+    // the in-repo checkers (cache/p50_actions.cpp, cache/formal/
+    // check_trace.py) consume them.
+    std::optional<uint32_t> queue_position;
+    std::optional<uint32_t> queue_depth;
 };
 
 class ActionTrace {

@@ -1922,7 +1922,8 @@ const CActiveTx& CRoute::begin_v1(
         active_queue_.push_back(std::move(active));
         p29v1_->answered_need.clear();
         p29v1_->fill_answered = false;
-        record(ActionType::TX_BEGIN, active_queue_.back());
+        record(ActionType::TX_BEGIN, active_queue_.back(),
+               active_queue_.size() - 1);
         return active_queue_.back();
     } catch (const std::exception& error) {
         if (p29v1_->serializer.has_pending()) {
@@ -2123,7 +2124,8 @@ void CRoute::reset_v1_route(FStoreGuid f_store_guid,
     reset_history(f_store_guid, history_nonce);
 }
 
-void CRoute::record(ActionType action, const CActiveTx& active) {
+void CRoute::record(ActionType action, const CActiveTx& active,
+                    size_t queue_position) {
     if (!trace_) return;
     ActionRecord record;
     record.action = action;
@@ -2145,6 +2147,13 @@ void CRoute::record(ActionType action, const CActiveTx& active) {
                                         active.begin.tu_seq,
                                         active.begin.transaction_digest)
             : active.begin.pre_state_digest;
+    // Additive route-pipelining telemetry (P50_ROUTE_PIPELINING.md step 7):
+    // stamped only on a K>1 route so depth-1 records stay byte-identical.
+    if (max_active_tx_ > 1) {
+        record.queue_position =
+            static_cast<uint32_t>(queue_position);
+        record.queue_depth = static_cast<uint32_t>(max_active_tx_);
+    }
     trace_->record(std::move(record));
 }
 
@@ -2181,7 +2190,7 @@ void CRoute::retire_locked_commits() {
         }
         state_digest_ = head_commit.post_state_digest;
         confirmed_cursor_.value = head.begin.rel_seq.value + 1;
-        record(head_action, head);
+        record(head_action, head, 0);
         active_queue_.pop_front();
     }
 }
@@ -2206,8 +2215,8 @@ void CRoute::accept_commit(const TxCommit& committed, ActionType action) {
 
 void CRoute::abandon_active() {
     if (active_queue_.empty()) return;
-    for (const CActiveTx& active : active_queue_)
-        record(ActionType::TX_ABORTED, active);
+    for (size_t index = 0; index != active_queue_.size(); ++index)
+        record(ActionType::TX_ABORTED, active_queue_[index], index);
     if (p29v1_ && p29v1_->serializer.has_pending())
         p29v1_->serializer.abandon();
     active_queue_.clear();

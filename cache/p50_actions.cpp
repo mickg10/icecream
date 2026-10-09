@@ -384,7 +384,16 @@ std::string action_jsonl(const ActionRecord& record) {
     }
     out << "],\"remaining_need\":" << record.remaining_need
         << ",\"duplicate\":" << (record.duplicate ? "true" : "false")
-        << ",\"stage_bytes\":" << record.stage_bytes << '}';
+        << ",\"stage_bytes\":" << record.stage_bytes;
+    // Route-pipelining additive fields: emitted only when set (i.e. only on
+    // C-side records of a K>1 route), so a K=1 record's bytes -- including
+    // this object's terminating '}' -- are identical to a pre-pipelining
+    // build's output.
+    if (record.queue_position)
+        out << ",\"queue_position\":" << *record.queue_position;
+    if (record.queue_depth)
+        out << ",\"queue_depth\":" << *record.queue_depth;
+    out << '}';
     return out.str();
 }
 
