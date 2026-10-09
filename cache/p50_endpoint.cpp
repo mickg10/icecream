@@ -1950,6 +1950,17 @@ struct P50ServerEndpoint::Impl {
         uint64_t f_apply_materialize_ns = 0;
     };
 
+    // step 5c: a connection parked in front of the live dialogue because its
+    // peeked TX_BEGIN rel_seq is ahead of the route's cursor. `io` is a
+    // weak_ptr purely so a route-level release can reach the socket
+    // (`io.lock()->socket.cancel()`) without itself extending that
+    // connection's lifetime -- the owning run_connected coroutine's own
+    // shared_ptr<ServerIoState> is the only thing keeping it alive.
+    struct ParkedWaiter {
+        std::weak_ptr<ServerIoState> io;
+        bool released = false;
+    };
+
     struct Route {
         HistoryNonce nonce{};
         RelSeq next_rel{};
@@ -1966,7 +1977,74 @@ struct P50ServerEndpoint::Impl {
         // a discarded continuing codec cannot honestly mirror that cursor.
         // Advertise no route until HISTORY_RESET replaces it.
         bool codec_history_reset_required = false;
+        // step 5c: connections parked ahead of next_rel, keyed by the
+        // rel_seq they are waiting for. See research/designs/
+        // P50_ROUTE_PIPELINING.md §1.2 point 5 for the release triggers.
+        std::map<uint64_t, std::vector<std::shared_ptr<ParkedWaiter>>> parked;
     };
+
+    // step 5c: register `io` as parked on `route` until `target` becomes the
+    // route's cursor. The caller's park loop must call forget_parked() with
+    // the returned handle once it stops waiting (released or not), so a
+    // connection that disconnects while parked never leaves a dangling entry
+    // behind for a later release to iterate over.
+    static std::shared_ptr<ParkedWaiter> park(
+        Route& route, RelSeq target, const std::shared_ptr<ServerIoState>& io) {
+        auto waiter = std::make_shared<ParkedWaiter>();
+        waiter->io = io;
+        route.parked[target.value].push_back(waiter);
+        return waiter;
+    }
+
+    static void forget_parked(Route& route, RelSeq target,
+                              const std::shared_ptr<ParkedWaiter>& waiter) {
+        const auto found = route.parked.find(target.value);
+        if (found == route.parked.end())
+            return;
+        std::vector<std::shared_ptr<ParkedWaiter>>& waiters = found->second;
+        waiters.erase(std::remove(waiters.begin(), waiters.end(), waiter),
+                     waiters.end());
+        if (waiters.empty())
+            route.parked.erase(found);
+    }
+
+    static void release_one(const std::shared_ptr<ParkedWaiter>& waiter) {
+        waiter->released = true;
+        if (const std::shared_ptr<ServerIoState> io = waiter->io.lock()) {
+            boost::system::error_code ignored;
+            io->socket.cancel(ignored);
+        }
+    }
+
+    // step 5c: wake every waiter parked on `route` at exactly `target` --
+    // the ordinary, single-successor release when the predecessor commits.
+    // Does not erase the registry entry itself; the woken park loop does
+    // that via forget_parked() so a waiter racing its own disconnect
+    // cleanup is never double-erased from here.
+    static void release_parked_at(Route& route, RelSeq target) {
+        const auto found = route.parked.find(target.value);
+        if (found == route.parked.end())
+            return;
+        for (const std::shared_ptr<ParkedWaiter>& waiter : found->second)
+            release_one(waiter);
+    }
+
+    // step 5c: bulk-release every connection parked anywhere on `route`,
+    // regardless of which rel_seq it is waiting for. Used by every release
+    // trigger other than "the exact predecessor committed" (abort,
+    // disconnect, HISTORY_RESET, cold adoption, sidecar stop/whole-namespace
+    // eviction) -- in each of those cases route.next_rel either changes
+    // discontinuously or the route itself is going away, so every parked
+    // connection must re-run stage()/the live path to see the real, current
+    // outcome rather than sleep waiting for a predecessor that will never
+    // commit.
+    static void release_all_parked(Route& route) {
+        for (auto& [rel_seq_value, waiters] : route.parked) {
+            for (const std::shared_ptr<ParkedWaiter>& waiter : waiters)
+                release_one(waiter);
+        }
+        route.parked.clear();
+    }
 
     struct Namespace {
         bool established = false;
@@ -2283,6 +2361,15 @@ struct P50ServerEndpoint::Impl {
         if (!namespace_is_evictable(c_guid))
             throw std::logic_error(
                 "F endpoint selected a live namespace for whole-namespace eviction");
+        // step 5c: this namespace's routes are about to disappear out from
+        // under any parked connection; wake every one of them now so each
+        // re-runs the live path (which will see the namespace gone) instead
+        // of sleeping forever on a route that no longer exists.
+        const auto position = namespaces.find(c_guid);
+        if (position != namespaces.end()) {
+            for (auto& [profile, route] : position->second.routes)
+                release_all_parked(route);
+        }
         global_resources->evict(c_guid);
         input_records.evict_namespace(c_guid);
         if (namespaces.erase(c_guid) != 1)
@@ -2732,6 +2819,14 @@ struct P50ServerEndpoint::Impl {
             release_pending(*route->pending);
             route->pending.reset();
         }
+        // step 5c: this connection was the route's active (unparked) TX;
+        // its disconnect means whatever cursor it would have produced on
+        // commit is never coming, so every connection parked behind it must
+        // wake and re-run the live path against the real outcome
+        // (interrupted/pending cleared above) instead of waiting on a
+        // commit that will never arrive.
+        if (route != nullptr)
+            release_all_parked(*route);
         if (route != nullptr && *session.profile == ProfileId::P29V1 &&
             route->dialogue_profile == ProfileId::P29V1 &&
             route->dialogue && route->dialogue->terminal())
@@ -2808,6 +2903,15 @@ struct P50ServerEndpoint::Impl {
                                reset);
         if (*session.profile == ProfileId::P29V1)
             invalidate_p29v1_codec(*session.c_guid, space);
+        // step 5c: insert_or_assign below wholesale-replaces the Route
+        // object. Any connection parked on the OLD route would otherwise be
+        // stranded -- nothing would ever call socket.cancel() on it again
+        // once the registry copy it is parked in is destroyed. Wake them
+        // all now so each re-runs the live path and sees the new,
+        // reset route (which will reject a stale-epoch BEGIN through the
+        // ordinary history_nonce mismatch path).
+        if (Route* const old_route = find_route(space, *session.profile))
+            release_all_parked(*old_route);
         space.established = true;
         space.nonce_high_water[*session.profile] = reset.history_nonce;
         space.routes.insert_or_assign(
@@ -3180,6 +3284,11 @@ struct P50ServerEndpoint::Impl {
         advance_revision(revision);
         route.state = materialized.commit.post_state_digest;
         ++route.next_rel.value;
+        // step 5c: wake exactly the successor (if any) parked waiting for
+        // this rel_seq to become the route's cursor. Ordinary, single-
+        // successor release path -- every other trigger is a bulk release
+        // via release_all_parked() elsewhere.
+        release_parked_at(route, route.next_rel);
         route.last_commit = materialized.commit;
         route.interrupted.reset();
         pending.dialogue->commit_visible(materialized.commit);
@@ -4361,14 +4470,185 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 }
             }
         }
+        // step 5c (route pipelining, F side): admission / park gate. Decide,
+        // from the step-5b peek, whether this connection's first TX_BEGIN is
+        // the route's next TX (K=1-identical fall-through) or an
+        // already-known-ahead-of-cursor successor. If ahead, park here --
+        // idle, opportunistically draining whatever further bytes land on
+        // the raw socket into a local buffer, never blocking on anything
+        // but the socket itself -- until a release trigger wakes it, then
+        // fall through to the completely unchanged stage()/HISTORY_RESET/
+        // BEGIN/BODY path below, reading from the drained buffer first and
+        // the live socket after, exactly as if those bytes had arrived only
+        // now. See research/designs/P50_ROUTE_PIPELINING.md §1.2 points
+        // 1-5.
+        //
+        // Everything above this point (the HELLO read, the step-5b peek)
+        // is read-only with respect to shared route state. Everything
+        // below (stage()'s STATE write, HISTORY_RESET, BEGIN, BODY/NEED/
+        // FILL) reads or mutates the route's shared, scalar cursor and
+        // must not run early for a successor TX -- that is the whole
+        // reason this gate exists.
+        std::vector<Frame> buffered_frames;
+        std::size_t buffered_frame_index = 0;
+        if (result.f_hello_time_peeked_begin_rel_seq) {
+            const RelSeq peeked_rel = *result.f_hello_time_peeked_begin_rel_seq;
+            const auto namespace_position =
+                impl_->namespaces.find(hello.c_store_guid);
+            Impl::Route* route = nullptr;
+            if (namespace_position != impl_->namespaces.end()) {
+                const ProfileId profile =
+                    require_single_route_profile(selection.negotiated_profiles);
+                route = Impl::find_route(namespace_position->second, profile);
+            }
+            // Only an established route with a cursor defines "ahead of
+            // next_rel". A brand-new/pre-HISTORY_RESET route, or a peeked
+            // rel_seq at or behind the cursor, falls through unchanged and
+            // lets the existing mismatch logic in FStore::begin /
+            // Impl::prepare_begin decide (desync, stale replay, replay of
+            // an already-applied TX, etc. -- no new rejection path is
+            // introduced here). F has no visibility into C's pipeline
+            // depth K -- that admission gate is entirely C-side
+            // (cache/p50_cache_service.cpp's
+            // SidecarRuntime::RouteGate) -- and does not need it: treating
+            // every ahead-of-cursor rel_seq as parkable is a safe
+            // superset, since C itself already bounds how many successors
+            // it ever opens concurrently to K-1.
+            if (route != nullptr && peeked_rel.value > route->next_rel.value) {
+                // step 5c: a HISTORY_RESET cold-starts the epoch -- the TLA
+                // model (research/designs/P50_ROUTE_PIPELINING.md's formal
+                // companion) treats it as a cold epoch change, and this
+                // route's pre-reset cursor must never gate a post-reset
+                // BEGIN. Re-peek (nothing has been consumed since the
+                // step-5b peek; this observes the identical bytes) and scan
+                // frame order: if a HISTORY_RESET precedes the TX_BEGIN in
+                // this batch, skip parking entirely so the unchanged
+                // HISTORY_RESET-vs-BEGIN dispatch below processes the reset
+                // -- and only then the BEGIN, against the fresh epoch's own
+                // cursor -- exactly as it would without this gate. The same
+                // pass derives this park's anti-DoS drain ceiling from the
+                // TX's own self-declared wire size (raw_bytes covers the
+                // P29V1 inner stream; body.encoded_bytes covers the outer
+                // Protocol-50 BODY component) when parking does proceed;
+                // that ceiling bounds memory only -- it is not a
+                // protocol-correctness check, and the unchanged decode path
+                // downstream still verifies every digest once this TX is
+                // actually processed.
+                bool history_reset_precedes_begin = false;
+                bool begin_seen = false;
+                std::size_t drain_ceiling = 1u << 20;
+                {
+                    boost::system::error_code order_avail_error;
+                    const std::size_t order_available =
+                        socket.available(order_avail_error);
+                    if (!order_avail_error && order_available > 0) {
+                        std::vector<uint8_t> order_buffer(order_available);
+                        boost::system::error_code order_recv_error;
+                        const std::size_t order_peeked = socket.receive(
+                            asio::buffer(order_buffer),
+                            tcp::socket::message_peek, order_recv_error);
+                        if (!order_recv_error) {
+                            FrameParser order_parser(
+                                selection.limits.max_frame_payload);
+                            for (const Frame& order_frame : order_parser.feed(
+                                     std::span<const uint8_t>(
+                                         order_buffer.data(), order_peeked))) {
+                                if (order_frame.type == MessageType::HISTORY_RESET) {
+                                    history_reset_precedes_begin = true;
+                                    break;
+                                }
+                                if (order_frame.type == MessageType::TX_BEGIN) {
+                                    const TxBegin order_begin =
+                                        decode_as<TxBegin>(order_frame);
+                                    drain_ceiling =
+                                        static_cast<std::size_t>(
+                                            order_begin.raw_bytes +
+                                            order_begin.body.encoded_bytes) *
+                                            2 +
+                                        (1u << 20);
+                                    begin_seen = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!history_reset_precedes_begin && begin_seen) {
+                    const std::shared_ptr<Impl::ParkedWaiter> waiter =
+                        Impl::park(*route, peeked_rel, io);
+                    FrameParser drain_parser(selection.limits.max_frame_payload);
+                    std::size_t drained_bytes_total = 0;
+                    bool drain_ceiling_exceeded = false;
+                    for (;;) {
+                        if (waiter->released)
+                            break;
+                        boost::system::error_code wait_error;
+                        co_await socket.async_wait(
+                            tcp::socket::wait_read,
+                            asio::redirect_error(asio::use_awaitable, wait_error));
+                        require_operation();
+                        if (waiter->released)
+                            break;
+                        if (wait_error) {
+                            Impl::forget_parked(*route, peeked_rel, waiter);
+                            throw boost::system::system_error(wait_error);
+                        }
+                        boost::system::error_code avail_error;
+                        const std::size_t available_bytes =
+                            socket.available(avail_error);
+                        if (avail_error) {
+                            Impl::forget_parked(*route, peeked_rel, waiter);
+                            throw boost::system::system_error(avail_error);
+                        }
+                        if (available_bytes == 0) {
+                            // A graceful close while parked surfaces here as a
+                            // readable-but-empty socket; treat it exactly like
+                            // any other mid-dialogue EOF.
+                            Impl::forget_parked(*route, peeked_rel, waiter);
+                            throw boost::system::system_error(asio::error::eof);
+                        }
+                        std::vector<uint8_t> drain_buffer(available_bytes);
+                        boost::system::error_code recv_error;
+                        const std::size_t drained_now = socket.receive(
+                            asio::buffer(drain_buffer), 0, recv_error);
+                        if (recv_error) {
+                            Impl::forget_parked(*route, peeked_rel, waiter);
+                            throw boost::system::system_error(recv_error);
+                        }
+                        drained_bytes_total += drained_now;
+                        if (drained_bytes_total > drain_ceiling) {
+                            drain_ceiling_exceeded = true;
+                            break;
+                        }
+                        for (Frame& drained_frame : drain_parser.feed(
+                                 std::span<const uint8_t>(drain_buffer.data(),
+                                                          drained_now)))
+                            buffered_frames.push_back(std::move(drained_frame));
+                    }
+                    Impl::forget_parked(*route, peeked_rel, waiter);
+                    if (drain_ceiling_exceeded)
+                        throw std::length_error(
+                            "F endpoint parked connection exceeded its declared TX size");
+                }
+            }
+        }
+        // step 5c: serve already-drained frames (buffered while parked)
+        // before falling through to the live socket. Mechanically the same
+        // async_read_frame() every other profile/path on this connection
+        // already uses -- just fed from a different source first.
+        const auto next_frame = [&]() -> asio::awaitable<Frame> {
+            if (buffered_frame_index < buffered_frames.size())
+                co_return std::move(buffered_frames[buffered_frame_index++]);
+            co_return co_await async_read_frame(
+                socket, selection.limits.max_frame_payload,
+                impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+        };
         SessionState state = impl_->stage(session, hello, selection);
         co_await async_write_message(socket, state, selection.limits.max_frame_payload,
                                      impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                      impl_->completions, control, verify);
 
-        Frame next = co_await async_read_frame(
-            socket, selection.limits.max_frame_payload,
-            impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+        Frame next = co_await next_frame();
         if (next.type == MessageType::HISTORY_RESET) {
             const HistoryReset reset = decode_as<HistoryReset>(next);
             impl_->validate_history_reset_candidate(session, reset);
@@ -4378,9 +4658,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             co_await async_write_message(socket, reset_ack, selection.limits.max_frame_payload,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                          impl_->completions, control, verify);
-            next = co_await async_read_frame(socket, selection.limits.max_frame_payload,
-                                             impl_->stamp(session, AsyncOperationKind::ReadHeader),
-                                             impl_->completions, verify);
+            next = co_await next_frame();
             // Diagnostic-only: sampled immediately after the BEGIN frame read
             // completes, before decode_as<TxBegin>, so this is F's receipt
             // time for the BEGIN bytes and excludes prepare/activate/install
@@ -4420,9 +4698,7 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     .count());
 
         do {
-            Frame component = co_await async_read_frame(
-                socket, selection.limits.max_frame_payload,
-                impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
+            Frame component = co_await next_frame();
             // The reducer owns message ordering, while the selected profile
             // owns BODY/NEED/FILL semantics. ZSTD_TU deliberately rejects
             // the interactive messages through its adapter; future profiles
