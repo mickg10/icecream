@@ -5603,6 +5603,52 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         // reason this gate exists.
         std::vector<Frame> buffered_frames;
         std::size_t buffered_frame_index = 0;
+        // Park and pre-park drains move raw bytes off the socket into a
+        // local FrameParser. When a drain stops (released, grace expiry,
+        // first-frame fall-through) that parser can still hold the head of
+        // a frame whose tail has not arrived yet -- a multi-MB BODY or FILL
+        // routinely straddles the release on a real route. Those bytes are
+        // already consumed, so the live reads below would resume mid-frame
+        // ("unknown frame type" / "frame payload exceeds configured cap";
+        // K2-2 farm leg, 2026-10-09). Finish that frame, and any frames
+        // completing in the same reads, from the socket until the parser
+        // sits exactly on a frame boundary. The drain's byte ceiling still
+        // applies, raised to the declared size of any TX_BEGIN drained so
+        // far (the same bound the park paths derive).
+        const auto declared_drain_ceiling = [](const TxBegin& begin) {
+            return static_cast<std::size_t>(begin.raw_bytes +
+                                            begin.body.encoded_bytes) *
+                       2 +
+                   (1u << 20);
+        };
+        const auto finish_partial_frame =
+            [&](FrameParser& parser, std::size_t& drained_total,
+                std::size_t ceiling) -> asio::awaitable<void> {
+            for (const Frame& frame : buffered_frames)
+                if (frame.type == MessageType::TX_BEGIN)
+                    ceiling = std::max(
+                        ceiling, declared_drain_ceiling(decode_as<TxBegin>(frame)));
+            std::vector<uint8_t> chunk;
+            while (parser.buffered_bytes() > 0) {
+                chunk.resize(64u << 10);
+                const std::size_t got = co_await socket.async_read_some(
+                    asio::buffer(chunk), asio::use_awaitable);
+                require_operation();
+                drained_total += got;
+                for (Frame& frame : parser.feed(
+                         std::span<const uint8_t>(chunk.data(), got))) {
+                    if (frame.type == MessageType::TX_BEGIN)
+                        ceiling = std::max(
+                            ceiling,
+                            declared_drain_ceiling(decode_as<TxBegin>(frame)));
+                    buffered_frames.push_back(std::move(frame));
+                }
+                if (drained_total > ceiling)
+                    throw std::length_error(
+                        "F endpoint parked connection exceeded its declared "
+                        "TX size");
+            }
+        };
         if (result.f_hello_time_peeked_begin_rel_seq) {
             const RelSeq peeked_rel = *result.f_hello_time_peeked_begin_rel_seq;
             const auto namespace_position =
@@ -5741,6 +5787,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     if (drain_ceiling_exceeded)
                         throw std::length_error(
                             "F endpoint parked connection exceeded its declared TX size");
+                    co_await finish_partial_frame(drain_parser,
+                                                  drained_bytes_total,
+                                                  drain_ceiling);
                 }
             }
         }
@@ -6008,6 +6057,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                         throw std::length_error(
                             "F endpoint pre-parked connection exceeded its "
                             "declared TX size");
+                    co_await finish_partial_frame(prepark_drain_parser,
+                                                  prepark_drained_total,
+                                                  prepark_ceiling);
                 }
             }
         }
