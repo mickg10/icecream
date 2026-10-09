@@ -3,6 +3,7 @@
 #include "comm.h"
 #include "../services/digest128.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstdio>
@@ -3508,6 +3509,306 @@ void test_owner_lag_trace_default_off_then_emits_per_second_line() {
     CHECK(trace.find("\"owner_cpu_ns\":") != std::string::npos);
 }
 
+// --- Route transfer-lock regression (K2-0, 2026-10-09) ---------------------
+//
+// SidecarRuntime::transfer_source_on_owner (cache/p50_cache_service.cpp)
+// serializes same-route source transfers on one per-route timed_mutex. Route
+// pipelining step 4c started releasing that lock at the FILL write-complete
+// for EVERY depth; at K=1 that admitted a concurrent same-route successor
+// into prepare_for_route while its predecessor was still uncommitted, the
+// depth-1 admission bound refused it, and the sticky cold-replacement path
+// replaced the client sidecar (the fix gates the early release on
+// route_pipeline_depth_ > 1). The two tests below drive the REAL
+// transfer_source_on_owner path against a real F (an in-process SidecarRuntime
+// behind CapacityFront) with N concurrent transfers for ONE route and the
+// head's F-side commit deliberately stalled, so the head's "FILL on the wire,
+// uncommitted" window -- exactly where a premature lock release shows -- is
+// held open deterministically instead of raced for.
+//
+// F-side head stall: the first materialized TX's commit path on F's owner
+// thread (P50ServerEndpointConfig::input_job_state, which SidecarRuntime wraps
+// around the input lifecycle) blocks until the test releases it. Successors
+// park on F before their own materialize (their stage is deferred until the
+// predecessor commits), so exactly one gate entry exists per storm.
+struct HeadCommitGate {
+    HeadCommitGate() : released(release.get_future()) {}
+    ~HeadCommitGate() { free(); }
+    HeadCommitGate(const HeadCommitGate&) = delete;
+    HeadCommitGate& operator=(const HeadCommitGate&) = delete;
+
+    // The input_job_state callback, installed on the F runtime's config.
+    InputJobState f_input_job_state(CStoreGuid, const TxBegin&, const TxCommit&,
+                                    std::span<const uint8_t>) {
+        if (!armed_once.exchange(true)) {
+            entered.store(true, std::memory_order_release);
+            released.wait();
+        }
+        return InputJobState::Open;
+    }
+
+    void free() {
+        const bool already = freed.exchange(true);
+        if (!already) {
+            try {
+                release.set_value();
+            } catch (...) {
+            }
+        }
+    }
+
+    std::promise<void> release;
+    std::future<void> released;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> armed_once{false};
+    std::atomic<bool> freed{false};
+};
+
+// Shared C-side observables for one storm. The before-prepare hook fires on
+// the C owner executor inside transfer_bytes immediately before
+// prepare_for_route: a transfer that reaches it has been admitted past the
+// route lock AND the endpoint window slot wait, so its count is exactly the
+// "who got into the pipeline" probe both tests assert against.
+struct RouteStormObservation {
+    std::atomic<size_t> prepare_entries{0};
+    std::atomic<size_t> completed{0};
+    std::atomic<size_t> replacement_results{0};
+    std::atomic<size_t> fail_stops{0};
+};
+
+constexpr size_t kStormTransfers = 8;
+
+// One storm: N concurrent transfers for one route against one real F, with
+// the head's commit gated. Returns the per-transfer results (identity order)
+// and fills the observations sampled while the head was stalled.
+struct RouteStormResult {
+    std::array<local::P50SourceTransferResult, kStormTransfers> results{};
+    // One more same-route transfer after the storm, on the same C runtime:
+    // commits only if the sticky whole-sidecar replacement latch never
+    // latched during the storm.
+    local::P50SourceTransferResult after_storm{};
+    bool after_storm_ran = false;
+    bool head_gate_entered = false;
+    bool successor_entered_prepare = false;  // prepare_entries reached 2
+    size_t prepare_entries_at_settle = 0;
+    size_t completed_while_stalled = 0;
+};
+
+// `pipeline_depth` selects the leg: 1 runs the default K=1 configuration
+// (no env), 2 runs ICECC_P50_ROUTE_PIPELINE_DEPTH=2 with the test-unsafe
+// escape and a P29V1 sidecar caps profile (without it
+// RouteGate::route_pipeline_depth clamps back to 1 for a ZSTD_TU sidecar).
+RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
+                                        RouteStormObservation& observe) {
+    CHECK(pipeline_depth == 1 || pipeline_depth == 2);
+    for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
+                             "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
+                             "ICECC_P50_ROUTE_LANES", "ICECC_P50_ARMED_WINDOW",
+                             "ICECC_P50_PREP_AHEAD"})
+        CHECK(::unsetenv(name) == 0);
+    if (pipeline_depth == 2) {
+        CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+        CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+    }
+
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x98;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    HeadCommitGate gate;
+    f_config.endpoint_config.input_job_state =
+        [&gate](CStoreGuid guid, const TxBegin& begin, const TxCommit& commit,
+                std::span<const uint8_t> exact) {
+            return gate.f_input_job_state(guid, begin, commit, exact);
+        };
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = pipeline_depth == 2 ? 0xd4 : 0xd5;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    if (pipeline_depth == 2)
+        c_config.endpoint_caps.profile = ProfileId::P29V1;
+    c_config.before_route_prepare_for_test = [&] {
+        observe.prepare_entries.fetch_add(1, std::memory_order_acq_rel);
+    };
+    c_config.fail_stop = [&] { observe.fail_stops.fetch_add(1); };
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const uint64_t identity_base = pipeline_depth == 2 ? 300 : 100;
+    const auto transfer = [&](uint64_t identity) {
+        const std::string text = "storm-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-route-storm", source)));
+    };
+    const auto replacement_code = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    const auto record_result =
+        [&](std::array<local::P50SourceTransferResult, kStormTransfers>& results,
+            size_t index, const local::P50SourceTransferResult& result) {
+            results[index] = result;
+            observe.completed.fetch_add(1, std::memory_order_acq_rel);
+            if (result.error_code == replacement_code)
+                observe.replacement_results.fetch_add(1, std::memory_order_acq_rel);
+        };
+
+    RouteStormResult storm;
+    std::vector<std::thread> storm_threads;
+    storm_threads.emplace_back([&] {
+        local::P50SourceTransferResult result = transfer(identity_base);
+        record_result(storm.results, 0, result);
+    });
+    storm.head_gate_entered = eventually(
+        [&] { return gate.entered.load(std::memory_order_acquire); },
+        std::chrono::seconds(10));
+    // The head is now stalled with its FILL on the wire and its route entry
+    // uncommitted. Launch the same-route successors: they queue on this
+    // route's transfer lock exactly as concurrent compile jobs do in
+    // production.
+    for (size_t index = 1; index != kStormTransfers; ++index)
+        storm_threads.emplace_back([&, index] {
+            const uint64_t identity = identity_base + 10 * index;
+            local::P50SourceTransferResult result = transfer(identity);
+            record_result(storm.results, index, result);
+        });
+
+    // Sample the storm while the head is still stalled. Post-fix at K=1 no
+    // successor may even reach prepare_for_route (the route lock is held to
+    // the head's final result); at K=2 exactly one successor is admitted
+    // (the depth-2 window) and every further one waits in
+    // wait_for_window_slot before prepare_for_route.
+    storm.successor_entered_prepare = eventually(
+        [&] { return observe.prepare_entries.load(std::memory_order_acquire) >= 2; },
+        std::chrono::seconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    storm.prepare_entries_at_settle =
+        observe.prepare_entries.load(std::memory_order_acquire);
+    storm.completed_while_stalled =
+        observe.completed.load(std::memory_order_acquire);
+
+    gate.free();
+    for (std::thread& thread : storm_threads)
+        thread.join();
+    storm_threads.clear();
+    // The gate has fired once (armed_once); a later transfer's commit passes
+    // straight through it, so this is a plain post-storm transfer.
+    storm.after_storm = transfer(identity_base + 100);
+    storm.after_storm_ran = true;
+    front.stop();
+
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+    return storm;
+}
+
+// (a) K=1 regression (the K2-0 fix): N concurrent same-route transfers must
+// serialize on the route lock -- no successor may reach prepare_for_route
+// while the head is uncommitted, so none is refused by the depth-1 admission
+// bound, nothing is replacement-latched, no fail_stop fires, and every
+// transfer (plus one afterwards) commits. Before the fix the lock was
+// released at the head's FILL write-complete, the first successor was
+// admitted and refused, and the sticky cold-replacement path latched: this
+// test fails on the pre-fix code (successor_entered_prepare == true, no
+// successor commits).
+void test_k1_concurrent_same_route_transfers_serialize_on_route_lock() {
+    RouteStormObservation observe;
+    const RouteStormResult storm = run_stalled_head_storm(1, observe);
+
+    std::fprintf(stderr,
+                 "p50cacheservice: K=1 storm head_gate=%d successor_prepare=%d "
+                 "prepare_settled=%zu completed_stalled=%zu replacements=%zu\n",
+                 int(storm.head_gate_entered), int(storm.successor_entered_prepare),
+                 storm.prepare_entries_at_settle, storm.completed_while_stalled,
+                 observe.replacement_results.load());
+    CHECK(storm.head_gate_entered);
+    CHECK(!storm.successor_entered_prepare);
+    CHECK(storm.prepare_entries_at_settle == 1);
+    CHECK(storm.completed_while_stalled == 0);
+    for (const auto& result : storm.results) {
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(result.error_code != static_cast<uint16_t>(
+                  local::SourceTransferErrorCode::RouteReplacementRequired));
+        CHECK(result.attempts >= 1);
+        CHECK(result.valid());
+    }
+    std::vector<uint64_t> storm_tu_seqs;
+    for (const auto& result : storm.results)
+        storm_tu_seqs.push_back(result.tu_seq);
+    std::sort(storm_tu_seqs.begin(), storm_tu_seqs.end());
+    std::vector<uint64_t> expected_tu_seqs;
+    for (uint64_t seq = 0; seq != kStormTransfers; ++seq)
+        expected_tu_seqs.push_back(seq);
+    CHECK(storm_tu_seqs == expected_tu_seqs);
+    CHECK(observe.replacement_results.load() == 0);
+    CHECK(observe.fail_stops.load() == 0);
+
+    // The sticky whole-sidecar replacement latch must never have latched:
+    // a fresh same-route transfer on the same C runtime still commits.
+    CHECK(storm.after_storm_ran);
+    CHECK(storm.after_storm.code == local::SourceTransferResultCode::Committed);
+    CHECK(storm.after_storm.error_code != static_cast<uint16_t>(
+              local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+}
+
+// (b) K=2 (ICECC_P50_ROUTE_PIPELINE_DEPTH=2 + TEST_UNSAFE, P29V1 sidecar
+// caps): the early lock release stays enabled, so a same-route successor IS
+// admitted while the head is uncommitted (two pipeline entries), every
+// transfer still commits with no admission refusal, and the (K+1)-th and
+// later stay behind wait_for_window_slot (prepare count settles at exactly 2
+// while the stalled head plus its one successor hold the window).
+void test_k2_concurrent_same_route_transfers_admit_two_deep() {
+    RouteStormObservation observe;
+    const RouteStormResult storm = run_stalled_head_storm(2, observe);
+
+    std::fprintf(stderr,
+                 "p50cacheservice: K=2 storm head_gate=%d successor_prepare=%d "
+                 "prepare_settled=%zu completed_stalled=%zu replacements=%zu\n",
+                 int(storm.head_gate_entered), int(storm.successor_entered_prepare),
+                 storm.prepare_entries_at_settle, storm.completed_while_stalled,
+                 observe.replacement_results.load());
+    CHECK(storm.head_gate_entered);
+    CHECK(storm.successor_entered_prepare);
+    CHECK(storm.prepare_entries_at_settle == 2);
+    CHECK(storm.completed_while_stalled == 0);
+    for (const auto& result : storm.results) {
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(result.error_code != static_cast<uint16_t>(
+                  local::SourceTransferErrorCode::RouteReplacementRequired));
+        CHECK(result.attempts >= 1);
+        CHECK(result.valid());
+    }
+    std::vector<uint64_t> storm_tu_seqs;
+    for (const auto& result : storm.results)
+        storm_tu_seqs.push_back(result.tu_seq);
+    std::sort(storm_tu_seqs.begin(), storm_tu_seqs.end());
+    std::vector<uint64_t> expected_tu_seqs;
+    for (uint64_t seq = 0; seq != kStormTransfers; ++seq)
+        expected_tu_seqs.push_back(seq);
+    CHECK(storm_tu_seqs == expected_tu_seqs);
+    CHECK(observe.replacement_results.load() == 0);
+    CHECK(observe.fail_stops.load() == 0);
+    CHECK(storm.after_storm_ran);
+    CHECK(storm.after_storm.code == local::SourceTransferResultCode::Committed);
+    CHECK(storm.after_storm.error_code != static_cast<uint16_t>(
+              local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -4136,6 +4437,12 @@ int main(int argc, char** argv) {
             test_route_pipeline_depth_env_parsing_and_clamps();
             test_route_pipeline_depth_forces_single_lane();
             test_owner_lag_trace_default_off_then_emits_per_second_line();
+            return 0;
+        }
+        if (argc == 2 &&
+            std::strcmp(argv[1], "--route-pipeline-concurrency") == 0) {
+            test_k1_concurrent_same_route_transfers_serialize_on_route_lock();
+            test_k2_concurrent_same_route_transfers_admit_two_deep();
             return 0;
         }
         CHECK(argc == 1);
