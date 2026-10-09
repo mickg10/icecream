@@ -6648,7 +6648,11 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
         bytes("# 1 \"/tmp/k2-fixture.cc\"\ncold-tx\n");
     const PreparedTuHandle third_handle = admit(*run.client, third);
     const P5coStoreGuids guids = p5co_store_guids(scenario.seed);
-    P50ServerEndpoint real_server(guids.f, EndpointCaps{});
+    EndpointCaps third_caps;
+    third_caps.profile = ProfileId::P29V1;
+    third_caps.zstd.max_raw_bytes = 4U << 20;
+    third_caps.zstd.max_encoded_body_bytes = 4U << 20;
+    P50ServerEndpoint real_server(guids.f, third_caps);
     const PairResult third_pair =
         run_pair(*run.client, real_server, third_handle);
     require(third_pair.client.status == ClientRunStatus::Committed,
