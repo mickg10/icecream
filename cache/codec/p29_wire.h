@@ -1,5 +1,6 @@
 #pragma once
 
+#include "p29_need_expectation.h"
 #include "p29_online_s1.h"
 #include "services/digest128.h"
 
@@ -1050,19 +1051,6 @@ concept P29ReceiverProvidesPooledMaterializeBuffer =
 };
 
 } // namespace p29_wire_detail
-
-// Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata):
-// at depth > 1 the sender predict-commits TX n locally (P29Serializer::commit)
-// before TX n+1's begin_tu() runs, which clear_pending()s the NEED expectation
-// TX n's confirm would otherwise validate through pending_. A predict-committed
-// TX snapshots it here (P29Serializer::need_expectation()) and confirms later
-// through the snapshot (P29Serializer::confirm_need_snapshot()), which needs no
-// pending TU. Namespace scope, not a nested type, so route bookkeeping
-// (CActiveTx) can name it without naming the serializer template.
-struct P29NeedExpectation {
-  bool expected = false;
-  std::vector<std::uint32_t> missing_regions;
-};
 
 template <P29SenderProvider Provider, P29WireDictionary Dictionary>
 class P29Serializer {

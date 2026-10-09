@@ -109,6 +109,7 @@ EXTRA_DIST = \
 	codec/README.md \
 	codec/p29_grow_buffer.h \
 	codec/p29_intern.h \
+	codec/p29_need_expectation.h \
 	codec/p29_online_s1.h \
 	codec/p29_wire.h \
 	codec/provider.h \
