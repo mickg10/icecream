@@ -2349,6 +2349,23 @@ struct P50ServerEndpoint::Impl {
                 route.cursor_claim_serial != serial);
     }
 
+    // Another connection is still parked on this route without knowing its
+    // own TX_BEGIN rel_seq (a begin-unknown pre-park). A release that wakes
+    // more than one such waiter leaves the cursor's next step ambiguous --
+    // released and begin-unknown, they would race the same fall-through
+    // stage() -- so each must instead wait for its own first frame and
+    // decide by its BEGIN's rel_seq (K>2 farm legs, 2026-10-09). Waiters
+    // whose BEGIN is known never race: their release is the ordinary
+    // cursor release.
+    static bool has_other_begin_unknown_parked(
+        const Route& route, const std::shared_ptr<ParkedWaiter>& self) {
+        for (const auto& [rel_seq_value, waiters] : route.parked)
+            for (const std::shared_ptr<ParkedWaiter>& waiter : waiters)
+                if (waiter != self && !waiter->begin_known)
+                    return true;
+        return false;
+    }
+
     // step 5c: register `io` as parked on `route` until `target` becomes the
     // route's cursor. The caller's park loop must call forget_parked() with
     // the returned handle once it stops waiting (released or not), so a
@@ -5985,46 +6002,55 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     // that has not installed yet (the release-to-install
                     // gap, or K>2 where this key collides with an earlier
                     // successor's) -- re-arm one past the new cursor and
-                    // keep waiting; otherwise fall through. Once the first
-                    // frame is a known successor BEGIN, a release is the
-                    // ordinary cursor release.
+                    // keep waiting. If the route is free but ANOTHER
+                    // begin-unknown waiter was released with this one (K>2:
+                    // both pre-parked at the same next_rel + 1 key before
+                    // either knew its rel_seq), the cursor's next step is
+                    // ambiguous: neither may fall through without its own
+                    // first frame -- each waits (bounded by the remaining
+                    // grace) and then decides by its BEGIN's rel_seq, so a
+                    // begin-unknown release of TWO waiters can never race
+                    // the same stage(). A single woken begin-unknown waiter
+                    // keeps today's fall-through: the K=1
+                    // recovery-reconnect shape, where C waits for STATE
+                    // before its BEGIN. Once the first frame is a known
+                    // successor BEGIN, a release is the ordinary cursor
+                    // release.
                     const auto prepark_should_exit = [&]() {
                         if (!prepark_waiter->released)
                             return false;
-                        if (prepark_first_frame_done ||
-                            !Impl::route_busy_for(*prepark_route,
-                                                  session.serial))
+                        if (prepark_first_frame_done)
                             return true;
-                        Impl::forget_parked(*prepark_route, prepark_key,
-                                            prepark_waiter);
-                        prepark_key =
-                            RelSeq{prepark_route->next_rel.value + 1};
-                        prepark_waiter =
-                            Impl::park(*prepark_route, prepark_key, io,
-                                       session.serial, /*begin_known=*/false);
-                        return false;
+                        if (Impl::route_busy_for(*prepark_route,
+                                                  session.serial)) {
+                            Impl::forget_parked(*prepark_route, prepark_key,
+                                                prepark_waiter);
+                            prepark_key =
+                                RelSeq{prepark_route->next_rel.value + 1};
+                            prepark_waiter =
+                                Impl::park(*prepark_route, prepark_key, io,
+                                           session.serial,
+                                           /*begin_known=*/false);
+                            return false;
+                        }
+                        return !Impl::has_other_begin_unknown_parked(
+                            *prepark_route, prepark_waiter);
                     };
                     for (;;) {
-                        if (prepark_should_exit())
-                            break;
                         boost::system::error_code prepark_wait_error;
                         co_await socket.async_wait(
                             tcp::socket::wait_read,
                             asio::redirect_error(asio::use_awaitable,
                                                  prepark_wait_error));
                         require_operation();
-                        if (prepark_waiter->released) {
-                            // The release's socket.cancel() is what woke
-                            // this wait (operation_aborted): never an error.
-                            // Exit, or -- re-armed on a still-busy route --
-                            // wait again under the new key.
-                            if (prepark_should_exit())
-                                break;
-                            continue;
-                        }
+                        // A release cancels this socket: the wait then
+                        // completes operation_aborted, which is never an
+                        // error here. A grace expiry cancels it too: it is
+                        // checked BEFORE the error check so an expiry
+                        // FALLS THROUGH exactly as today.
                         if (*prepark_grace_expired)
                             break;
-                        if (prepark_wait_error) {
+                        if (prepark_wait_error && !prepark_waiter->released) {
                             Impl::forget_parked(*prepark_route, prepark_key,
                                                 prepark_waiter);
                             cancel_quietly(prepark_timer);
@@ -6042,14 +6068,34 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                                 prepark_eof_error);
                         }
                         if (prepark_available_now == 0) {
-                            // Readable-but-empty is a graceful close while
-                            // pre-parked: exactly the parked loop's EOF.
-                            Impl::forget_parked(*prepark_route, prepark_key,
-                                                prepark_waiter);
-                            cancel_quietly(prepark_timer);
-                            throw boost::system::system_error(
-                                asio::error::eof);
+                            if (!prepark_waiter->released) {
+                                // Readable-but-empty is a graceful close
+                                // while pre-parked: exactly the parked
+                                // loop's EOF.
+                                Impl::forget_parked(*prepark_route, prepark_key,
+                                                    prepark_waiter);
+                                cancel_quietly(prepark_timer);
+                                throw boost::system::system_error(
+                                    asio::error::eof);
+                            }
+                            // A release with no data behind it (the K=1
+                            // recovery-reconnect shape: C waits for STATE
+                            // before its BEGIN): decide by the route --
+                            // exit to the fall-through, or re-arm and wait
+                            // for this connection's own first frame.
+                            if (prepark_should_exit())
+                                break;
+                            continue;
                         }
+                        // Data (a release WITH data, or an ordinary
+                        // readable): DRAIN FIRST, decide AFTERWARDS. A
+                        // just-arrived BEGIN is then judged by its rel_seq
+                        // against the live cursor -- never against a
+                        // route snapshot taken before the drain -- so a
+                        // BEGIN landing inside another session's released
+                        // stage write resolves by the frame, and the
+                        // first-frame block below re-keys this pre-park
+                        // onto it before this iteration's exit decision.
                         std::vector<uint8_t> prepark_drain_buffer(
                             prepark_available_now);
                         boost::system::error_code prepark_recv_error;
@@ -6127,6 +6173,11 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                             prepark_ceiling_exceeded = true;
                             break;
                         }
+                        // Decide AFTER the drain (sorbet-main review): a
+                        // release that raced this data was not evaluated
+                        // on the stale pre-drain route state above.
+                        if (prepark_should_exit())
+                            break;
                     }
                     Impl::forget_parked(*prepark_route, prepark_key,
                                         prepark_waiter);
@@ -6135,6 +6186,19 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                         throw std::length_error(
                             "F endpoint pre-parked connection exceeded its "
                             "declared TX size");
+                    // Every exit left standing here falls through to the
+                    // stage() below, whose SESSION_STATE write suspends
+                    // BEFORE the dispatch installs this session's pending
+                    // TX: a third connection's HELLO in that gap must
+                    // pre-park on this claim, not stage() against the
+                    // cursor this session is about to consume (the
+                    // release-to-install gap, now closed for the
+                    // begin-unknown fall-through too, not just the
+                    // begin-known release path). Idempotent with the
+                    // begin-known release claim (release_parked_at set this
+                    // serial already); cleared at this session's install,
+                    // its disconnect, or any bulk release.
+                    prepark_route->cursor_claim_serial = session.serial;
                     co_await finish_partial_frame(prepark_drain_parser,
                                                   prepark_drained_total,
                                                   prepark_ceiling);
