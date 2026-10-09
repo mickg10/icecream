@@ -6705,7 +6705,14 @@ void test_p29v1_k2_pipeline_head_disconnect_tears_down_successor() {
     K2PipelineRunResult run;
     k2_drive(scenario, run);
     require(run.head.status == ClientRunStatus::Disconnected,
-            "K2 head-drop: head did not report its disconnect");
+            std::string("K2 head-drop: head did not report its disconnect "
+                        "(status=") +
+                std::to_string(static_cast<uint8_t>(run.head.status)) +
+                " terminal=" +
+                (run.head.terminal_error.has_value()
+                     ? run.head.terminal_error->detail
+                     : std::string("<none>")) +
+                ")");
     require(run.successor.status != ClientRunStatus::Committed,
             "K2 head-drop: successor was not torn down");
     require(run.client->endpoint.has_pipeline_poison(),
