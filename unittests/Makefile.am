@@ -578,11 +578,13 @@ p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libp50input.a \
+	../cache/libp50ownerwatchdog.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
 	../cache/libp50endpointtesthooks.a \
-	../cache/libp50input.a  readyclose_shim.so
+	../cache/libp50input.a ../cache/libp50ownerwatchdog.a \
+	readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
 check_PROGRAMS += p50frameasync
