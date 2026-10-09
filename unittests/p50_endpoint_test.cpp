@@ -6128,10 +6128,17 @@ void test_split_prepare_marks_nonrunnable_exactly_once() {
     const std::vector<uint8_t> oversize(2048, uint8_t{'x'});
     const std::vector<uint8_t> fine{uint8_t{'#'}, uint8_t{' '},
                                     uint8_t{'a'}, uint8_t{'\n'}};
+    // Keep the raw-byte cap small so `oversize` trips the limit while
+    // `fine` stays under it; both limits must be nonzero (the authority
+    // rejects zero limits at construction).
+    ZstdTuLimits intern_limits;
+    intern_limits.max_raw_bytes = 1024;
+    intern_limits.max_encoded_body_bytes = 64U << 10;
+    intern_limits.max_window_log = 10;
     const PreparationAuthorityLimits limits{};
     {
         P50PreparationAuthority authority(CStoreGuid::from_u64(101),
-                                          ZstdTuLimits{}, limits, 1,
+                                          intern_limits, limits, 1,
                                           ProfileId::P29V1, TuSeq{0});
         {
             StderrCapture capture;
@@ -6168,7 +6175,7 @@ void test_split_prepare_marks_nonrunnable_exactly_once() {
     }
     {
         P50PreparationAuthority authority(
-            CStoreGuid::from_u64(102), ZstdTuLimits{}, limits, 1,
+            CStoreGuid::from_u64(102), intern_limits, limits, 1,
             ProfileId::P29V1, TuSeq{10},
             P29InternerFaultInjection::FailOnce);
         const PreparationRouteKey route{
