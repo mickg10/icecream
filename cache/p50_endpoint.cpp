@@ -1316,33 +1316,18 @@ P50PreparationAuthority::prepare_source(
         impl_->ensure_p29v1_locked();
         const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
         shared->tu_seq = tu_seq;
-        try {
-            // Locked half of prepare_p29v1_at_seq: reserve, intern, stats.
-            // No verify loop here.
-            shared->p29_source = impl_->p29_authority->intern_p29v1_locked(
-                *shared->raw, tu_seq, raw_digest);
-            impl_->p29_authority->commit_tu_seq(tu_seq);
-        } catch (...) {
-            // Exactly today's combined-path failure shape: the interner
-            // marks itself permanently non-runnable for any failure after
-            // processing begins, and this TU's reserved TU_SEQ is never
-            // committed.  That leaves a permanent TU_SEQ gap; that is legal
-            // (a reservation is committed only on success) and unobservable
-            // (the interner is non-runnable afterwards anyway, so no later
-            // TU can ever use the hole).
-            bool marked = false;
-            try {
-                throw;
-            } catch (const std::exception& error) {
-                impl_->p29_authority->mark_p29v1_nonrunnable(error);
-                marked = true;
-            } catch (...) {
-                impl_->p29_authority->mark_p29v1_nonrunnable_untyped();
-                marked = true;
-            }
-            (void)marked;
-            throw;
-        }
+        // Locked half of prepare_p29v1_at_seq: reserve, intern, stats.
+        // No verify loop here, and no catch here: intern_p29v1_locked
+        // marks non-runnable itself for exactly the old guarded region
+        // (dense_regions.reserve + process + the injected failure), and
+        // its precondition throws stay ordinary typed exceptions, so a
+        // failed TU's reserved TU_SEQ is simply never committed.  That
+        // leaves a permanent TU_SEQ gap; that is legal (a reservation is
+        // committed only on success) and unobservable (the interner is
+        // non-runnable afterwards anyway, so no later TU can use the hole).
+        shared->p29_source = impl_->p29_authority->intern_p29v1_locked(
+            *shared->raw, tu_seq, raw_digest);
+        impl_->p29_authority->commit_tu_seq(tu_seq);
     }
     // Verify OUTSIDE the C-wide mutex.  On failure, re-take the mutex and
     // reproduce exactly today's combined-path behaviour: mark non-runnable

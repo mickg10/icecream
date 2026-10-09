@@ -1780,20 +1780,20 @@ uint64_t CAuthority::p29v1_interner_committed_bytes() const noexcept {
 PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
     std::span<const uint8_t> exact_input, TuSeq tu_seq,
     Digest128 exact_digest) {
-    if (!p29v1_ || !p29v1_->runnable)
-        throw std::logic_error("P29V1 is not runnable until daemon restart");
-    if (exact_input.size() > p29v1_->max_tu_bytes)
-        throw std::length_error("P29V1 input exceeds its TU limit");
+    // Locked half (the interner is single-writer; the caller holds the
+    // C-wide preparation mutex): reserve + intern only, NO verify loop.
+    // intern_p29v1_locked marks non-runnable itself for exactly the old
+    // guarded region; its two precondition throws stay ordinary typed
+    // exceptions, so this wrapper adds no catch of its own for them.
+    PreparedTUPtr prepared =
+        intern_p29v1_locked(exact_input, tu_seq, exact_digest);
+    // Unlocked half: the materialization verify is a pure read over
+    // already-published regions, so it does not need the C-wide mutex
+    // (it is the single largest term of the serialized hold time).
+    // A failure here is exactly today's combined-path failure: mark
+    // non-runnable and rethrow the same logic_error string.
     try {
-        // Locked half (internter is single-writer; caller holds the C-wide
-        // preparation mutex): reserve + intern only, NO verify loop.
-        auto prepared =
-            intern_p29v1_locked(exact_input, tu_seq, exact_digest);
-        // Unlocked half: the materialization verify is a pure read over
-        // already-published regions, so it must NOT hold the C-wide mutex
-        // (it is the single largest term of the serialized hold time).
         verify_p29v1_materialization(prepared->dense_regions, exact_input);
-        return prepared;
     } catch (const std::exception& error) {
         mark_p29v1_nonrunnable(error);
         throw;
@@ -1801,6 +1801,7 @@ PreparedTUPtr CAuthority::prepare_p29v1_at_seq(
         mark_p29v1_nonrunnable_untyped();
         throw;
     }
+    return prepared;
 }
 
 PreparedTUPtr CAuthority::intern_p29v1_locked(
@@ -1810,44 +1811,60 @@ PreparedTUPtr CAuthority::intern_p29v1_locked(
         throw std::logic_error("P29V1 is not runnable until daemon restart");
     if (exact_input.size() > p29v1_->max_tu_bytes)
         throw std::length_error("P29V1 input exceeds its TU limit");
-    auto prepared = std::make_shared<PreparedTU>();
-    {
+    // The guarded region is exactly the old one: reserve + process + the
+    // injected failure.  Only a failure here marks the interner
+    // non-runnable; the two precondition throws above stay ordinary
+    // logic_error/length_error so a later TU keeps its type (and a caller
+    // re-marks nothing: once non-runnable, the precondition fires first).
+    try {
+        auto prepared = std::make_shared<PreparedTU>();
+        {
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
-        codec::p29_wire_detail::P29StageTimerScope reserve_timer_scope(
-            codec::p29_wire_detail::P29StageTimerEntry::SenderPrepareReserve);
+            codec::p29_wire_detail::P29StageTimerScope reserve_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderPrepareReserve);
 #endif
 #if defined(ICECC_P50SIM_ALLOCATION_COUNTER)
-        codec::p29_wire_detail::P29AllocationScope reserve_allocation_scope(
-            codec::p29_wire_detail::P29AllocationEntry::SenderPrepareReserve);
+            codec::p29_wire_detail::P29AllocationScope reserve_allocation_scope(
+                codec::p29_wire_detail::P29AllocationEntry::SenderPrepareReserve);
 #endif
-        prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
-    }
-    {
+            prepared->dense_regions.reserve(exact_input.size() / 32 + 1);
+        }
+        {
 #if defined(ICECC_P50SIM_STAGE_TIMERS)
-        codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
-            codec::p29_wire_detail::P29StageTimerEntry::SenderInternAndMatch);
+            codec::p29_wire_detail::P29StageTimerScope stage_timer_scope(
+                codec::p29_wire_detail::P29StageTimerEntry::SenderInternAndMatch);
 #endif
-        p29v1_->interner.process(exact_input, prepared->dense_regions);
+            p29v1_->interner.process(exact_input, prepared->dense_regions);
+        }
+        if (p29v1_->prepares == p29v1_->inject_failure_after) {
+            std::fprintf(stderr,
+                          "{\"schema\":\"icecream-p50-fault-v1\","
+                          "\"fault\":\"p29-interner-fail-%s\","
+                          "\"outcome\":\"fired\"}\n",
+                          p29v1_->inject_failure_after == 0 ? "once"
+                                                           : "second");
+            p29v1_->inject_failure_after = P29V1State::kNoInjectedFailure;
+            std::fflush(stderr);
+            throw std::runtime_error("injected P29V1 interner failure");
+        }
+        prepared->tu_seq = tu_seq;
+        prepared->raw_bytes = exact_input.size();
+        prepared->raw_digest = exact_digest;
+        ++p29v1_->prepares;
+        p29v1_->raw_bytes += exact_input.size();
+        const uint64_t period = P29V1State::stats_period();
+        if (period != 0 && p29v1_->prepares % period == 0)
+            p29v1_->report("stats", nullptr);
+        return prepared;
+    } catch (const std::exception& error) {
+        p29v1_->runnable = false;
+        p29v1_->report("nonrunnable", error.what());
+        throw;
+    } catch (...) {
+        p29v1_->runnable = false;
+        p29v1_->report("nonrunnable", "non-standard exception");
+        throw;
     }
-    if (p29v1_->prepares == p29v1_->inject_failure_after) {
-        std::fprintf(stderr,
-                     "{\"schema\":\"icecream-p50-fault-v1\","
-                     "\"fault\":\"p29-interner-fail-%s\","
-                     "\"outcome\":\"fired\"}\n",
-                     p29v1_->inject_failure_after == 0 ? "once" : "second");
-        p29v1_->inject_failure_after = P29V1State::kNoInjectedFailure;
-        std::fflush(stderr);
-        throw std::runtime_error("injected P29V1 interner failure");
-    }
-    prepared->tu_seq = tu_seq;
-    prepared->raw_bytes = exact_input.size();
-    prepared->raw_digest = exact_digest;
-    ++p29v1_->prepares;
-    p29v1_->raw_bytes += exact_input.size();
-    const uint64_t period = P29V1State::stats_period();
-    if (period != 0 && p29v1_->prepares % period == 0)
-        p29v1_->report("stats", nullptr);
-    return prepared;
 }
 
 void CAuthority::verify_p29v1_materialization(

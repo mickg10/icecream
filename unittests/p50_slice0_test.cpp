@@ -1,9 +1,11 @@
 #include "cache/p50_slice0.h"
+#include "cache/p50_endpoint.h"
 #include "cache/p50_actions.h"
 
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <unistd.h>
 #include <cstdlib>
 #include <limits>
 #include <optional>
@@ -736,6 +738,156 @@ void test_croute_records_stamp_pipeline_fields() {
             "a fresh route trace is not empty");
 }
 
+// Capture the interner's own stderr reports (one JSON line per "nonrunnable"
+// event) for a bounded region, so a test can count them exactly.
+class StderrCapture {
+public:
+    StderrCapture() {
+        std::fflush(stderr);
+        saved_ = ::dup(STDERR_FILENO);
+        int pipefd[2];
+        if (::pipe(pipefd) != 0 || saved_ < 0) {
+            if (saved_ >= 0) ::close(saved_);
+            saved_ = -1;
+            return;
+        }
+        ::dup2(pipefd[1], STDERR_FILENO);
+        ::close(pipefd[1]);
+        reader_ = pipefd[0];
+    }
+    ~StderrCapture() {
+        if (reader_ >= 0) {
+            ::close(reader_);
+        }
+        if (saved_ >= 0) {
+            ::dup2(saved_, STDERR_FILENO);
+            ::close(saved_);
+        }
+        std::fflush(stderr);
+    }
+    [[nodiscard]] std::string drained() const {
+        if (reader_ < 0)
+            return {};
+        std::string result;
+        char buffer[4096];
+        for (;;) {
+            const ssize_t got = ::read(reader_, buffer, sizeof(buffer));
+            if (got <= 0)
+                break;
+            result.append(buffer, static_cast<size_t>(got));
+        }
+        return result;
+    }
+    [[nodiscard]] static size_t count_lines(const std::string& text,
+                                            const char* needle) {
+        size_t total = 0;
+        std::string_view view(text);
+        for (size_t position = 0; position < view.size();) {
+            const size_t end = view.find('\n', position);
+            const std::string_view line =
+                view.substr(position, end == std::string_view::npos
+                                           ? std::string_view::npos
+                                           : end - position);
+            if (line.find(needle) != std::string_view::npos)
+                ++total;
+            if (end == std::string_view::npos)
+                break;
+            position = end + 1;
+        }
+        return total;
+    }
+
+private:
+    int saved_ = -1;
+    int reader_ = -1;
+};
+
+void test_split_prepare_marks_nonrunnable_exactly_once() {
+    // The split locked/unlocked prepare_source must reproduce the combined
+    // path's failure shape exactly: only a failure in the guarded region
+    // (the interner's own reserve/process/injected-failure) marks the
+    // interner non-runnable and prints a "nonrunnable" line.  The
+    // oversize-TU precondition stays an ordinary length_error (no mark, no
+    // line), and a call after the interner is already non-runnable throws
+    // the precondition logic_error WITHOUT re-marking (no second line).
+    // prepare_source is the public path over the same split halves.
+    const std::vector<uint8_t> oversize(2048, uint8_t{'x'});
+    const std::vector<uint8_t> fine{uint8_t{'#'}, uint8_t{' '},
+                                    uint8_t{'a'}, uint8_t{'\n'}};
+    const PreparationAuthorityLimits limits{};
+    {
+        P50PreparationAuthority authority(CStoreGuid::from_u64(101),
+                                          ZstdTuLimits{}, limits, 1,
+                                          ProfileId::P29V1, TuSeq{0});
+        {
+            StderrCapture capture;
+            // prepare_source refuses oversize input itself with a null
+            // return (the max_raw_bytes check), so drive the underlying
+            // typed path through prepare_for_route, which does NOT
+            // pre-check the P29V1 TU limit and relies on the interner's
+            // own length_error staying ordinary.
+            const PreparationRouteKey route{
+                CStoreGuid::from_u64(101),
+                FStoreGuid::from_u64(202), 1, ProfileId::P29V1};
+            const PrepareRequestKey key{1, 1};
+            require_throws<std::length_error>(
+                [&] {
+                    (void)authority.prepare_for_route(route, key, oversize);
+                },
+                "oversize TU did not throw length_error");
+            require(capture.drained().empty(),
+                    "oversize TU printed an interner report");
+        }
+        // A valid TU still interns after the ordinary length_error.
+        {
+            StderrCapture capture;
+            const PreparationRouteKey route{
+                CStoreGuid::from_u64(101),
+                FStoreGuid::from_u64(202), 1, ProfileId::P29V1};
+            const PreparedTuHandle prepared =
+                authority.prepare_for_route(route, PrepareRequestKey{1, 1},
+                                            fine);
+            (void)prepared;
+            require(capture.drained().empty(),
+                    "valid TU printed an interner report");
+        }
+    }
+    {
+        P50PreparationAuthority authority(
+            CStoreGuid::from_u64(102), ZstdTuLimits{}, limits, 1,
+            ProfileId::P29V1, TuSeq{10},
+            P29InternerFaultInjection::FailOnce);
+        const PreparationRouteKey route{
+            CStoreGuid::from_u64(102), FStoreGuid::from_u64(203), 1,
+            ProfileId::P29V1};
+        {
+            StderrCapture capture;
+            require_throws<P29V1CapabilityUnavailable>(
+                [&] {
+                    (void)authority.prepare_for_route(
+                        route, PrepareRequestKey{1, 1}, fine);
+                },
+                "injected failure did not surface");
+            const std::string drained = capture.drained();
+            require(StderrCapture::count_lines(
+                        drained, "\"event\":\"nonrunnable\"") == 1,
+                    "injected failure did not print exactly one "
+                    "nonrunnable line");
+        }
+        {
+            StderrCapture capture;
+            require_throws<P29V1CapabilityUnavailable>(
+                [&] {
+                    (void)authority.prepare_for_route(
+                        route, PrepareRequestKey{1, 2}, fine);
+                },
+                "non-runnable interner did not fail closed");
+            require(capture.drained().empty(),
+                    "post-failure call re-printed a nonrunnable line");
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -747,6 +899,7 @@ int main() {
     test_f_store_routes_are_isolated_by_profile();
     test_f_store_begin_rejects_second_active_tx_without_commit();
     test_authority_and_route_fail_closed_before_enablement();
+    test_split_prepare_marks_nonrunnable_exactly_once();
     test_terminal_session_serial();
     test_action_trace_jsonl_fields_additive();
     test_check_action_trace_k1_identity();
