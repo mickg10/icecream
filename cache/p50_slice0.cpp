@@ -1,6 +1,7 @@
 #include "p50_slice0.h"
 #include "codec/p29_intern.h"
 #include "codec/p29_wire.h"
+#include "p50_input_buffer_pool.h"
 #include "services/stage_trace.h"
 
 #include <algorithm>
@@ -844,7 +845,8 @@ static_assert(codec::P29SenderProvider<P29SenderProvider>);
 
 class P29ReceiverProvider {
 public:
-    explicit P29ReceiverProvider(size_t max_tu_bytes) {
+    explicit P29ReceiverProvider(size_t max_tu_bytes)
+        : pool_(InputBufferPool::instance()) {
         limits_.max_tu_bytes = max_tu_bytes;
         limits_.max_region_bytes = max_tu_bytes;
     }
@@ -858,6 +860,19 @@ public:
         return sources_.get(path);
     }
     codec::P29WireLimits wire_limits() { return limits_; }
+
+    // Detected via SFINAE by P29Deserializer::receive_fill() (see
+    // p29_wire_detail::P29ReceiverProvidesPooledMaterializeBuffer in
+    // codec/p29_wire.h) rather than being part of the P29ReceiverProvider
+    // concept, so sender/sim/test providers need not implement it. Returns
+    // an empty vector on a pool miss or when pooling is disabled
+    // (ICECC_P50_F_INPUT_POOL_BYTES=0); the caller falls back to its usual
+    // reserve() in that case.
+    std::vector<uint8_t> get_pooled_materialize_buffer(size_t min_capacity) {
+        std::vector<uint8_t> buffer = pool_->get(min_capacity);
+        pool_->maybe_report();
+        return buffer;
+    }
 
     void begin_wire_publish() {
         if (publishing_)
@@ -884,6 +899,7 @@ private:
     codec::P29WireLimits limits_;
     P29SourceTextCache sources_;
     bool publishing_ = false;
+    std::shared_ptr<InputBufferPool> pool_;
 };
 
 static_assert(codec::P29ReceiverProvider<P29ReceiverProvider>);

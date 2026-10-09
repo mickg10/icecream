@@ -1,4 +1,5 @@
 #include "p50_input_record.h"
+#include "p50_input_buffer_pool.h"
 #include "p50_profile.h"
 
 #include <algorithm>
@@ -167,10 +168,28 @@ InputRecordStore::PreparedPublish InputRecordStore::prepare_validated_publish(
     CStoreGuid c_store_guid, const TxBegin& begin, const TxCommit& commit,
     std::vector<uint8_t> exact_input) {
     const InputRecordKey key{c_store_guid, begin.tu_seq};
-    auto mutable_backing =
-        std::make_shared<std::vector<uint8_t>>(std::move(exact_input));
-    std::shared_ptr<const std::vector<uint8_t>> backing =
-        std::move(mutable_backing);
+    // Not make_shared<>: a custom deleter is required so the backing's
+    // storage can be returned to the process-wide InputBufferPool instead
+    // of being freed outright when the last InputRecord/InputCursor
+    // reference drops (today that is usually on InputBackingReaper's
+    // background thread; see p50_input_backing_reaper.h). The deleter
+    // captures its own shared_ptr<InputBufferPool>, so the pool stays
+    // alive for as long as any backing created here might still be
+    // destroyed, independent of static-destruction order.
+    const std::shared_ptr<InputBufferPool> pool = InputBufferPool::instance();
+    auto* const raw_backing =
+        new std::vector<uint8_t>(std::move(exact_input));
+    std::shared_ptr<const std::vector<uint8_t>> backing(
+        raw_backing, [pool](std::vector<uint8_t>* ptr) noexcept {
+            // Must never block for long: put() only ever takes its mutex
+            // long enough to splice `*ptr` into (or discard it from) the
+            // pool's free list. Any actual free this triggers (pool full,
+            // or pooling disabled) happens inside put(), after its mutex
+            // is released -- never here, and never under any lock this
+            // deleter holds (it holds none).
+            std::unique_ptr<std::vector<uint8_t>> owned(ptr);
+            pool->put(std::move(*owned));
+        });
     Entry entry{begin.raw_bytes, begin.raw_digest, begin, commit,
                 std::move(backing), true};
     Records staging;

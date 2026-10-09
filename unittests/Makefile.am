@@ -151,6 +151,11 @@ p50inputbackingreaper_CXXFLAGS = -pthread
 p50inputbackingreaper_LDFLAGS = -pthread
 p50inputbackingreaper_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
+p50inputbufferpool_SOURCES = p50_input_buffer_pool_test.cpp
+p50inputbufferpool_CXXFLAGS = -pthread
+p50inputbufferpool_LDFLAGS = -pthread
+p50inputbufferpool_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
 p50inputattachment_LDADD = libp50reference.a ../cache/libprotocol50.a ../services/libicecc.la
 p50endpoint_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) -DICECC_P50_ENDPOINT_TEST_HOOKS
 p50endpoint_CXXFLAGS = -pthread
@@ -308,9 +313,12 @@ p50inputrecordlate_SOURCES = p50_input_record_late_commit_test.cpp
 p50inputrecordreopen_SOURCES = p50_input_record_closed_reopen_test.cpp
 check_PROGRAMS += p50inputbackingreaper
 TESTS += p50inputbackingreaper
+check_PROGRAMS += p50inputbufferpool
+TESTS += p50inputbufferpool
 p50inputattachment_SOURCES = p50_input_attachment_test.cpp
 p50inputfd_SOURCES = p50_input_fd_attachment_test.cpp ../cache/p50_control_operation.cpp \
 	../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+	../cache/p50_input_buffer_pool.cpp \
 	../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/protocol50.cpp
 p50inputfd_CPPFLAGS = $(AM_CPPFLAGS) -DICECC_P50_INPUT_FD_ATTACHMENT_TEST_HOOKS
@@ -321,6 +329,7 @@ check_PROGRAMS += p50inputattachasync
 TESTS += p50inputattachasync
 p50inputattachasync_SOURCES = p50inputattachasync.cpp ../cache/p50_control_operation.cpp \
     ../cache/p50_input_fd_attachment.cpp ../cache/p50_input_record.cpp \
+    ../cache/p50_input_buffer_pool.cpp \
     ../cache/p50_local_transport.cpp ../cache/p50_fd_handoff.cpp \
     ../cache/protocol50.cpp
 p50inputattachasync_CXXFLAGS = -pthread

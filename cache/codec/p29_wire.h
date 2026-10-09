@@ -1028,6 +1028,21 @@ inline void p29v1_materialize_thp_note_madvise_call() noexcept {
       1, std::memory_order_relaxed);
 }
 
+// Optional, non-concept-breaking pool hook: a Provider MAY offer a
+// `std::vector<std::uint8_t> get_pooled_materialize_buffer(std::size_t)`
+// method, detected here via SFINAE rather than added to the
+// P29ReceiverProvider concept above. Keeping it out of the concept matters
+// because that concept is also satisfied by sender/sim/test providers that
+// have no reason to know about any F-side buffer pool; only the concrete
+// F-side provider (cache/p50_slice0.cpp) implements this method, and
+// receive_fill() below calls it only through `if constexpr`.
+template <class P>
+concept P29ReceiverProvidesPooledMaterializeBuffer =
+    requires(P &provider, std::size_t min_capacity) {
+  { provider.get_pooled_materialize_buffer(min_capacity) }
+  -> std::same_as<std::vector<std::uint8_t>>;
+};
+
 } // namespace p29_wire_detail
 
 template <P29SenderProvider Provider, P29WireDictionary Dictionary>
@@ -1822,6 +1837,22 @@ public:
     if (expected_materialized_bytes > provider_.wire_limits().max_tu_bytes)
       fail("P29 expected materialization exceeds provider TU limit");
     if (expected_materialized_bytes > pending_.materialized.capacity()) {
+      bool pooled_hit = false;
+      if constexpr (p29_wire_detail::
+                        P29ReceiverProvidesPooledMaterializeBuffer<Provider>) {
+        // Ask the provider's buffer pool (if it has one -- see the SFINAE
+        // concept above) for an already-faulted buffer before falling back
+        // to reserve() below. A miss returns an empty vector, which is
+        // simply discarded here: no different from never having asked.
+        std::vector<std::uint8_t> pooled =
+            provider_.get_pooled_materialize_buffer(
+                expected_materialized_bytes);
+        if (pooled.capacity() >= expected_materialized_bytes) {
+          pending_.materialized = std::move(pooled);
+          pooled_hit = true;
+        }
+      }
+      if (!pooled_hit) {
       pending_.materialized.reserve(expected_materialized_bytes);
       // Opt-5 (wire-neutral, no allocator-type change, no copy-back): keep
       // pending_.materialized as the plain std::vector<uint8_t> the rest of
@@ -1884,6 +1915,7 @@ public:
         }
       }
 #endif
+      }  // if (!pooled_hit)
     }
     parse_fill(fill, close_entropy);
     if (expected_materialized_bytes != 0 &&
