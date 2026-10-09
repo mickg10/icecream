@@ -23,9 +23,11 @@
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
+#include <latch>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -464,6 +466,22 @@ class EndpointCodecPool {
 public:
     static constexpr size_t kWorkerCount = 2;
     static constexpr size_t kMaxOutstanding = 8;
+
+    EndpointCodecPool() {
+        // Diagnostic-only: name this pool's worker threads so a freeze
+        // snapshot can tell them apart from unnamed pool threads elsewhere
+        // in the process. std::latch blocks the constructor until every
+        // worker has run its naming task, so the names are guaranteed set
+        // before any real codec work is posted to the pool.
+        std::latch named{kWorkerCount};
+        for (size_t i = 0; i < kWorkerCount; ++i) {
+            asio::post(pool_, [&named] {
+                ::pthread_setname_np(::pthread_self(), "p50-codec");
+                named.count_down();
+            });
+        }
+        named.wait();
+    }
 
     [[nodiscard]] bool try_acquire() noexcept {
         size_t current = outstanding_.load(std::memory_order_relaxed);

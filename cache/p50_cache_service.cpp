@@ -26,8 +26,10 @@
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <string_view>
 #include <stdexcept>
+#include <latch>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <time.h>
@@ -2002,11 +2004,20 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
       // owner-lag block near SidecarRuntime's declaration for what this
       // gates (nothing on the production path when unset).
       owner_lag_trace_enabled_(owner_lag_trace_enabled()),
+      // Diagnostic-only owner-stall watchdog (ICECC_P50_OWNER_WATCHDOG_MS);
+      // see the member declaration in the header for what this gates.
+      owner_watchdog_threshold_(
+          diag::resolve_owner_watchdog_threshold(std::getenv("ICECC_P50_OWNER_WATCHDOG_MS"))),
       // One C sidecar may serve twenty persistent relationships, with two
       // compile slots per F.  Keep the operation table bounded while leaving
       // room for every concurrently admitted C/F session (40) plus control
       // churn during replacement.
       fsession_owner_(64, config_.f_store_generation) {
+    if (owner_watchdog_threshold_.rejected) {
+        std::fprintf(stderr, "P50_OWNER_WATCHDOG_CONFIG_REJECTED reason=%s\n",
+                     owner_watchdog_threshold_.rejection_reason.c_str());
+        std::fflush(stderr);
+    }
     const auto fsession_ready = fsession::mint_fsession_admission_ready(
         fsession_owner_.service_generation(), 1);
     if (!fsession_owner_.open_admission(fsession_ready))
@@ -2069,6 +2080,22 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.compression_level = 3;
     route_config.reopen = ReopenExecutor{reopen_pool_.get_executor(), reopen_outstanding_,
                                          kReopenLimit};
+    {
+        // Diagnostic-only: name reopen_pool_'s two worker threads so a
+        // freeze snapshot (e.g. `ps -T` or a watchdog backtrace of some
+        // other thread) can tell them apart from unnamed pool threads
+        // elsewhere in the process. std::latch blocks this constructor
+        // until both workers have run their naming task, so the names are
+        // guaranteed set before any real work is posted to the pool below.
+        std::latch named{2};
+        for (int i = 0; i < 2; ++i) {
+            asio::post(reopen_pool_, [&named] {
+                ::pthread_setname_np(::pthread_self(), "p50-reopen");
+                named.count_down();
+            });
+        }
+        named.wait();
+    }
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -2088,6 +2115,11 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     }
     if (owner_lag_trace_enabled_)
         asio::post(context_, [this] { arm_owner_lag_timer(); });
+    if (owner_watchdog_threshold_.enabled) {
+        asio::post(context_, [this] { arm_owner_heartbeat_timer(); });
+        owner_watchdog_ = std::make_unique<diag::OwnerWatchdog>(
+            owner_watchdog_threshold_.threshold_ms, owner_heartbeat_ns_, owner_tid_);
+    }
     endpoint_owner_thread_ = std::thread([this] { endpoint_owner_loop(); });
 }
 
@@ -2167,6 +2199,24 @@ void SidecarRuntime::arm_owner_lag_timer() noexcept {
             owner_lag_second_samples_.clear();
         }
         arm_owner_lag_timer();
+    });
+}
+
+// Diagnostic-only owner-stall watchdog heartbeat (ICECC_P50_OWNER_WATCHDOG_MS).
+// Runs only when owner_watchdog_threshold_.enabled, in which case it is first
+// posted from the constructor and thereafter reschedules itself every 50ms
+// on context_ -- i.e. always on endpoint_owner_thread_, the thread whose
+// liveness this heartbeat is reporting to the separate "p50-ownerwd" thread.
+// Bumping the heartbeat is the only side effect; nothing is read back here.
+void SidecarRuntime::arm_owner_heartbeat_timer() noexcept {
+    if (stop_requested_.load(std::memory_order_acquire))
+        return;
+    owner_heartbeat_ns_.store(diag::steady_now_ns(), std::memory_order_release);
+    owner_heartbeat_timer_.expires_after(std::chrono::milliseconds(50));
+    owner_heartbeat_timer_.async_wait([this](const boost::system::error_code& error) {
+        if (error || stop_requested_.load(std::memory_order_acquire))
+            return;
+        arm_owner_heartbeat_timer();
     });
 }
 
@@ -2875,6 +2925,11 @@ bool SidecarRuntime::bind_route_endpoint_identity(
 }
 
 SidecarRuntime::~SidecarRuntime() {
+    // Stop (and join) the watchdog thread first: it reads
+    // owner_heartbeat_ns_/owner_tid_ via a reference captured at
+    // construction, and endpoint_owner_thread_ (joined below) is the last
+    // thing that keeps either of those live/updated.
+    owner_watchdog_.reset();
     stop();
     endpoint_work_guard_.reset();
     if (endpoint_owner_thread_.joinable())
@@ -2882,6 +2937,17 @@ SidecarRuntime::~SidecarRuntime() {
 }
 
 void SidecarRuntime::endpoint_owner_loop() noexcept {
+    ::pthread_setname_np(::pthread_self(), "p50-owner");
+    if (owner_watchdog_threshold_.enabled) {
+        // Diagnostic-only (see cache/p50_owner_watchdog.h): publish this
+        // thread's tid for the separate "p50-ownerwd" thread to target with
+        // SIGPROF, and install this thread's own sigaltstack so that signal
+        // handler has somewhere to run. Both are no-ops on the production
+        // path (owner_watchdog_threshold_.enabled is false unless
+        // ICECC_P50_OWNER_WATCHDOG_MS names a valid threshold).
+        diag::install_owner_sigaltstack();
+        owner_tid_.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
+    }
     try {
         if (config_.owner_failure)
             config_.owner_failure();
@@ -4210,6 +4276,7 @@ int run(const Options& options) noexcept {
                 [connection = std::move(connection), &effective_options,
                  runtime_ptr = runtime.get(),
                  worker]() mutable {
+                    ::pthread_setname_np(::pthread_self(), "p50-ctl");
                     (void)handle_connection(std::move(connection), effective_options,
                                             *runtime_ptr);
                     const int fd = worker->cancel_fd.exchange(-1, std::memory_order_acq_rel);

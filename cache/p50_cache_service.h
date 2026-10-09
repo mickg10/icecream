@@ -32,6 +32,7 @@
 #include "p50_input_fd_attachment.h"
 #include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
+#include "p50_owner_watchdog.h"
 #include "../client/p50_route_owner.h"
 
 #include <boost/asio/awaitable.hpp>
@@ -41,6 +42,8 @@
 #include <boost/asio/thread_pool.hpp>
 
 namespace icecc::p50::service {
+
+namespace diag = ::icecc::p50::diag;
 
 // Unset is the production default. Any configured value other than the one
 // deliberately supported live-farm fault is malformed and must prevent READY.
@@ -393,6 +396,24 @@ private:
     std::unordered_map<InputRecordKey, std::chrono::steady_clock::time_point,
                         InputRecordKeyHash>
         owner_lag_tx_inflight_;
+
+    // --- owner-stall watchdog (ICECC_P50_OWNER_WATCHDOG_MS) ----------------
+    // Entirely diagnostic (see p50_owner_watchdog.h for the full design and
+    // motivation); disabled unless the env var names a threshold in
+    // [100, 10000] ms. When disabled, owner_watchdog_ stays null,
+    // arm_owner_heartbeat_timer() is never posted, and endpoint_owner_loop()
+    // skips the heartbeat bump/tid publish/sigaltstack install below -- no
+    // behavior, timing, or memory-growth change on the production path.
+    const diag::OwnerWatchdogThresholdResult owner_watchdog_threshold_;
+    std::atomic<int64_t> owner_heartbeat_ns_{0};
+    std::atomic<int> owner_tid_{0};
+    boost::asio::steady_timer owner_heartbeat_timer_{context_};
+    void arm_owner_heartbeat_timer() noexcept;
+    // Constructed only when owner_watchdog_threshold_.enabled; destroyed
+    // first in ~SidecarRuntime (before stop()/context_ teardown) since it
+    // reads owner_heartbeat_ns_/owner_tid_, which stop being updated once
+    // the owner thread exits.
+    std::unique_ptr<diag::OwnerWatchdog> owner_watchdog_;
 
     // --- dedicated F-session control connections (owner-affine) -----------
     struct FSessionPump;
