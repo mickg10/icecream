@@ -2324,6 +2324,12 @@ public:
 
     [[nodiscard]] uint16_t port() const noexcept { return port_; }
 
+    // Optional per-arm endpoint control handed to F with every adopted
+    // (non-parked) CacheWire session, e.g. a before_materialize_on_worker
+    // stall. Must be set before the first transfer connects. Null (default)
+    // leaves the plain start_adopted_endpoint behaviour unchanged.
+    std::function<EndpointIoControl()> arm_control;
+
     void hold(CStoreGuid c_store) {
         std::lock_guard lock(mutex_);
         held_ = c_store;
@@ -2463,7 +2469,8 @@ private:
                 observed_.push_back(c_store);
             }
             if (!park) {
-                f_runtime_.start_adopted_endpoint(raw_fd);
+                f_runtime_.start_adopted_endpoint(
+                    raw_fd, arm_control ? arm_control() : EndpointIoControl{});
                 return;
             }
             int placeholder_peer = -1;
@@ -3518,32 +3525,31 @@ void test_owner_lag_trace_default_off_then_emits_per_second_line() {
 // into prepare_for_route while its predecessor was still uncommitted, the
 // depth-1 admission bound refused it, and the sticky cold-replacement path
 // replaced the client sidecar (the fix gates the early release on
-// route_pipeline_depth_ > 1). The two tests below drive the REAL
+// route_pipeline_depth_ > 1 and request.cache_profile == P29V1). The two
+// tests below drive the REAL
 // transfer_source_on_owner path against a real F (an in-process SidecarRuntime
 // behind CapacityFront) with N concurrent transfers for ONE route and the
 // head's F-side commit deliberately stalled, so the head's "FILL on the wire,
 // uncommitted" window -- exactly where a premature lock release shows -- is
 // held open deterministically instead of raced for.
 //
-// F-side head stall: the first materialized TX's commit path on F's owner
-// thread (P50ServerEndpointConfig::input_job_state, which SidecarRuntime wraps
-// around the input lifecycle) blocks until the test releases it. Successors
-// park on F before their own materialize (their stage is deferred until the
+// F-side head stall: the FIRST materialization job's
+// EndpointIoControl::before_materialize_on_worker hook (a codec-pool worker;
+// F's owner thread stays free) blocks until the test releases it. The head
+// then sits with its FILL on the wire and its route entry uncommitted;
+// same-route successors park on F (F defers their stage until the
 // predecessor commits), so exactly one gate entry exists per storm.
-struct HeadCommitGate {
-    HeadCommitGate() : released(release.get_future()) {}
-    ~HeadCommitGate() { free(); }
-    HeadCommitGate(const HeadCommitGate&) = delete;
-    HeadCommitGate& operator=(const HeadCommitGate&) = delete;
+struct HeadMaterializeGate {
+    HeadMaterializeGate() : released(release.get_future()) {}
+    ~HeadMaterializeGate() { free(); }
+    HeadMaterializeGate(const HeadMaterializeGate&) = delete;
+    HeadMaterializeGate& operator=(const HeadMaterializeGate&) = delete;
 
-    // The input_job_state callback, installed on the F runtime's config.
-    InputJobState f_input_job_state(CStoreGuid, const TxBegin&, const TxCommit&,
-                                    std::span<const uint8_t>) {
+    void before_materialize() {
         if (!armed_once.exchange(true)) {
             entered.store(true, std::memory_order_release);
             released.wait();
         }
-        return InputJobState::Open;
     }
 
     void free() {
@@ -3595,8 +3601,8 @@ struct RouteStormResult {
 
 // `pipeline_depth` selects the leg: 1 runs the default K=1 configuration
 // (no env), 2 runs ICECC_P50_ROUTE_PIPELINE_DEPTH=2 with the test-unsafe
-// escape and a P29V1 sidecar caps profile (without it
-// RouteGate::route_pipeline_depth clamps back to 1 for a ZSTD_TU sidecar).
+// escape. Both keep the DEFAULT sidecar endpoint_caps.profile (ZSTD_TU,
+// the production client-sidecar shape) and issue P29V1 requests.
 RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
                                         RouteStormObservation& observe) {
     CHECK(pipeline_depth == 1 || pipeline_depth == 2);
@@ -3616,12 +3622,6 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     service::RuntimeConfig f_config = test_runtime_config();
     f_config.f_store_guid = f_store_guid_for_root(f_root);
     f_config.f_store_generation = kFStoreGeneration;
-    HeadCommitGate gate;
-    f_config.endpoint_config.input_job_state =
-        [&gate](CStoreGuid guid, const TxBegin& begin, const TxCommit& commit,
-                std::span<const uint8_t> exact) {
-            return gate.f_input_job_state(guid, begin, commit, exact);
-        };
     service::SidecarRuntime f_runtime(std::move(f_config));
 
     StoreIdentityRoot c_root{};
@@ -3632,8 +3632,14 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     c_config.f_store_guid = launch.f_store_guid;
     c_config.f_store_generation = launch.store_generation;
     c_config.sidecar_launch = launch;
-    if (pipeline_depth == 2)
-        c_config.endpoint_caps.profile = ProfileId::P29V1;
+    // NOTE: endpoint_caps.profile deliberately stays at its default
+    // (ZSTD_TU) in BOTH legs -- that is the production client-sidecar
+    // shape. The route pipeline depth is scoped per route profile
+    // (RouteGate::route_pipeline_depth(CACHE_PROFILE_P29V1) in the
+    // SidecarRuntime constructor; the early lock release additionally
+    // requires request.cache_profile == CACHE_PROFILE_P29V1), so a P29V1
+    // request route pipelines under the depth env even on a ZSTD_TU-caps
+    // sidecar, and every request below is P29V1.
     c_config.before_route_prepare_for_test = [&] {
         observe.prepare_entries.fetch_add(1, std::memory_order_acq_rel);
     };
@@ -3641,6 +3647,12 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     service::SidecarRuntime c_runtime(std::move(c_config));
 
     CapacityFront front(f_runtime, kFStoreGeneration);
+    HeadMaterializeGate gate;
+    front.arm_control = [&gate]() {
+        EndpointIoControl control;
+        control.before_materialize_on_worker = [&gate] { gate.before_materialize(); };
+        return control;
+    };
     const auto clock = sidecar::process_monotonic_clock_identity();
     const uint64_t identity_base = pipeline_depth == 2 ? 300 : 100;
     const auto transfer = [&](uint64_t identity) {
@@ -3702,8 +3714,8 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     for (std::thread& thread : storm_threads)
         thread.join();
     storm_threads.clear();
-    // The gate has fired once (armed_once); a later transfer's commit passes
-    // straight through it, so this is a plain post-storm transfer.
+    // The gate fired once (armed_once), so this later transfer's own
+    // materialize passes straight through it: a plain post-storm transfer.
     storm.after_storm = transfer(identity_base + 100);
     storm.after_storm_ran = true;
     front.stop();
@@ -3779,12 +3791,13 @@ void test_k1_concurrent_same_route_transfers_serialize_on_route_lock() {
     CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
 }
 
-// (b) K=2 (ICECC_P50_ROUTE_PIPELINE_DEPTH=2 + TEST_UNSAFE, P29V1 sidecar
-// caps): the early lock release stays enabled, so a same-route successor IS
-// admitted while the head is uncommitted (two pipeline entries), every
-// transfer still commits with no admission refusal, and the (K+1)-th and
-// later stay behind wait_for_window_slot (prepare count settles at exactly 2
-// while the stalled head plus its one successor hold the window).
+// (b) K=2 (ICECC_P50_ROUTE_PIPELINE_DEPTH=2 + TEST_UNSAFE, P29V1 requests
+// on the default ZSTD_TU sidecar caps -- the production shape): the early
+// lock release stays enabled, so a same-route successor IS admitted while
+// the head is uncommitted (two pipeline entries), every transfer still
+// commits with no admission refusal, and the (K+1)-th and later stay behind
+// wait_for_window_slot (prepare count settles at exactly 2 while the
+// stalled head plus its one successor hold the window).
 void test_k2_concurrent_same_route_transfers_admit_two_deep() {
     RouteStormObservation observe;
     const RouteStormResult storm = run_stalled_head_storm(2, observe);
