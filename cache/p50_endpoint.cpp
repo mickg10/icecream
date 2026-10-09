@@ -4263,6 +4263,7 @@ P50ClientEndpoint::run_connected_successor(
         if (position != impl_->successors.end())
             impl_->successors.erase(position);
     };
+    uint32_t terminal_cap = impl_->caps.wire.max_frame_payload;
 
     const auto deadline_crossed = [&]() {
         return deadline.has_value() &&
@@ -4562,6 +4563,17 @@ P50ClientEndpoint::run_connected_successor(
         result.observation = io->expired || deadline_crossed()
                                  ? ClientRunObservation::DeadlineExpired
                                  : ClientRunObservation::Disconnected;
+    } catch (const std::exception& error) {
+        // Same result contract as the head's generic catch: the failure
+        // detail rides on terminal_error, the route is poisoned, and the
+        // status is the ordinary disconnected observation.
+        close_now(socket);
+        impl_->poison_pipeline();
+        set_client_terminal_result(
+            result, bounded_error(3, error.what(), terminal_cap));
+        result.status = ClientRunStatus::Disconnected;
+        result.observation = ClientRunObservation::Disconnected;
+        result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
     } catch (...) {
         close_now(socket);
         impl_->poison_pipeline();
