@@ -169,7 +169,8 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<const std::vector<uint8_t>> source,
     std::optional<Digest128> raw_digest,
-    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+    std::function<void()> write_complete) {
     if (!relationship.valid() ||
         request.producer_session == 0 ||
         request.request_token == 0 || !connection)
@@ -188,7 +189,7 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     }
     ZstdSourceTransferResult result = co_await sender->transfer_route(
         std::move(connection), request, deadline, source, raw_digest,
-        std::move(stall_stage));
+        std::move(stall_stage), std::move(write_complete));
     if (result.replacement_required && !result.route_local_failure)
         replacement_required_ = true;
     co_return result;
@@ -241,11 +242,12 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
 // replacement_required_.
 //
 // Unchanged: reset_route() (same-incarnation path; protects lost-commit
-// reconcile), P50CRouteOwner::reset() (full teardown), and RouteState's
-// field shape -- discard_route() only touches the single
-// uncommitted_route_entry optional the same way release() already does, so
-// a later merge with the perf-pipe deque conversion stays local to that one
-// field in cache/p50_endpoint.cpp.
+// reconcile) and P50CRouteOwner::reset() (full teardown). discard_route()
+// touches the uncommitted_route_entries successor deque the same uniform
+// way release() and the pipelining abandon path already do (clearing the
+// whole outstanding-successor chain, with at most one CRoute::
+// abandon_active() call per discard_route() invocation); the perf-pipe
+// deque conversion is exactly this one field in cache/p50_endpoint.cpp.
 // ---------------------------------------------------------------------------
 bool P50CRouteOwner::reset_f_store_exact(
     FStoreGuid old_f_store_guid,

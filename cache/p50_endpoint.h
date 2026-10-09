@@ -210,6 +210,19 @@ struct EndpointIoControl {
     // written successfully. It receives an immutable message copy and cannot
     // change product framing or endpoint state.
     std::function<void(ActorSide, const Message&)> outbound_message_observer;
+    // Step 4 sub-step 4c (research/designs/P50_ROUTE_PIPELINING.md): fires
+    // exactly once per run_connected() dialogue, immediately after this TX's
+    // last FILL byte (or, for non-P29V1 profiles, its BODY) has been written
+    // to the wire and before this endpoint starts waiting on a peer reply it
+    // can no longer influence by writing more. Null by default: every
+    // existing caller is unaffected.
+    // Step 4d contract: this fires from INSIDE the endpoint's own coroutine
+    // on the owner executor. A callback must never block, suspend, or run
+    // another endpoint operation inline (a prepare, a run, a future wait):
+    // production only RELEASES the route transfer lock here (the next
+    // transfer then runs in its own coroutine), and anything heavier can
+    // self-deadlock the single-threaded owner.
+    std::function<void()> write_complete;
 };
 
 struct PrepareRequestKey {
@@ -241,6 +254,15 @@ struct PreparationAuthorityLimits {
     // it fits under this, else probe(); its hash tables grow into the rest.
     uint64_t max_interner_reserved_bytes = uint64_t{24} << 30;
     uint64_t max_route_state_bytes = uint64_t{1} << 30;
+    // How many successive TUs on one route may have an uncommitted
+    // successor prepared at once (research/designs/P50_ROUTE_PIPELINING.md,
+    // "Step 4"). 1 reproduces every pre-pipelining call site byte-for-byte:
+    // a route may not begin TU n+1 until TU n commits. The production value
+    // is sourced once at sidecar construction from
+    // SidecarRuntime::RouteGate::route_pipeline_depth(), which itself stays
+    // clamped to 1 outside this step's own tests until the F-side sequencer
+    // (design doc Step 5) exists.
+    uint32_t route_pipeline_depth = 1;
     auto operator<=>(const PreparationAuthorityLimits&) const = default;
 };
 
@@ -310,8 +332,22 @@ public:
     // outgrow a socket buffer.  confirm_p29v1_need() must check NEED later.
     std::optional<std::span<const uint8_t>> fill_p29v1_before_need(
         PreparedTuHandle handle);
+    // Read-only probe of the same bound: true exactly when
+    // fill_p29v1_before_need() would return a FILL, without building one.
+    // Route pipelining, P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata: the endpoint dispatch uses this to keep a would-be successor
+    // that must answer NEED interactively on the head path instead.
+    [[nodiscard]] bool p29v1_fill_before_need_possible(PreparedTuHandle handle);
     void confirm_p29v1_need(PreparedTuHandle handle,
                             std::span<const uint8_t> inner_need);
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata): run this handle's P29V1 serializer commit locally,
+    // ahead of F's TX_COMMIT ack, recording its predicted post-state digest
+    // and freeing the route's serializer for the next successor's begin.
+    // Only valid at route_pipeline_depth > 1; nothing calls it at the
+    // default depth of 1, where the legacy confirm-only commit inside
+    // commit() stays byte-identical.
+    void commit_predicted_p29v1(PreparedTuHandle handle);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
         PreparedTuHandle handle) const;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse(
@@ -345,6 +381,10 @@ public:
     [[nodiscard]] size_t route_history_entries() const;
     [[nodiscard]] size_t route_history_entries(PreparationRouteKey route) const;
     [[nodiscard]] ProfileId profile() const;
+    // Route pipelining (research/designs/P50_ROUTE_PIPELINING.md "Step 4"):
+    // the per-route outstanding-successor bound this authority admits.
+    // 1 is the byte-identical default.
+    [[nodiscard]] uint32_t route_pipeline_depth() const;
 
     // Route owners call this only after all handles for the relationship have
     // been released.  It drops matcher/history state without touching the
@@ -362,6 +402,17 @@ public:
     // P50CRouteOwner::reset_f_store_exact and P50ZstdSourceSender::
     // transfer_in_flight for the full argument.
     [[nodiscard]] bool discard_route(PreparationRouteKey route) noexcept;
+
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): a pipelined
+    // successor's own uncommitted P29V1 route state must be retired when the
+    // client endpoint observes its predecessor deviated from the predicted
+    // witness, before the handle itself is released. Unlike reset_route(),
+    // this acts on one still-live handle, not a whole relationship; the
+    // caller must not use `handle` again afterward. Throws
+    // std::invalid_argument if `handle` does not belong to this authority,
+    // has already been released, or is not an active P29V1 successor; throws
+    // std::logic_error if `handle` is not the route's identified successor.
+    void abandon_route(PreparedTuHandle handle);
 
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
@@ -620,6 +671,14 @@ public:
     size_t cancel_all_for_incarnation(const SidecarLaunchIdentity& incarnation) noexcept;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     void request_cancel_for_test() noexcept;
+    // Step 4d core test hooks (P50_ROUTE_PIPELINING.md section 5.1): the
+    // outstanding-successor window and both waiter structures must stay
+    // empty at depth 1 (T6b's K=1 no-op assertion) and be observable from
+    // the endpoint tests while a K>1 window is open.
+    [[nodiscard]] size_t pipeline_window_size_for_test() const;
+    [[nodiscard]] size_t pipeline_retire_waiter_count_for_test() const;
+    [[nodiscard]] size_t pipeline_window_slot_waiter_count_for_test() const;
+    [[nodiscard]] uint64_t pipeline_epoch_for_test() const;
 #endif
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
@@ -629,11 +688,54 @@ public:
     [[nodiscard]] RelSeq next_rel_seq() const;
     [[nodiscard]] Digest128 state_digest() const;
 
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): true from the
+    // moment a pipelined successor observes its predecessor deviate from the
+    // predicted witness until reset_after_pipeline_poison() clears it. The
+    // predicted-cursor/pipeline-member bookkeeping that is meant to set this
+    // flag is the remaining Step 4d/5 work and does not exist yet, so this
+    // is always false today; the accessor and its paired reset below are
+    // being landed first as the cross-layer bridge the sender side already
+    // calls.
+    [[nodiscard]] bool has_pipeline_poison() const noexcept;
+
+    // Cold local reset for the route this endpoint owns, performed by the
+    // caller while the poisoning transfer still counts as in flight. Leaves
+    // f_guid untouched so the next head dialogue's same_f check stays true
+    // and takes the existing, unmodified RouteHistoryReset wire branch.
+    // Throws std::logic_error if called without an outstanding pipeline
+    // poison.
+    void reset_after_pipeline_poison();
+
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata): suspend this coroutine until the endpoint's
+    // outstanding-dialogue window has a free slot (fewer than
+    // route_pipeline_depth dialogues: head plus successors). Level
+    // triggered; woken by accept() retirement and by poison/epoch changes.
+    // Bounded by deadline: a timeout resolves to false and the caller takes
+    // its ordinary route-local deadline failure. At the default depth of 1
+    // this returns true immediately without suspending, so the sender's
+    // pre-prepare wait is invisible to every existing caller.
+    boost::asio::awaitable<bool> wait_for_window_slot(
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
 private:
     boost::asio::awaitable<ClientRunResult> run_connected(
         std::optional<boost::asio::ip::tcp::endpoint> remote,
         std::optional<boost::asio::ip::tcp::socket> socket,
         PreparedTuHandle prepared, EndpointIoControl control,
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
+    // Step 4d core: one successor dialogue at depth > 1. Never touches the
+    // confirmed cursor fields until promoted; opens its own connection;
+    // predict-commits its own serializer right after its eager FILL write
+    // (symmetric with the head's Site A) so the next successor can begin;
+    // waits level-triggered for its predecessor to retire before reading
+    // its own COMMIT through the shared accept() path.
+    boost::asio::awaitable<ClientRunResult> run_connected_successor(
+        std::optional<boost::asio::ip::tcp::endpoint> remote,
+        std::optional<boost::asio::ip::tcp::socket> adopted,
+        PreparedTuHandle prepared, PreparedInputPtr admitted,
+        EndpointIoControl control,
         std::optional<std::chrono::steady_clock::time_point> deadline);
 
     struct Impl;

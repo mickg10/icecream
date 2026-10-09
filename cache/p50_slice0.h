@@ -3,6 +3,7 @@
 #include "p50_actions.h"
 #include "protocol50.h"
 #include "codec/p29_online_s1.h"
+#include "codec/p29_wire.h"
 
 #include <array>
 #include <chrono>
@@ -335,6 +336,16 @@ struct CActiveTx {
     // (confirm-only: compare against this digest) from one whose serializer
     // commit is still owed to it (depth == 1, byte-identical legacy path).
     std::optional<Digest128> predicted_post_digest;
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): commit_predicted_v1() ends this entry's serializer pending
+    // (clear_pending), so the NEED expectation this entry's confirm would
+    // otherwise validate through pending_ is snapshotted here instead.
+    // predicted_need is set when the NEED was still owed at predict-commit
+    // time (eager-FILL entries); need_confirmed is set when the NEED was
+    // already consumed (fresh-head answer path).  Both stay unset at depth
+    // == 1: the legacy confirm_need_v1 path is untouched there.
+    std::optional<codec::P29NeedExpectation> predicted_need;
+    bool need_confirmed = false;
 };
 
 class CRoute {
@@ -362,6 +373,14 @@ public:
     // more than max_need_regions.  confirm_need_v1() must check NEED later.
     std::optional<std::span<const uint8_t>> fill_v1_before_need(
         size_t max_need_regions);
+    // Read-only probe of the same admission bound (route pipelining,
+    // P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata): true exactly
+    // when fill_v1_before_need() would return a FILL, without building one
+    // or consuming the entry's freshness. The endpoint dispatch uses this
+    // to refuse opening a successor dialogue that could only be completed
+    // by a NEED-answer path a successor must not have.
+    [[nodiscard]] bool fill_before_need_possible(
+        size_t max_need_regions) const;
     void confirm_need_v1(std::span<const uint8_t> inner_need);
     // Run the newest ACTIVE_TX's P29Serializer::commit() locally, ahead of
     // F's real TX_COMMIT ack, and record its predicted post-state digest.
@@ -372,6 +391,16 @@ public:
     // calls it: the legacy path still runs the equivalent commit() lazily,
     // inside accept_commit(), once F's ack actually arrives.
     const CActiveTx& commit_predicted_v1();
+    // Confirm the NEED of the entry named by rel_seq (route pipelining,
+    // P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata).  A
+    // predict-committed entry validates through its recorded
+    // predicted_need snapshot -- its serializer pending is already gone --
+    // and marks itself need_confirmed; any other entry delegates to the
+    // existing legacy confirm_need_v1 path (newest pending entry).  F
+    // always sends NEED before TX_COMMIT, so retire_locked_commits() treats
+    // a predict-committed head with an unconfirmed NEED as a route
+    // deviation (poison), never a silent retirement.
+    void confirm_need_v1(RelSeq rel_seq, std::span<const uint8_t> inner_need);
     void restart_v1_for_transport_retry();
     void reset_v1_route(FStoreGuid f_store_guid,
                         HistoryNonce history_nonce);

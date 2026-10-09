@@ -37,6 +37,125 @@ the invariant the whole design leans on at this layer, pinned by a test
 corrected diff item 3 and invariant 2 below, and the new paragraph after
 diff item 6 on where `P29Serializer::commit()`'s call site moves under K>1.
 
+**Errata (2026-10-08, during Step 4 sub-step 4d review):** §1.1 diff item 4
+overstated the required change. `ClientIoState`/`ClientRunSocketTarget`
+(`cache/p50_endpoint.cpp:277`/`289`) are already constructed fresh per
+`run_connected()` call (`auto io = std::make_shared<ClientIoState>(executor);`)
+— never stored on `Impl` — so "each entry owning its own `ClientIoState`
+(socket)" is not a new requirement; that part of item 4 is already true
+today and needs no change. The actual required change is narrower:
+`Impl::active_session`/`active`/`queued` become a bounded **window**: a HEAD
+(the oldest outstanding dialogue) plus up to `K-1` SUCCESSORS, ordered by
+`rel_seq` — not a generalized map with its own reconcile logic per entry.
+Corrected item 4 text below.
+
+This also settles the open question of how the STATE/COMMIT reconciliation
+branches (exact/`same_f` match, `HISTORY_RESET` fallback,
+`LOST_COMMIT_ACCEPTED` replay detection, `accept`/`stamp`/`live_identity`)
+behave under `K>1`: they stay keyed to the HEAD only, and run **only** when
+the window holds no successors — i.e. they degenerate exactly to today's
+`K=1` path whenever a successor exists; nothing about them is generalized
+to multi-dialogue. A successor only ever exists on the deviation-free
+straight line opened by `pipelined_begin` (diff item 5); it never enters
+any reconcile branch.
+
+Any deviation — on the head or on any successor, while the window holds at
+least one successor — is handled conservatively, not by generalizing
+reconcile: (i) close all successor sockets (F bulk-releases the
+corresponding parked BEGINs via its own mismatch path, independently, in
+§1.2/Step 5); (ii) clear the window and `CRoute::active_queue_` in one shot
+via the existing whole-queue `abandon_active()` (`cache/p50_slice0.cpp`);
+(iii) run the existing full C-side route history reset
+(`Impl::reset_history`, `cache/p50_endpoint.cpp:2803-2830`) so the next
+transfer starts cold at `K=1`; the window only refills once that TX commits
+cleanly. Failing TX(s) return their existing failure statuses — callers
+retry/fall back exactly as today. This is consistent with touch-up (a)
+below (every fault is a full route history reset, never a partial unwind)
+and with the TLA model's `Fault` action (cold reset on both sides, epoch
+bump, stale-epoch traffic rejected); it is not a new rule, only a
+restatement of (a) scoped explicitly to the window.
+
+Persistent cursor fields (`history_nonce`/`next_rel`/`state`/`route_known`/
+`route_f_fingerprint`) keep CONFIRMED values exactly as today, advanced
+only by the HEAD's real COMMIT; successor BEGINs use PREDICTED values from
+`CRoute`'s `predicted_cursor_`/`predicted_post_digest` (diff item 5), never
+touching the confirmed fields. Retirement goes strictly in `rel_seq` order
+through the diff-item-1 reorder buffer.
+
+None of this changes `K=1`: the window never holds a successor at `K=1`,
+so this whole paragraph is dead code there, and
+`test_p29v1_k1_pipeline_wire_identity` (§5.1, part of 4a) remains the
+byte-identity gate.
+
+**Errata (2026-10-08, during Step 4 sub-step 4d core implementation):** the
+"`K>1`: called locally ... right after the FILL write completes" paragraph
+above (at ~276-285 in this file) is correct about the *write-completion /
+lock-release point* but incomplete about one interaction it did not call out:
+the head's own NEED confirm. `CRoute::confirm_need_v1`
+(`cache/p50_slice0.cpp:2032-2046`) validates a NEED through the *shared,
+per-route* `P29V1State` serializer while TX `n` is still its pending TU
+(`P29Serializer::confirm_need`, `cache/codec/p29_wire.h:1127-1132`, calls
+`require_pending()`, `p29_wire.h:1240-1243`), and `begin_v1`
+(`cache/p50_slice0.cpp:1923-1924`) clears the per-route
+`answered_need`/`fill_answered` flags that guard it. Under `K>1`, TX `n+1`'s
+`begin_tu()` (in its `prepare_for_route`, after the 4c lock release at TX
+`n`'s FILL write) can therefore run before TX `n`'s NEED frame is read back,
+and TX `n`'s legacy confirm would then either throw ("no early P29V1 FILL to
+confirm", because `fill_answered` was cleared) or validate TX `n`'s NEED
+against TX `n+1`'s pending state. The local predict-commit of TX `n`
+(`commit_predicted_v1`) additionally ends TX `n`'s serializer pending
+(`clear_pending()`, `p29_wire.h:1180`), so the NEED expectation must be
+captured *before* it. Resolution (approved by sorbet-main, 2026-10-08; the
+§1.1 "~3555" placement itself stands):
+
+1. `P29Serializer` (`cache/codec/p29_wire.h`) gains
+   `struct P29NeedExpectation { bool expected; std::vector<uint32_t> missing_regions; }`,
+   `need_expectation()` (requires a pending TU with `fill_ready`, snapshots
+   `!manifest_blocks.empty() || !missing_regions.empty()` plus the
+   `missing_regions` list — exactly what `validate_need`
+   (`p29_wire.h:1407-1430`) computes), and
+   `confirm_need_snapshot(const P29NeedExpectation&, need_frames)`, which
+   needs **no** pending TU: `validate_need`'s body is factored into one
+   helper taking `(expected, missing_regions, bytes)` and called by both
+   `validate_need` and `confirm_need_snapshot` with identical `fail()`
+   strings, so `K=1` stays byte-identical. Decoding TX `n`'s NEED frames
+   after TX `n+1`'s `begin_tu()` is safe: `MessageCodec::decode`
+   (`p29_wire.h:485-512`) resets its zstd session on every call.
+2. `CActiveTx` (`cache/p50_slice0.h:325-338`) gains
+   `std::optional<codec::P29NeedExpectation> predicted_need` and
+   `bool need_confirmed`. `commit_predicted_v1()` records, *before*
+   `serializer.commit()`: the snapshot (eager-FILL case, per-route
+   `answered_need` empty) or `need_confirmed = true` (fresh-head answer
+   case, NEED already consumed). A per-entry confirm keyed by `rel_seq`
+   replaces the serializer-pending path for predict-committed entries; the
+   per-route `answered_need`/`fill_answered` flags continue to gate only the
+   newest (pending) TX. `retire_locked_commits` treats a predict-committed
+   head with `!need_confirmed` as a deviation (F always sends NEED before
+   COMMIT).
+3. `run_connected`'s `K>1` gates are: at Site A/B, immediately after the
+   FILL write, `commit_predicted_p29v1(handle)` (a new owner-checked
+   `P50PreparationAuthority` wrapper) *then* `control.write_complete()` —
+   the 4c lock-release point stays where 4c landed it — plus the
+   poison-on-deviation guard from the 4d brief (no reconcile branches while
+   successors exist). At `depth == 1` no predict-commit runs and
+   `write_complete` fires exactly where 4c landed it. Nothing else in the
+   straight-line body changes.
+4. A would-be successor for which `fill_p29v1_before_need` returns
+   `nullopt` (NEED could list more regions than the early-FILL bound) does
+   not open a successor dialogue: it keeps the route lock, waits
+   level-triggered on the same waiter machinery until the window is empty,
+   then runs the *unchanged* head path (fresh-head, Site B). Its begun
+   `pre_state_digest` equals `impl_->state` once the head retires as
+   predicted; a mismatch is a deviation.
+5. The endpoint's window-slot wait (`wait_for_window_slot`) runs in
+   `P50ZstdSourceSender::transfer_bytes` *before* `prepare_for_route`, so a
+   `(K+1)`-th concurrent transfer never reaches
+   `prepare_for_route`'s admission throw (`cache/p50_endpoint.cpp:1107-1110`
+   / `begin_v1`'s `cache/p50_slice0.cpp:1881-1882`), which would otherwise
+   escalate to the sticky cold-replacement path
+   (`client/p50_zstd_sender.cpp:600-607`). The admission throw stays as a
+   defensive assert. At `depth == 1` the wait returns without suspending.
+
 Branch: `perf-pipe`, off `a348414e` ("services/sys_close_range.h: guard the UAPI
 include with `__has_include`"), the current farm "perf-combo" build
 (instrumentation + robustness fixes + perf-opt).
@@ -182,15 +301,25 @@ to the same outcome enum on mismatch — no new fallback vocabulary needed.
    this design; the serializer's existing "at most one pending TU" guard is
    relied upon, not generalized — see invariant 2's correction in §2 and the
    paragraph after diff item 6 below.
-4. `P50ClientEndpoint::Impl` (`active_session` at 1892, `next_rel` at 1898,
-   `state` at 1899): scalar `active_session`/`active`/`queued` → an ordered
-   map/deque keyed by `rel_seq`, each entry owning its *own* `ClientIoState`
-   (socket). This is required, not optional: `async_wait_peer_close`'s guard at
-   `cache/p50_endpoint.cpp:788-802` ("message arrived after final TX_COMMIT" at
-   line 799) structurally forbids sending a second BEGIN on one already-committed
-   connection, so TX `n+1` *must* use a brand-new TCP connection — confirmed
-   independently from both the C-side and F-side audits. `run_connected`'s guard
-   at 3339-3340 becomes "already have `K` outstanding dialogues for this route."
+4. **(Corrected 2026-10-08 — see errata above.)** `P50ClientEndpoint::Impl`
+   (`active_session` at 1892, `next_rel` at 1898, `state` at 1899): scalar
+   `active_session`/`active`/`queued` → a bounded **window** of up to `K`
+   outstanding dialogues, ordered by `rel_seq`: a HEAD (the oldest, today's
+   sole dialogue) plus up to `K-1` SUCCESSORS. `ClientIoState`/
+   `ClientRunSocketTarget` need **no** change — they are already constructed
+   fresh per `run_connected()` call, never stored on `Impl`. This is
+   required, not optional: `async_wait_peer_close`'s guard at
+   `cache/p50_endpoint.cpp:788-802` ("message arrived after final TX_COMMIT"
+   at line 799) structurally forbids sending a second BEGIN on one
+   already-committed connection, so TX `n+1` *must* use a brand-new TCP
+   connection — confirmed independently from both the C-side and F-side
+   audits. `run_connected`'s guard at 3339-3340 becomes "already have `K`
+   outstanding dialogues for this route." All existing reconciliation
+   machinery (exact/`same_f` match, `HISTORY_RESET` fallback,
+   `LOST_COMMIT_ACCEPTED` replay detection, `accept`/`stamp`/`live_identity`)
+   stays keyed to the HEAD only and runs only when the window holds no
+   successors; see the errata above for the any-deviation-while-successors-
+   exist handling.
 5. For TX `n+1`, reuse the existing `pipelined_begin` code path
    (3505-3512 gate, 3514-3555 body) almost verbatim: open a new connection, write
    HELLO, then — gated on `predicted_cursor_` being valid (TX `n` already

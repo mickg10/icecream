@@ -2031,6 +2031,16 @@ std::span<const uint8_t> CRoute::build_fill_v1(
     }
 }
 
+bool CRoute::fill_before_need_possible(size_t max_need_regions) const {
+    // Read-only twin of fill_v1_before_need's admission bound: same entry
+    // freshness conditions, but no FILL is built and no route flag consumed.
+    if (active_queue_.empty() ||
+        active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
+        p29v1_->terminal || p29v1_->fill_answered)
+        return false;
+    return p29v1_->serializer.pending_missing_regions() <= max_need_regions;
+}
+
 std::optional<std::span<const uint8_t>> CRoute::fill_v1_before_need(
     size_t max_need_regions) {
     if (active_queue_.empty() ||
@@ -2072,6 +2082,52 @@ void CRoute::confirm_need_v1(std::span<const uint8_t> inner_need) {
     }
 }
 
+void CRoute::confirm_need_v1(RelSeq rel_seq, std::span<const uint8_t> inner_need) {
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): the per-entry confirm.  A predict-committed entry's
+    // serializer pending is already gone (clear_pending ran in
+    // commit_predicted_v1()), so it validates against the snapshot recorded
+    // there; any other entry delegates to the legacy path, which requires
+    // the newest pending TU.  The per-route answered_need/fill_answered
+    // flags keep gating only that legacy newest-entry path.
+    const auto entry = std::find_if(
+        active_queue_.begin(), active_queue_.end(),
+        [&](const CActiveTx& candidate) {
+            return candidate.begin.rel_seq == rel_seq;
+        });
+    if (entry == active_queue_.end() ||
+        entry->begin.profile != ProfileId::P29V1)
+        throw std::logic_error(
+            "P29V1 NEED does not name an outstanding route successor");
+    if (entry->predicted_post_digest) {
+        // Predict-committed: the serializer pending is gone, so the NEED
+        // validates through the snapshot recorded at predict-commit time.
+        // A confirm for an entry whose NEED was already consumed (or was
+        // never snapshotted) is a protocol deviation.
+        if (entry->need_confirmed || !entry->predicted_need)
+            throw std::logic_error(
+                "P29V1 predict-committed successor has no NEED snapshot");
+        try {
+            require_need_tu_end(inner_need);
+            p29v1_->serializer.confirm_need_snapshot(
+                *entry->predicted_need,
+                inner_need.first(inner_need.size() - 5));
+            entry->need_confirmed = true;
+            entry->predicted_need.reset();
+        } catch (...) {
+            poison_v1();
+            throw;
+        }
+        return;
+    }
+    // Legacy path (depth 1, or the not-yet-predict-committed newest entry):
+    // only the newest entry may confirm through the serializer's pending.
+    if (&*entry != &active_queue_.back())
+        throw std::logic_error(
+            "P29V1 NEED confirm is not the route's pending successor");
+    confirm_need_v1(inner_need);
+}
+
 const CActiveTx& CRoute::commit_predicted_v1() {
     if (active_queue_.empty())
         throw std::logic_error("C route has no ACTIVE_TX to predict-commit");
@@ -2081,6 +2137,19 @@ const CActiveTx& CRoute::commit_predicted_v1() {
             "C route's newest ACTIVE_TX was already predict-committed");
     if (active.begin.profile != ProfileId::P29V1 || !p29v1_ || p29v1_->terminal)
         throw std::logic_error("P29V1 route cannot predict-commit");
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): serializer.commit() below ends this entry's serializer
+    // pending (clear_pending), so the NEED expectation its confirm would
+    // otherwise validate through pending_ must be recorded first.  An
+    // empty per-route answered_need means the NEED is still owed
+    // (eager-FILL entry): snapshot it.  A non-empty answered_need means
+    // this entry's NEED was already consumed (fresh-head answer path).
+    // Neither branch runs at max_active_tx() == 1: nothing calls
+    // commit_predicted_v1() there.
+    if (p29v1_->answered_need.empty())
+        active.predicted_need = p29v1_->serializer.need_expectation();
+    else
+        active.need_confirmed = true;
     try {
         p29v1_->serializer.commit();
         if (p29v1_route_state_bytes() > p29v1_->max_route_state_bytes)
@@ -2143,7 +2212,14 @@ void CRoute::restart_v1_for_transport_retry() {
 
 void CRoute::reset_v1_route(FStoreGuid f_store_guid,
                             HistoryNonce history_nonce) {
-    if (active_queue_.empty() ||
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): after a pipeline poison the bridge's abandon_route() has
+    // already cleared the whole queue, and the cold HISTORY_RESET dance must
+    // still be able to rebuild the route from an empty one -- refusing here
+    // would strand the route (sticky). abandon_active() inside
+    // reset_history() is already a no-op on an empty queue, so only the
+    // profile of a live back() is checked.
+    if (!active_queue_.empty() &&
         active_queue_.back().begin.profile != ProfileId::P29V1)
         throw std::logic_error(
             "C route has no active P29V1 transaction to reset");
@@ -2213,6 +2289,22 @@ void CRoute::retire_locked_commits() {
                 p29v1_->terminal = true;
                 throw;
             }
+        } else if (!head.need_confirmed &&
+                   head_action == ActionType::COMMIT_ACCEPTED) {
+            // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1,
+            // 2026-10-08 errata): F always sends NEED before TX_COMMIT, so
+            // a predict-committed head retiring through the ordinary
+            // COMMIT_ACCEPTED path with an unconfirmed NEED means the NEED
+            // frame never arrived -- the head deviated and the whole chain
+            // is invalid, not retired.  LOST_COMMIT_ACCEPTED is exempt: its
+            // connection is definitionally gone (drop between FILL and
+            // NEED, F committed anyway) and the recovered commit itself is
+            // the proof, so the route must stay usable -- poisoning here
+            // would be a sticky silent P29V1 loss, exactly the class this
+            // codebase spent weeks killing.
+            p29v1_->terminal = true;
+            throw std::logic_error(
+                "P29V1 predict-committed head retired without its NEED");
         }
         state_digest_ = head_commit.post_state_digest;
         confirmed_cursor_.value = head.begin.rel_seq.value + 1;

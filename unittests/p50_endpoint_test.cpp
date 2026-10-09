@@ -1121,6 +1121,97 @@ void test_route_pipeline_k1_identity() {
             "route cursor progression");
 }
 
+// Step 4 sub-step 4a (research/designs/P50_ROUTE_PIPELINING.md, "Step 4"):
+// K=1 identity capture. This records the exact client+server wire bytes
+// (via EndpointIoControl::outbound_message_observer, the existing
+// production-safe test seam -- no new plumbing) plus the C-side action
+// trace for a sequential multi-TX K=1 dialogue on one P29V1 route, folds
+// everything into a single Digest128, and freezes it against a golden
+// value captured from pre-Step-4 code. Every later Step 4 sub-step (4b-4e)
+// must keep this test green: with K=1 (one TX fully committed before the
+// next begins), observable wire bytes and action-trace content must stay
+// byte-identical even once K>1 pipelining lands for K>=2.
+void test_p29v1_k1_pipeline_wire_identity() {
+    const P5coStoreGuids guids = p5co_store_guids(237);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, &actions,
+                      authority_limits);
+
+    icecc::Digest128Builder builder;
+    const auto observe = [&builder](ActorSide actor, const Message& message) {
+        builder.append_u8(static_cast<uint8_t>(actor));
+        const std::vector<uint8_t> frame = encode_frame(message);
+        builder.append_u32(static_cast<uint32_t>(frame.size()));
+        builder.append(std::span<const uint8_t>(frame));
+    };
+    EndpointIoControl client_control;
+    client_control.outbound_message_observer = observe;
+    EndpointIoControl server_control;
+    server_control.outbound_message_observer = observe;
+
+    const std::vector<uint8_t> tu1 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nfirst-tu\n");
+    const std::vector<uint8_t> tu2 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nsecond-tu\n");
+    const std::vector<uint8_t> tu3 =
+        bytes("# 1 \"/tmp/k1-fixture.cc\"\nthird-tu\n");
+
+    const PairResult first = run_pair(client, server, admit(client, tu1),
+                                       client_control, server_control);
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed &&
+                first.server.committed_input.has_value(),
+            "K1 identity: first TU did not commit");
+    server.close_input_job(*first.server.committed_input);
+
+    const PairResult second = run_pair(client, server, admit(client, tu2),
+                                        client_control, server_control);
+    require(second.client.status == ClientRunStatus::Committed &&
+                second.server.status == ServerRunStatus::Completed &&
+                second.server.committed_input.has_value(),
+            "K1 identity: second TU did not commit");
+    server.close_input_job(*second.server.committed_input);
+
+    const PairResult third = run_pair(client, server, admit(client, tu3),
+                                       client_control, server_control);
+    require(third.client.status == ClientRunStatus::Committed &&
+                third.server.status == ServerRunStatus::Completed &&
+                third.server.committed_input.has_value(),
+            "K1 identity: third TU did not commit");
+    server.close_input_job(*third.server.committed_input);
+
+    require(client.endpoint.next_rel_seq().value == 3,
+            "K1 identity: route rel_seq did not advance 1,2,3 across "
+            "sequential K=1 TUs");
+
+    if (const auto error = check_action_trace(actions.records()))
+        fail("K1 identity action trace: " + *error);
+    for (const ActionRecord& record : actions.records())
+        builder.append(action_jsonl(record));
+
+    // Golden value captured from pre-Step-4 code (today's base). Any Step 4
+    // sub-step that changes this value for a K=1 dialogue has broken the
+    // "K=1 stays byte-identical" invariant and must be investigated, not
+    // silently re-baselined.
+    const icecc::Digest128 golden{{
+        0x86, 0x88, 0x34, 0x20, 0xa6, 0x4c, 0x8c, 0xc5,
+        0xc1, 0x42, 0xaf, 0x51, 0xa6, 0x6d, 0xcf, 0xc3,
+    }};
+    const icecc::Digest128 actual = builder.finish();
+    require(actual == golden,
+            "K1 wire+action identity drifted from the pre-Step-4 golden "
+            "capture (actual_hex=" + icecc::digest128_hex(actual) +
+            "); every Step 4 sub-step must keep K=1 byte-identical per "
+            "P50_ROUTE_PIPELINING.md Step 4");
+}
+
 void test_profile_materialized_result_digest_gates() {
     uint64_t identity = 19000;
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
@@ -6200,6 +6291,895 @@ void test_commit_identity_negative_matrix() {
     }
 }
 
+// ===== Step 4 sub-step 4d core: K>1 successor window (P50_ROUTE_PIPELINING.md) =====
+//
+// The F side of these fixtures is a raw socket coroutine driving the REAL
+// FStore state machine (begin/append_body/need_frames/append_fill_v1/
+// materialize_and_verify/commit_input), not P50ServerEndpoint: the real
+// server endpoint still rejects a successor TX_BEGIN while its predecessor
+// is ACTIVE (FStore::begin's occupied-slot check, cache/p50_slice0.cpp) --
+// F-side parking is Step 5. The fake implements the approved release shape
+// instead (design section 1.2 point 4): a successor connection defers
+// stage()+STATE until its predecessor's commit_input, so the successor
+// observes the post-predecessor cursor, exactly what C's predicted witness
+// expects.
+
+struct RawParkedRouteState {
+    explicit RawParkedRouteState(CStoreGuid c_guid_value, FStoreGuid f_guid_value)
+        : store(f_guid_value), c_guid(c_guid_value) {
+        session = store.connect(c_guid);
+    }
+    FStore store;
+    CStoreGuid c_guid;
+    SessionHandle session{};
+    bool route_established = false;
+    // Park release is a plain flag, polled with a 1 ms asio timer from the
+    // successor connection (a std::future::get() would block the one
+    // io_context thread these fixtures share and deadlock the head).
+    std::atomic<bool> predecessor_committed{false};
+    // T2: set by the successor after its COMMIT write; the head polls it
+    // before writing its own COMMIT so the successor's COMMIT observably
+    // precedes the head's on the wire.
+    std::atomic<bool> successor_commit_written{false};
+    // T3: poison the released successor's staged STATE digest.
+    std::atomic<bool> corrupt_successor_state{false};
+    // T4: the head connection drops right after NEED (no COMMIT), with the
+    // successor already outstanding.
+    std::atomic<bool> head_drop_after_need{false};
+    // T5: the head connection never writes COMMIT; the successor's own wait
+    // deadline must fire first.
+    std::atomic<bool> head_never_commits{false};
+    // T8 (review point 2): the head commits at F (materialize+commit_input)
+    // but drops the connection without writing the COMMIT frame, so a later
+    // STATE proves the commit via LOST_COMMIT_ACCEPTED. The route must stay
+    // usable: no sticky terminal, no poison.
+    std::atomic<bool> head_commit_but_drop_commit_frame{false};
+    // T9 (follow-up review): the successor connection dies after HELLO --
+    // before its released STATE -- with the head healthy. C must poison the
+    // route (the successor's predict-commit advanced C's serializer past a
+    // TX F will never apply), the head must still commit, and the next TX
+    // must recover through the cold HISTORY_RESET path.
+    std::atomic<bool> successor_drop_after_hello{false};
+};
+
+// One connection of the parked fake F. `park` is set for successor
+// connections: STATE is deferred until the predecessor's commit_input (the
+// release trigger of design section 1.2 point 5), then presents the
+// post-predecessor cursor -- exactly C's predicted witness.
+asio::awaitable<void> raw_parked_f_serve_connection(
+    tcp::acceptor& acceptor, const std::shared_ptr<RawParkedRouteState>& state,
+    bool park, bool wait_for_successor_commit, TxBegin& out_begin,
+    std::vector<uint8_t>& out_body) {
+    tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+    const auto executor = co_await asio::this_coro::executor;
+    const SessionHello hello =
+        raw_decode<SessionHello>(co_await raw_read(socket, kInitialMaxFramePayload));
+    const SessionSelection selection =
+        negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
+    const uint32_t cap = selection.limits.max_frame_payload;
+    TxBegin& begin = out_begin;
+    if (park && state->successor_drop_after_hello.load()) {
+        // T9: the successor's own socket dies before its released STATE.
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    bool have_begin = false;
+    if (!state->route_established) {
+        SessionState fresh;
+        fresh.wire_revision = selection.wire_revision;
+        fresh.negotiated_profiles = selection.negotiated_profiles;
+        fresh.limits = selection.limits;
+        fresh.f_store_guid = state->store.guid();
+        co_await raw_write(socket, Message{fresh});
+        const HistoryReset reset =
+            raw_decode<HistoryReset>(co_await raw_read(socket, cap));
+        state->store.start_route(state->session, reset.history_nonce,
+                                 reset.initial_state_digest);
+        state->route_established = true;
+    } else if (!park) {
+        // Established route: present the live cursor. A cold C endpoint
+        // (post-pipeline-poison reset) answers with HISTORY_RESET; apply
+        // it and re-present, exactly the unchanged server behavior.
+        SessionState live = state->store.resume(state->session);
+        live.wire_revision = selection.wire_revision;
+        live.negotiated_profiles = selection.negotiated_profiles;
+        co_await raw_write(socket, Message{live});
+        Frame next = co_await raw_read(socket, cap);
+        if (next.type == MessageType::HISTORY_RESET) {
+            const HistoryReset reset = raw_decode<HistoryReset>(next);
+            // The real server drops the retained route before installing
+            // the reset one (FStore::start_route refuses an existing
+            // route; forget_route is the same legality gate the server
+            // applies: only outside ACTIVE_TX).
+            state->store.forget_route(state->session);
+            state->store.start_route(state->session, reset.history_nonce,
+                                      reset.initial_state_digest);
+        } else {
+            begin = raw_decode<TxBegin>(next);
+            have_begin = true;
+        }
+    }
+    if (park) {
+        // Deferred stage()/STATE: park (polling, never blocking) until the
+        // predecessor committed, then present the post-predecessor cursor.
+        asio::steady_timer park_timer(executor);
+        while (!state->predecessor_committed.load()) {
+            park_timer.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await park_timer.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        SessionState staged = state->store.resume(state->session);
+        staged.wire_revision = selection.wire_revision;
+        staged.negotiated_profiles = selection.negotiated_profiles;
+        if (state->corrupt_successor_state.load())
+            staged.state_digest.bytes[0] ^= 0x80;
+        co_await raw_write(socket, Message{staged});
+    } else if (!have_begin) {
+        // Fresh-route or reset-just-applied: acknowledge the new route with
+        // its own cursor, then read the begin.
+        SessionState ack = state->store.resume(state->session);
+        ack.wire_revision = selection.wire_revision;
+        ack.negotiated_profiles = selection.negotiated_profiles;
+        co_await raw_write(socket, Message{ack});
+    }
+    if (!have_begin)
+        begin = raw_decode<TxBegin>(co_await raw_read(socket, cap));
+    state->store.begin(state->session, begin);
+    uint64_t body_bytes = 0;
+    while (body_bytes < begin.body.encoded_bytes) {
+        const BodyMessage body =
+            raw_decode<BodyMessage>(co_await raw_read(socket, cap));
+        if (body.bytes.empty())
+            break;
+        body_bytes += body.bytes.size();
+        state->store.append_body(state->session, body.bytes);
+        out_body.insert(out_body.end(), body.bytes.begin(), body.bytes.end());
+    }
+    for (const NeedMessage& need :
+         encode_p29v1_need_messages(
+             state->store.p29v1_need_frames(state->session), cap, 1 << 20))
+        co_await raw_write(socket, Message{need});
+    if (state->head_drop_after_need.load() && !park) {
+        // T4: abrupt head drop with the successor outstanding. Everything
+        // after NEED (FILL/COMMIT) is withheld.
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    // FILL: read the frames C sent (the successor sent them before NEED; the
+    // head answers NEED with them) until the inner stream is complete.
+    P29V1FillStreamDecoder fill_decoder(1 << 20);
+    bool fill_seen = false;
+    while (!fill_decoder.complete()) {
+        const Frame frame = co_await raw_read(socket, cap);
+        if (frame.type != MessageType::FILL)
+            throw std::invalid_argument(
+                "parked fake F expected FILL frames after NEED");
+        fill_decoder.push(raw_decode<FillMessage>(frame));
+        fill_seen = true;
+    }
+    if (fill_seen)
+        state->store.append_fill_v1(state->session,
+                                    fill_decoder.take_inner_frames());
+    (void)state->store.materialize_and_verify(state->session);
+    if (state->head_commit_but_drop_commit_frame.load() && !park) {
+        // T8: F durably commits but never writes the COMMIT frame.
+        (void)state->store.commit_input(state->session);
+        state->predecessor_committed.store(true);
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    const TxCommit commit = state->store.commit_input(state->session);
+    if (park)
+        state->successor_commit_written.store(true);
+    else {
+        state->predecessor_committed.store(true);
+        if (wait_for_successor_commit) {
+            asio::steady_timer order_timer(executor);
+            while (!state->successor_commit_written.load()) {
+                order_timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await order_timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+        }
+    }
+    if (state->head_never_commits.load() && !park) {
+        // T5: the head never writes its COMMIT; C's own transfer deadline
+        // must be the thing that fails it. Sit in the peer-close wait until
+        // C gives up and closes.
+        co_await raw_wait_for_close(socket);
+        co_return;
+    }
+    co_await raw_write(socket, Message{commit});
+    co_await raw_wait_for_close(socket);
+}
+
+
+// Shared driver for the K=2 window scenarios: one endpoint, one parked
+// fake F (real FStore), two TUs. The successor TX's run is spawned from the
+// head's write_complete callback (the point the 4c route lock releases in
+// production, and strictly after the head's predict-commit at Site B), so
+// the successor's prepare_for_route sees the head predict-committed exactly
+// as the production lock ordering guarantees.
+struct K2PipelineScenario {
+    enum class HeadOutcome { Commit, DropAfterNeed, NeverCommit };
+    enum class SuccessorOutcome { Commit, CorruptStateDigest, DeadlineWait };
+
+    HeadOutcome head_outcome = HeadOutcome::Commit;
+    SuccessorOutcome successor_outcome = SuccessorOutcome::Commit;
+    bool force_successor_commit_first = false;
+    uint8_t seed = 240;
+    std::chrono::steady_clock::time_point successor_deadline{};
+    bool has_successor_deadline = false;
+};
+
+struct K2PipelineRunResult {
+    ClientRunResult head;
+    ClientRunResult successor;
+    TxBegin head_begin;
+    TxBegin successor_begin;
+    // The bridge (client/p50_zstd_sender.cpp) does the poison teardown in
+    // production; the tests own the same calls, so the client and the
+    // successor handle outlive context.run().
+    std::shared_ptr<TestClient> client;
+    PreparedTuHandle successor_handle;
+    std::function<void()> spawn_successor;
+    std::shared_ptr<RawParkedRouteState> fake;
+    std::shared_ptr<std::atomic<ClientStallStage>> successor_stall;
+};
+
+void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
+    const P5coStoreGuids guids = p5co_store_guids(scenario.seed);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    auto client = std::make_shared<TestClient>(guids.c, caps, HistoryNonce{1},
+                                               nullptr, nullptr, limits);
+    auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
+    out.client = client;
+    out.fake = state;
+    if (scenario.head_outcome ==
+        K2PipelineScenario::HeadOutcome::DropAfterNeed)
+        state->head_drop_after_need.store(true);
+    if (scenario.head_outcome ==
+        K2PipelineScenario::HeadOutcome::NeverCommit)
+        state->head_never_commits.store(true);
+    if (scenario.successor_outcome ==
+        K2PipelineScenario::SuccessorOutcome::CorruptStateDigest)
+        state->corrupt_successor_state.store(true);
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+
+    const std::vector<uint8_t> tu1 = bytes("# 1 \"/tmp/k2-fixture.cc\"\nalpha-tu\n");
+    const std::vector<uint8_t> tu2 = bytes("# 1 \"/tmp/k2-fixture.cc\"\nbeta-tu\n");
+    const PreparedTuHandle head_handle = admit(*client, tu1);
+
+    TxBegin succ_begin_capture;
+    std::vector<uint8_t> succ_body_capture;
+    std::promise<void> successor_spawned;
+    std::optional<std::future<ClientRunResult>> successor_result;
+
+    EndpointIoControl head_control;
+    std::atomic<bool> head_write_complete_fired{false};
+    out.successor_stall = std::make_shared<std::atomic<ClientStallStage>>(
+        ClientStallStage::Connecting);
+    head_control.write_complete = [&]() {
+        // Production (client/p50_zstd_sender.cpp + p50_cache_service.cpp)
+        // only RELEASES the route transfer lock here; TX n+1's transfer
+        // then prepares and runs in its OWN coroutine on the owner. The
+        // test models exactly that: never admit (prepare) inline from
+        // inside the head's dialogue -- post the successor transfer.
+        if (head_write_complete_fired.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            // The head predict-committed (Site B) immediately before this
+            // post landed: the successor's prepare_for_route sees the
+            // head's predicted_post_digest, exactly the production lock
+            // ordering.
+            out.successor_handle = admit(*client, tu2);
+            const PreparedTuHandle succ_handle = out.successor_handle;
+            EndpointIoControl successor_control;
+            successor_control.stall_stage = out.successor_stall.get();
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client->endpoint.run(
+                    remote, succ_handle, successor_control,
+                    scenario.has_successor_deadline
+                        ? std::optional<std::chrono::steady_clock::time_point>(
+                              scenario.successor_deadline)
+                        : std::nullopt),
+                asio::use_future));
+            successor_spawned.set_value();
+        });
+    };
+
+    TxBegin head_begin_capture;
+    std::vector<uint8_t> head_body_capture;
+    std::future<void> head_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, false,
+                                      scenario.force_successor_commit_first,
+                                      head_begin_capture, head_body_capture),
+        asio::use_future);
+
+
+    TxBegin succ_begin_wire;
+    std::vector<uint8_t> succ_body_wire;
+    std::future<void> successor_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, true, false,
+                                      succ_begin_wire, succ_body_wire),
+        asio::use_future);
+    (void)succ_begin_capture;
+    (void)succ_body_capture;
+
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context,
+        client->endpoint.run(
+            remote, head_handle, head_control,
+            scenario.head_outcome == K2PipelineScenario::HeadOutcome::NeverCommit
+                ? std::optional<std::chrono::steady_clock::time_point>(
+                      std::chrono::steady_clock::now() + std::chrono::seconds(4))
+                : std::nullopt),
+        asio::use_future);
+
+    context.run();
+    out.head = head_result.get();
+    if (successor_result.has_value())
+        out.successor = successor_result->get();
+    out.head_begin = head_begin_capture;
+    out.successor_begin = succ_begin_wire;
+    (void)successor_spawned;
+}
+
+// T1: K=2 straight line. The successor opens while the head is outstanding;
+// both commit; retirement and confirmed state advance in rel_seq order.
+void test_p29v1_k2_pipeline_straight_line() {
+    K2PipelineScenario scenario;
+    scenario.seed = 240;
+    K2PipelineRunResult run;
+    k2_drive(scenario, run);
+    require(run.head.status == ClientRunStatus::Committed,
+            "K2 straight line: head TX did not commit");
+    require(run.successor.status == ClientRunStatus::Committed,
+            std::string("K2 straight line: successor TX did not commit "
+                        "(status=") +
+                std::to_string(static_cast<uint8_t>(run.successor.status)) +
+                " observation=" +
+                std::to_string(
+                    static_cast<uint8_t>(run.successor.observation)) +
+                " reconnect=" +
+                std::to_string(
+                    static_cast<uint8_t>(run.successor.reconnect)) +
+                " terminal=" +
+                (run.successor.terminal_error.has_value()
+                     ? run.successor.terminal_error->detail
+                     : std::string("<none>")) +
+                " stall=" +
+                std::to_string(static_cast<uint8_t>(
+                    run.successor_stall
+                        ? run.successor_stall->load()
+                        : ClientStallStage::Connecting)) +
+                ")");
+    require(run.successor_begin.rel_seq.value ==
+                run.head_begin.rel_seq.value + 1,
+            "K2 straight line: successor rel_seq was not head+1");
+    require(run.head.committed_commit.has_value() &&
+                run.successor.committed_commit.has_value(),
+            "K2 straight line: commit witnesses missing");
+    require(run.successor_begin.pre_state_digest ==
+                run.head.committed_commit->post_state_digest,
+            "K2 straight line: the successor's pre-state is not the head's "
+            "predicted post-state (digest chain broken)");
+    require(run.client->endpoint.state_digest() ==
+                run.successor.committed_commit->post_state_digest,
+            "K2 straight line: confirmed state did not advance to the "
+            "successor's commit in rel_seq order");
+    require(run.client->endpoint.next_rel_seq().value == 2,
+            "K2 straight line: confirmed rel_seq did not advance past both "
+            "TXs");
+}
+
+// T2: the successor's COMMIT is forced onto the wire before the head's; C
+// must still retire strictly in rel_seq order (the successor waits, then
+// confirms after the head), and the confirmed state stays correct.
+void test_p29v1_k2_pipeline_successor_commit_dispatched_first() {
+    K2PipelineScenario scenario;
+    scenario.seed = 241;
+    scenario.force_successor_commit_first = true;
+    K2PipelineRunResult run;
+    k2_drive(scenario, run);
+    require(run.head.status == ClientRunStatus::Committed &&
+                run.successor.status == ClientRunStatus::Committed,
+            "K2 commit-order: both TXs did not commit");
+    require(run.successor_begin.pre_state_digest ==
+                run.head.committed_commit->post_state_digest,
+            "K2 commit-order: digest chain broken");
+    require(run.client->endpoint.state_digest() ==
+                run.successor.committed_commit->post_state_digest,
+            "K2 commit-order: confirmed state did not retire in rel_seq "
+            "order despite the successor's COMMIT arriving first");
+}
+
+// T3: a successor deviation (STATE digest mismatch). The successor fails,
+// the head still returns its own correct status, and after the bridge's
+// abandon+reset the next TX runs K=1-cold on a fresh history nonce.
+void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
+    K2PipelineScenario scenario;
+    scenario.seed = 242;
+    scenario.successor_outcome =
+        K2PipelineScenario::SuccessorOutcome::CorruptStateDigest;
+    K2PipelineRunResult run;
+    k2_drive(scenario, run);
+    require(run.head.status == ClientRunStatus::Committed,
+            "K2 successor-deviation: head status was not its own "
+            "correct Committed result");
+    require(run.successor.status != ClientRunStatus::Committed,
+            "K2 successor-deviation: successor did not fail");
+    require(run.client->endpoint.has_pipeline_poison(),
+            "K2 successor-deviation: route was not marked poisoned");
+    const HistoryNonce poisoned_nonce =
+        run.client->endpoint.f_store_guid().has_value()
+            ? HistoryNonce{0}
+            : HistoryNonce{0};
+    (void)poisoned_nonce;
+    // The sender bridge (client/p50_zstd_sender.cpp): retire this handle's
+    // own uncommitted route state, then the cold endpoint reset. Performed
+    // by the test exactly as transfer_bytes does, in the same order.
+    run.client->authority->abandon_route(run.successor_handle);
+    run.client->endpoint.reset_after_pipeline_poison();
+    require(!run.client->endpoint.has_pipeline_poison(),
+            "K2 successor-deviation: reset_after_pipeline_poison did not "
+            "clear the poison");
+    require(run.client->endpoint.pipeline_epoch_for_test() == 1,
+            "K2 successor-deviation: reset did not bump the epoch");
+    require(run.client->endpoint.next_rel_seq().value == 0,
+            "K2 successor-deviation: reset did not rewind the rel_seq "
+            "cursor");
+    // The next TX runs K=1-cold against the SAME F (production keeps the
+    // f_guid across a poison reset; only the route history is fresh): a
+    // fresh full dance (STATE first, then HISTORY_RESET on a new nonce,
+    // then the TU), exactly the K=1 cold path.
+    const std::vector<uint8_t> third =
+        bytes("# 1 \"/tmp/k2-fixture.cc\"\ncold-tx\n");
+    const PreparedTuHandle third_handle = admit(*run.client, third);
+    asio::io_context third_context;
+    tcp::acceptor third_acceptor(third_context,
+                                 {asio::ip::address_v4::loopback(), 0});
+    TxBegin third_begin_wire;
+    std::vector<uint8_t> third_body_wire;
+    std::future<void> third_fake = asio::co_spawn(
+        third_context,
+        raw_parked_f_serve_connection(third_acceptor, run.fake, false,
+                                      false, third_begin_wire,
+                                      third_body_wire),
+        asio::use_future);
+    std::atomic<ClientStallStage> third_stage{ClientStallStage::Connecting};
+    EndpointIoControl third_control;
+    third_control.stall_stage = &third_stage;
+    std::future<ClientRunResult> third_result = asio::co_spawn(
+        third_context,
+        run.client->endpoint.run(third_acceptor.local_endpoint(),
+                                 third_handle, third_control),
+        asio::use_future);
+    third_context.run();
+    const ClientRunResult cold = third_result.get();
+    require(cold.status == ClientRunStatus::Committed,
+            std::string("K2 successor-deviation: the post-reset TX did not "
+                        "run cold and commit (status=") +
+                std::to_string(static_cast<uint8_t>(cold.status)) +
+                " reconnect=" +
+                std::to_string(static_cast<uint8_t>(cold.reconnect)) +
+                " terminal=" +
+                (cold.terminal_error.has_value()
+                     ? cold.terminal_error->detail
+                     : std::string("<none>")) +
+                ")");
+    require(third_begin_wire.rel_seq.value == 0 &&
+                third_begin_wire.history_nonce.value !=
+                    run.head_begin.history_nonce.value,
+            "K2 successor-deviation: the cold TX did not run on a fresh "
+            "nonce at rel 0");
+    (void)third_fake;
+}
+
+// T4: head disconnect with a successor outstanding. Everything is torn down
+// (the successor fails), and the next TX runs cold after the bridge reset.
+void test_p29v1_k2_pipeline_head_disconnect_tears_down_successor() {
+    K2PipelineScenario scenario;
+    scenario.seed = 243;
+    scenario.head_outcome = K2PipelineScenario::HeadOutcome::DropAfterNeed;
+    K2PipelineRunResult run;
+    k2_drive(scenario, run);
+    require(run.head.status == ClientRunStatus::Disconnected,
+            std::string("K2 head-drop: head did not report its disconnect "
+                        "(status=") +
+                std::to_string(static_cast<uint8_t>(run.head.status)) +
+                " terminal=" +
+                (run.head.terminal_error.has_value()
+                     ? run.head.terminal_error->detail
+                     : std::string("<none>")) +
+                ")");
+    require(run.successor.status != ClientRunStatus::Committed,
+            "K2 head-drop: successor was not torn down");
+    require(run.client->endpoint.has_pipeline_poison(),
+            "K2 head-drop: route was not poisoned");
+    run.client->authority->abandon_route(run.successor_handle);
+    run.client->endpoint.reset_after_pipeline_poison();
+    require(run.client->endpoint.next_rel_seq().value == 0 &&
+                run.client->endpoint.pipeline_epoch_for_test() == 1,
+            "K2 head-drop: cold reset did not land");
+}
+
+// T5: the head never retires; the successor's wait times out by its own
+// deadline, poisons, and the bridge resets the route cold.
+void test_p29v1_k2_pipeline_successor_wait_deadline() {
+    K2PipelineScenario scenario;
+    scenario.seed = 244;
+    scenario.head_outcome = K2PipelineScenario::HeadOutcome::NeverCommit;
+    scenario.has_successor_deadline = true;
+    scenario.successor_deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
+    K2PipelineRunResult run;
+    k2_drive(scenario, run);
+    require(run.successor.status == ClientRunStatus::DeadlineExceeded,
+            "K2 wait-deadline: successor wait did not fail by its own "
+            "deadline");
+    require(run.client->endpoint.has_pipeline_poison(),
+            "K2 wait-deadline: route was not poisoned");
+    run.client->authority->abandon_route(run.successor_handle);
+    run.client->endpoint.reset_after_pipeline_poison();
+    require(!run.client->endpoint.has_pipeline_poison() &&
+                run.client->endpoint.pipeline_epoch_for_test() == 1,
+            "K2 wait-deadline: cold reset did not land");
+}
+
+// T8 (review point 2): K=2, head only, connection drops after FILL. F
+// durably committed but never wrote the COMMIT frame; a later retry's
+// STATE proves it via LOST_COMMIT_ACCEPTED. The route must stay usable
+// (recoverable, not a sticky silent P29V1 loss), and a fresh third TX
+// must still commit.
+void test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable() {
+    const P5coStoreGuids guids = p5co_store_guids(246);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
+    state->head_commit_but_drop_commit_frame.store(true);
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    const std::vector<uint8_t> tu1 = bytes("# 1 \"/tmp/k2-t8.cc\"\nhead-drop\n");
+    const PreparedTuHandle head_handle = admit(client, tu1);
+
+    TxBegin head_begin_capture, retry_begin_wire;
+    std::vector<uint8_t> head_body_wire, retry_body_wire;
+    std::future<void> head_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, false, false,
+                                      head_begin_capture, head_body_wire),
+        asio::use_future);
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, EndpointIoControl{}),
+        asio::use_future);
+    context.run();
+    const ClientRunResult head = head_result.get();
+    require(head.status == ClientRunStatus::Disconnected,
+            "T8: head drop did not surface as a disconnect");
+    require(client.has_active_transaction(),
+            "T8: head drop lost the retained retry state");
+    require(!client.endpoint.has_pipeline_poison(),
+            "T8: head-only drop poisoned the route (no successor existed)");
+    // One drop only: the retry connection must write its COMMIT normally.
+    state->head_commit_but_drop_commit_frame.store(false);
+
+    // Retry on the SAME retained handle: F's STATE now proves the commit.
+    asio::io_context retry_context;
+    tcp::acceptor retry_acceptor(retry_context,
+                                  {asio::ip::address_v4::loopback(), 0});
+    TxBegin retry_begin_capture;
+    std::vector<uint8_t> retry_body_capture;
+    std::future<void> retry_fake = asio::co_spawn(
+        retry_context,
+        raw_parked_f_serve_connection(retry_acceptor, state, false, false,
+                                      retry_begin_capture, retry_body_capture),
+        asio::use_future);
+    std::future<ClientRunResult> retry_result = asio::co_spawn(
+        retry_context,
+        client.endpoint.run(retry_acceptor.local_endpoint(), {}, EndpointIoControl{}),
+        asio::use_future);
+    retry_context.run();
+    const ClientRunResult retry = retry_result.get();
+    require(retry.status == ClientRunStatus::Committed &&
+                retry.reconnect ==
+                    EndpointReconnectOutcome::LostFinalAcknowledgement,
+            "T8: the lost-commit recovery did not commit through "
+            "LOST_COMMIT_ACCEPTED");
+    require(retry_begin_capture.rel_seq.value == head_begin_capture.rel_seq.value,
+            "T8: retry replayed a different rel_seq");
+    (void)retry_begin_wire;
+    (void)retry_body_wire;
+    (void)head_fake;
+    (void)retry_fake;
+
+    // The route is usable for a fresh next TX: no sticky terminal.
+    asio::io_context third_context;
+    tcp::acceptor third_acceptor(third_context,
+                                 {asio::ip::address_v4::loopback(), 0});
+    TxBegin third_begin_capture;
+    std::vector<uint8_t> third_body_capture;
+    std::future<void> third_fake = asio::co_spawn(
+        third_context,
+        raw_parked_f_serve_connection(third_acceptor, state, false, false,
+                                      third_begin_capture, third_body_capture),
+        asio::use_future);
+    const std::vector<uint8_t> tu3 = bytes("# 1 \"/tmp/k2-t8.cc\"\nthird-tx\n");
+    const PreparedTuHandle third_handle = admit(client, tu3);
+    std::future<ClientRunResult> third_result = asio::co_spawn(
+        third_context,
+        client.endpoint.run(third_acceptor.local_endpoint(), third_handle,
+                            EndpointIoControl{}),
+        asio::use_future);
+    third_context.run();
+    require(third_result.get().status == ClientRunStatus::Committed,
+            "T8: the route was NOT usable for the next TX after the "
+            "lost-commit recovery (sticky route poison)");
+}
+
+// T9 (follow-up review): a successor's own io failure is a route
+// deviation, not a local one. Its predict-commit already advanced C's
+// serializer and predicted cursor past a TX F will never apply, so any
+// later begin would build on state F does not have. The route must be
+// poisoned (all remaining successors torn down), the head must still
+// commit, and the next TX must recover through the cold HISTORY_RESET
+// path with a fresh nonce -- never a sticky route.
+void test_p29v1_k2_pipeline_successor_io_death_poisons_route() {
+    const P5coStoreGuids guids = p5co_store_guids(247);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
+    state->successor_drop_after_hello.store(true);
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    const std::vector<uint8_t> tu1 = bytes("# 1 \"/tmp/k2-t9.cc\"\nhead-ok\n");
+    const std::vector<uint8_t> tu2 = bytes("# 1 \"/tmp/k2-t9.cc\"\nsucc-dies\n");
+    const PreparedTuHandle head_handle = admit(client, tu1);
+
+    TxBegin head_begin_capture, succ_begin_wire;
+    std::vector<uint8_t> head_body_wire, succ_body_wire;
+    std::future<void> head_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, false, false,
+                                      head_begin_capture, head_body_wire),
+        asio::use_future);
+    std::future<void> succ_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, true, false,
+                                      succ_begin_wire, succ_body_wire),
+        asio::use_future);
+
+    std::atomic<bool> head_write_complete_fired{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    PreparedTuHandle successor_handle;
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        // Post, never prepare inline: same rule as the k2 driver.
+        if (head_write_complete_fired.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            successor_handle = admit(client, tu2);
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(remote, successor_handle,
+                                    EndpointIoControl{}, std::nullopt),
+                asio::use_future));
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, head_control),
+        asio::use_future);
+    context.run();
+    const ClientRunResult head = head_result.get();
+    require(head.status == ClientRunStatus::Committed,
+            "T9: the healthy head did not commit while its successor "
+            "died");
+    require(successor_result.has_value(), "T9: successor run never started");
+    const ClientRunResult successor = successor_result->get();
+    require(successor.status != ClientRunStatus::Committed,
+            "T9: the io-dead successor was not failed");
+    require(client.endpoint.has_pipeline_poison(),
+            "T9: a successor io death did not poison the route");
+    // Bridge: retire the successor's own uncommitted route state, then the
+    // cold endpoint reset (fresh nonce, rel 0). abandon_route clears the
+    // CRoute queue so the next prepare starts a fresh predicted line.
+    client.authority->abandon_route(successor_handle);
+    client.endpoint.reset_after_pipeline_poison();
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.next_rel_seq().value == 0,
+            "T9: cold reset did not land after the successor io death");
+    (void)head_fake;
+    (void)succ_fake;
+
+    // The next TX recovers through the cold HISTORY_RESET path: this fake
+    // route is already established, so the endpoint's fresh nonce forces
+    // the reset dance, and the TX commits with rel_seq 0 under the new
+    // nonce.
+    state->successor_drop_after_hello.store(false);
+    asio::io_context third_context;
+    tcp::acceptor third_acceptor(third_context,
+                                 {asio::ip::address_v4::loopback(), 0});
+    TxBegin third_begin_wire;
+    std::vector<uint8_t> third_body_wire;
+    std::future<void> third_fake = asio::co_spawn(
+        third_context,
+        raw_parked_f_serve_connection(third_acceptor, state, false, false,
+                                      third_begin_wire, third_body_wire),
+        asio::use_future);
+    const std::vector<uint8_t> tu3 = bytes("# 1 \"/tmp/k2-t9.cc\"\nrecovered\n");
+    const PreparedTuHandle third_handle = admit(client, tu3);
+    std::future<ClientRunResult> third_result = asio::co_spawn(
+        third_context,
+        client.endpoint.run(third_acceptor.local_endpoint(), third_handle,
+                            EndpointIoControl{}),
+        asio::use_future);
+    third_context.run();
+    const ClientRunResult third = third_result.get();
+    require(third.status == ClientRunStatus::Committed,
+            "T9: the route did not recover for the next TX after the "
+            "successor io death");
+    require(third_begin_wire.rel_seq.value == 0 &&
+                third_begin_wire.history_nonce.value !=
+                    head_begin_capture.history_nonce.value,
+            "T9: the recovered TX did not run cold (fresh nonce, rel 0)");
+    require(third.committed_commit.has_value() &&
+                third.committed_commit->rel_seq.value == 0,
+            "T9: the recovered commit did not land on the cold cursor");
+    (void)third_fake;
+}
+
+// T6b: at depth 1 the waiter machinery is never used -- the K=1 identity
+// gate (T6a, test_p29v1_k1_pipeline_wire_identity) stays byte-identical,
+// and both waiter structures stay empty through a full K=1 dialogue.
+void test_p29v1_k1_pipeline_waiters_never_used() {
+    const P5coStoreGuids guids = p5co_store_guids(239);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    TestClient client(guids.c, caps);
+    P50ServerEndpoint server(guids.f, caps);
+    const PairResult first =
+        run_pair(client, server, admit(client, bytes("# 1 \"/tmp/k1-waiter.cc\"\nfirst\n")));
+    require(first.client.status == ClientRunStatus::Committed &&
+                first.server.status == ServerRunStatus::Completed,
+            "K1 waiter probe: base dialogue did not commit");
+    require(client.endpoint.pipeline_window_size_for_test() == 0 &&
+                client.endpoint.pipeline_retire_waiter_count_for_test() == 0 &&
+                client.endpoint.pipeline_window_slot_waiter_count_for_test() == 0 &&
+                client.endpoint.pipeline_epoch_for_test() == 0,
+            "K1 waiter probe: window/waiter bookkeeping was touched at "
+            "depth 1");
+    // wait_for_window_slot at depth 1 returns true without suspending.
+    asio::io_context context;
+    std::future<bool> slot = asio::co_spawn(
+        context, client.endpoint.wait_for_window_slot(std::nullopt),
+        asio::use_future);
+    context.run();
+    require(slot.get(), "K1 waiter probe: depth-1 window wait did not "
+                        "resolve immediately");
+}
+
+// T7: a would-be successor that cannot confirm its NEED through an eager
+// FILL (the early-FILL admission bound is exceeded) does not open a
+// successor dialogue: it waits level-triggered for the window to empty and
+// then runs the unchanged head path -- no poison, wire identical to K=1
+// for that TX.
+void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
+    const P5coStoreGuids guids = p5co_store_guids(245);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+
+    // Force the early-FILL admission bound to zero for this test only:
+    // the fallback under test is "NEED could outgrow the bound -> stay on
+    // the head path", and the bound is a plain admission number, so driving
+    // it to 0 exercises the path deterministically instead of depending on
+    // interner region shapes (a real production TU is bounded by the same
+    // number on both the dispatch probe and the eager FILL itself).
+    require(::setenv("ICECC_P50_EARLY_NEED_REGION_BOUND", "0", 1) == 0,
+            "T7: could not lower the early-FILL bound");
+    const struct BoundRestore {
+        ~BoundRestore() { ::unsetenv("ICECC_P50_EARLY_NEED_REGION_BOUND"); }
+    } bound_restore;
+    const std::vector<uint8_t> huge = bytes(
+        "# 1 \"/tmp/k2-t7-big.cc\"\nunique-fallback-source\n");
+    const std::vector<uint8_t> small = bytes("# 1 \"/tmp/k2-t7.cc\"\nsmall\n");
+    const PreparedTuHandle head_handle = admit(client, small);
+
+    TxBegin head_begin_capture, succ_begin_wire;
+    std::vector<uint8_t> head_body_wire, succ_body_wire;
+    std::future<void> head_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, false, false,
+                                      head_begin_capture, head_body_wire),
+        asio::use_future);
+    std::future<void> succ_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, true, false,
+                                      succ_begin_wire, succ_body_wire),
+        asio::use_future);
+
+    std::atomic<bool> head_write_complete_fired{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    std::atomic<bool> eager_fill_possible{true};
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        // Post, never prepare inline: same rule as the k2 driver.
+        if (head_write_complete_fired.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            const PreparedTuHandle succ_handle = admit(client, huge);
+            eager_fill_possible.store(
+                client.authority->p29v1_fill_before_need_possible(succ_handle));
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(remote, succ_handle, EndpointIoControl{},
+                                    std::nullopt),
+                asio::use_future));
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, head_control),
+        asio::use_future);
+    context.run();
+    const ClientRunResult head = head_result.get();
+    require(head.status == ClientRunStatus::Committed,
+            "T7: head TX did not commit");
+    require(!eager_fill_possible.load(),
+            "T7: fixture did not exceed the early-FILL admission bound "
+            "(choose a bigger source)");
+    require(successor_result.has_value(), "T7: successor run never started");
+    const ClientRunResult successor = successor_result->get();
+    require(successor.status == ClientRunStatus::Committed,
+            "T7: fallback-to-head TX did not commit");
+    require(!client.endpoint.has_pipeline_poison(),
+            "T7: fallback poisoned the route (it must not)");
+    require(client.endpoint.pipeline_epoch_for_test() == 0,
+            "T7: fallback bumped the pipeline epoch (it must not)");
+    (void)succ_fake;
+    (void)head_fake;
+}
 
 // ===== same_commit negative coverage: lost-final reconnect path =====
 // Ruling part 2: after a lost final commit, a fake F presenting a well-formed
@@ -6806,6 +7786,7 @@ int main(int argc, char** argv) {
     if (std::getenv("ICECC_P50_P29_DIALOGUE_FOCUS") != nullptr) {
         test_p29v1_endpoint_route_dialogue_lifetime();
         test_p29v1_pipelined_begin();
+        test_p29v1_k1_pipeline_wire_identity();
         std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
         return 0;
     }
@@ -6813,6 +7794,16 @@ int main(int argc, char** argv) {
         test_route_pipeline_k1_identity();
         test_route_pipeline_park_releases_in_commit_order();
         test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor();
+        test_p29v1_k1_pipeline_waiters_never_used();
+        test_p29v1_k2_pipeline_straight_line();
+        test_p29v1_k2_pipeline_successor_commit_dispatched_first();
+        test_p29v1_k2_pipeline_successor_state_mismatch_poisons();
+        test_p29v1_k2_pipeline_head_disconnect_tears_down_successor();
+        test_p29v1_k2_pipeline_successor_wait_deadline();
+        test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable();
+        test_p29v1_k2_pipeline_successor_io_death_poisons_route();
+        test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
+        test_p29v1_k1_pipeline_wire_identity();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
     }
@@ -6865,6 +7856,16 @@ int main(int argc, char** argv) {
     test_p29v1_pipelined_begin();
     test_route_pipeline_park_releases_in_commit_order();
     test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor();
+    test_p29v1_k1_pipeline_wire_identity();
+    test_p29v1_k1_pipeline_waiters_never_used();
+    test_p29v1_k2_pipeline_straight_line();
+    test_p29v1_k2_pipeline_successor_commit_dispatched_first();
+    test_p29v1_k2_pipeline_successor_state_mismatch_poisons();
+    test_p29v1_k2_pipeline_head_disconnect_tears_down_successor();
+    test_p29v1_k2_pipeline_successor_wait_deadline();
+    test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable();
+    test_p29v1_k2_pipeline_successor_io_death_poisons_route();
+    test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())

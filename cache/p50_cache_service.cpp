@@ -2220,6 +2220,18 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     }
     route_config.p29_interner_fault_injection =
         config_.p29_interner_fault_injection;
+    // Step 4 (research/designs/P50_ROUTE_PIPELINING.md): a process-lifetime
+    // constant, sourced once here rather than per-request, mirroring the
+    // one-time route_lane_count() env-var read. Stays clamped to 1 (today's
+    // behavior) until ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is set, per
+    // RouteGate::route_pipeline_depth()'s own no-F-sequencer safety gate.
+    route_config.authority_limits.route_pipeline_depth =
+        RouteGate::route_pipeline_depth(
+            config_.endpoint_caps.profile == ProfileId::P29V1
+                ? CACHE_PROFILE_P29V1
+                : config_.endpoint_caps.profile == ProfileId::ZSTD_ROUTE
+                      ? CACHE_PROFILE_ZSTD_ROUTE
+                      : CACHE_PROFILE_ZSTD_TU);
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);
@@ -2888,15 +2900,23 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // Destructs (in reverse declaration order) immediately before
     // source_transfer_lock's own destructor runs, so this traces the
     // real unlock point without altering it.
+    // Step 4 sub-step 4c: the lock below is now released explicitly at the
+    // write_done wait, not implicitly at this function's return. lock_
+    // released_early tracks that so this trace fires exactly once, at the
+    // real release point, in either case.
+    bool lock_released_early = false;
     struct TransferLockReleaseTrace {
         const P50SourceArmFields &req;
+        const bool &released_early;
         ~TransferLockReleaseTrace()
         {
+            if (released_early)
+                return;
             icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
                 (int64_t)req.assignment_epoch, (int64_t)req.wire_job_id,
                 (int64_t)req.logical_job, (int64_t)req.compiler_attempt);
         }
-    } transfer_lock_release_trace{arm};
+    } transfer_lock_release_trace{arm, lock_released_early};
     struct ActiveTransfer {
         std::atomic<size_t>& count;
         explicit ActiveTransfer(std::atomic<size_t>& value) : count(value) { ++count; }
@@ -2950,6 +2970,22 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 
     auto completion = std::make_shared<std::promise<local::P50SourceTransferResult>>();
     std::future<local::P50SourceTransferResult> result = completion->get_future();
+    // Step 4 sub-step 4c (research/designs/P50_ROUTE_PIPELINING.md): write_done
+    // fires once this TX's last FILL byte is on the wire -- independent of,
+    // and strictly no later than, the final result above -- so the per-route
+    // transfer lock below can release there instead of after STATE/COMMIT.
+    // At K=1 (default route_pipeline_depth) nothing else is ever waiting on
+    // this lane's lock when write_done fires, so releasing it earlier is
+    // unobservable: this preserves the "K=1 is byte-identical to today"
+    // invariant (research/designs/P50_ROUTE_PIPELINING.md, invariant 12).
+    auto write_complete_promise = std::make_shared<std::promise<void>>();
+    std::future<void> write_done = write_complete_promise->get_future();
+    auto write_complete_fired = std::make_shared<std::atomic<bool>>(false);
+    std::function<void()> write_complete_signal =
+        [write_complete_promise, write_complete_fired]() {
+            if (!write_complete_fired->exchange(true, std::memory_order_acq_rel))
+                write_complete_promise->set_value();
+        };
     try {
         asio::co_spawn(
             context_,
@@ -2958,7 +2994,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
              prepared_source, selected_lane, gate_wait_ns,
              expected_c_guid = relationship.c_store_guid, source_mutex_wait_ns,
              source_mutex_service_start, transfer_start_mono_ns,
-             stall_stage]() mutable
+             stall_stage, write_complete_signal]() mutable
                 -> asio::awaitable<void> {
                 local::P50SourceTransferResult value = source_transfer_error(4);
                 ZstdSourceTransferResult observed;
@@ -2990,7 +3026,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                         observed = co_await route_owner_->transfer(
                             relationship, route_request, connection,
                             transfer_deadline, source_bytes, source_digest,
-                            stall_stage);
+                            stall_stage, write_complete_signal);
                     }
                     if (observed.replacement_required && !observed.route_local_failure)
                         route_replacement_required_.store(
@@ -3028,6 +3064,11 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                     {{"status", (int64_t)observed.status}});
                 if (source_authority_)
                     source_authority_->release_source(route_request);
+                // Step 4 sub-step 4c: guarantee write_done resolves no later
+                // than completion on every path (success, early return, or
+                // exception) above, including ones that never reached an
+                // EndpointIoControl::write_complete call. Idempotent.
+                write_complete_signal();
                 completion->set_value(value);
                 co_return;
             },
@@ -3041,20 +3082,20 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // CacheWire.  A bounded grace lets the owner coroutine publish its typed
     // terminal result without allowing a control worker to wait forever.
     const auto wait_limit = transfer_deadline + config_.cancellation_grace;
-    if (result.wait_until(wait_limit) != std::future_status::ready) {
-        // The coroutine still owns the retained route state.  Returning would
-        // release this route's gate and admit a successor concurrently with
-        // that live operation, recreating the overlap the gate forbids.
-        // Retire the supervised sidecar instead of exposing ambiguous state.
-        //
-        // Diagnostic-only, same ICECC_P50_OWNER_LAG_TRACE probe as above:
-        // this is the one place a stuck owner coroutine is observed from
-        // outside the owner thread, right before the process exits, so it
-        // is the only chance to record which stage it last reached. No
-        // allocation: route_identity_hash/last_stage/both durations below
-        // are plain arithmetic or a single relaxed atomic load, and
-        // append_owner_lag_stall_trace writes through the same stack-buffer
-        // snprintf + direct ::write as every other owner-lag record.
+    // The coroutine still owns the retained route state.  Returning would
+    // release this route's gate and admit a successor concurrently with
+    // that live operation, recreating the overlap the gate forbids.
+    // Retire the supervised sidecar instead of exposing ambiguous state.
+    //
+    // Diagnostic-only, same ICECC_P50_OWNER_LAG_TRACE probe as above:
+    // this is the one place a stuck owner coroutine is observed from
+    // outside the owner thread, right before the process exits, so it
+    // is the only chance to record which stage it last reached. No
+    // allocation: route_identity_hash/last_stage/both durations below
+    // are plain arithmetic or a single relaxed atomic load, and
+    // append_owner_lag_stall_trace writes through the same stack-buffer
+    // snprintf + direct ::write as every other owner-lag record.
+    const auto owner_stall_exit = [&]() {
         int64_t stall_now_mono_ns = 0;
         {
             struct timespec stall_now_ts{};
@@ -3090,7 +3131,23 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         if (config_.fail_stop)
             config_.fail_stop();
         std::_Exit(125);
-    }
+    };
+    // Step 4 sub-step 4c: wait for the write-complete signal first and
+    // release the per-route transfer lock there. write_done always resolves
+    // no later than result (write_complete_signal() is called, idempotently,
+    // on every path through the coroutine above), so this adds no new
+    // timeout trigger beyond the existing one on result below: it can only
+    // ever fire in exactly the cases where that wait would also eventually
+    // time out.
+    if (write_done.wait_until(wait_limit) != std::future_status::ready)
+        owner_stall_exit();
+    icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
+        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+    source_transfer_lock.unlock();
+    lock_released_early = true;
+    if (result.wait_until(wait_limit) != std::future_status::ready)
+        owner_stall_exit();
     return result.get();
 }
 

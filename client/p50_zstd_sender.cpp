@@ -536,12 +536,13 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                                     Clock::time_point deadline,
                                     std::shared_ptr<const std::vector<uint8_t>> source,
                                     std::optional<Digest128> raw_digest,
-                                    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+                                    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+                                    std::function<void()> write_complete) {
     if (source && source->size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
         source.reset();
     return transfer_bytes(ConnectionTarget{std::move(connection)}, request,
                           deadline, true, std::move(source), raw_digest,
-                          std::move(stall_stage));
+                          std::move(stall_stage), std::move(write_complete));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -552,7 +553,8 @@ P50ZstdSourceSender::transfer_bytes(
     bool explicit_route,
     std::shared_ptr<const std::vector<uint8_t>> source,
     std::optional<Digest128> known_digest,
-    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage) {
+    std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
+    std::function<void()> write_complete) {
     InFlightGuard in_flight_guard(&impl_->transfer_in_flight);
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
@@ -595,6 +597,25 @@ P50ZstdSourceSender::transfer_bytes(
     // One route owner serializes its transfers. Retain only this operation's
     // completions so byte accounting is bounded and includes either retry.
     impl_->wire_completions.clear();
+
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata item 5): wait for a free outstanding-dialogue slot
+    // BEFORE prepare_for_route, so a (K+1)-th concurrent transfer never
+    // reaches the authority's admission throw
+    // (cache/p50_endpoint.cpp:1107-1110) which would escalate to the sticky
+    // cold-replacement path. At the default depth of 1 this returns true
+    // without suspending. On timeout the transfer takes its ordinary
+    // route-local deadline failure, never the sticky path.
+    if (impl_->route_bound) {
+        const bool slot = co_await impl_->endpoint->wait_for_window_slot(
+            std::optional<Clock::time_point>(deadline));
+        if (!slot) {
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+            impl_->quarantine_transport(result, explicit_route);
+            co_return result;
+        }
+    }
 
     PreparedTuHandle prepared;
     uint64_t prepare_route_ns = 0;
@@ -639,10 +660,19 @@ P50ZstdSourceSender::transfer_bytes(
         try {
             EndpointIoControl io_control;
             io_control.stall_stage = stall_stage.get();
+            io_control.write_complete = write_complete;
             if (std::holds_alternative<boost::asio::ip::tcp::endpoint>(target)) {
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared,
                     io_control, deadline);
+                if (impl_->endpoint->has_pipeline_poison()) {
+                    // Step 4d: retire this handle's own uncommitted P29V1
+                    // route state before anything below treats this attempt
+                    // as terminal, while the transfer still counts as in
+                    // flight.
+                    impl_->authority->abandon_route(prepared);
+                    impl_->endpoint->reset_after_pipeline_poison();
+                }
             } else {
                 int connected_fd = -1;
                 // BUSY is capacity only: this attempt has not started and no
@@ -681,6 +711,11 @@ P50ZstdSourceSender::transfer_bytes(
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
                         connected_fd, prepared, io_control, deadline);
+                    if (impl_->endpoint->has_pipeline_poison()) {
+                        // Step 4d: same retirement as the other branch above.
+                        impl_->authority->abandon_route(prepared);
+                        impl_->endpoint->reset_after_pipeline_poison();
+                    }
                 }
             }
         } catch (const P29V1CapabilityUnavailable&) {
