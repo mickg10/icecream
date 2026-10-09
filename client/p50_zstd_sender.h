@@ -206,11 +206,14 @@ public:
         std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
         std::function<void()> write_complete = nullptr);
 
-    // True from the moment transfer_bytes begins running until it reaches a
-    // terminal result (including by exception). Only meaningful for a
-    // route-bound sender; see P50CRouteOwner::reset_f_store_exact, which uses
-    // this to decide whether an orphaned preparation entry may be
-    // force-discarded for a provably superseded F incarnation.
+    // True from the moment any transfer_bytes() of this sender begins
+    // running until the last one reaches a terminal result (including by
+    // exception) -- ANY transfer, not "the" transfer: route pipelining
+    // (K>1) overlaps a successor's transfer_bytes() with the still-running
+    // head's on the same sender. Only meaningful for a route-bound sender;
+    // see P50CRouteOwner::reset_f_store_exact, which uses this to decide
+    // whether an orphaned preparation entry may be force-discarded for a
+    // provably superseded F incarnation.
     [[nodiscard]] bool transfer_in_flight() const noexcept;
 
 private:

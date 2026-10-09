@@ -1124,10 +1124,12 @@ void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
 // must block the force-discard and preserve today's whole-sidecar
 // replacement behavior. before_prepare_for_route_for_test fires
 // synchronously from inside transfer_bytes, after its InFlightGuard (the
-// function's first statement) has already set transfer_in_flight() true and
-// before any preparation entry exists -- a deterministic seam to reenter
+// function's first statement) has already made transfer_in_flight() true
+// and before any preparation entry exists -- a deterministic seam to reenter
 // reset_f_store_exact on the very relationship mid-transfer, without any
-// real stalled network I/O.
+// real stalled network I/O. (transfer_in_flight() is "any transfer of this
+// sender in flight": a nonzero counter since route pipelining K>1 overlaps
+// head and successor transfer_bytes() on one sender.)
 void test_reset_f_store_exact_refuses_while_transfer_in_flight() {
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});

@@ -227,18 +227,23 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
 // released for two different reasons: (1) the sender's transfer already
 // reached a terminal result (Committed and released, or non-Committed and
 // orphaned) -- in both cases the Sender is quiescent and safe to erase --
-// or (2) its transfer_bytes() coroutine is still running or suspended and
-// may not have created, or may already have released, its Entry at this
-// exact instant, racing this reset. transfer_in_flight() distinguishes the
-// two regardless of Entry state, so case (2) is always refused up front,
-// before reset_route()/discard_route() are consulted. Case (2) should be
-// rare to impossible here: per the class comment above, "the owner is
-// single-threaded ... callers serialize operations for one relationship on
-// their compiler-wrapper owner" (lanes=1), so a given relationship's sender
-// runs at most one transfer at a time, and bind_route_endpoint_identity()
-// only calls reset_f_store_exact() between assignments, never nested inside
-// one of its own transfer() calls. When in-flight is nonetheless observed,
-// this function keeps today's behavior: return false and let the caller set
+// or (2) some transfer_bytes() coroutine of that sender is still running
+// or suspended and may not have created, or may already have released, its
+// Entry at this exact instant, racing this reset. transfer_in_flight()
+// distinguishes the two regardless of Entry state, so case (2) is always
+// refused up front, before reset_route()/discard_route() are consulted.
+// With route pipelining (K>1, P50_ROUTE_PIPELINING.md step 4c) a sender
+// can have TWO transfers overlapped (head + successor on the same route),
+// so transfer_in_flight() is a nonzero-COUNT test ("any transfer in
+// flight"), not a single bool; see the InFlightGuard counter in
+// client/p50_zstd_sender.cpp. Case (2) should be rare to impossible here:
+// per the class comment above, "the owner is single-threaded ... callers
+// serialize operations for one relationship on their compiler-wrapper
+// owner" (lanes=1), and a pipelined route is forced to one lane; and
+// bind_route_endpoint_identity() only calls reset_f_store_exact()
+// between assignments, never nested inside one of its own transfer()
+// calls. When in-flight is nonetheless observed, this function keeps
+// today's behavior: return false and let the caller set
 // replacement_required_.
 //
 // Unchanged: reset_route() (same-incarnation path; protects lost-commit

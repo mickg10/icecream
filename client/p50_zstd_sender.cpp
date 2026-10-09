@@ -41,19 +41,25 @@ bool valid_deadline(Clock::time_point deadline, Clock::duration maximum_duration
            deadline - now <= maximum_duration;
 }
 
-// Marks *flag true for the lifetime of the coroutine frame that constructs
+// Counts one up for the lifetime of the coroutine frame that constructs
 // it, regardless of how that frame exits (normal co_return, exception, or
 // cancellation-driven unwind): the local object is destroyed exactly once
 // when the frame itself is destroyed. Used to give transfer_in_flight() an
-// accurate view of whether transfer_bytes() is currently running.
+// accurate view of whether any transfer_bytes() is currently running --
+// ANY, not "this one": with route pipelining (K>1,
+// P50_ROUTE_PIPELINING.md step 4) the per-route transfer lock releases at
+// the head's write-complete (4c), so a successor transfer_bytes() overlaps
+// the still-running head's on the SAME sender. A bool cleared by whichever
+// frame exits first would hide the still-live other transfer and let
+// P50CRouteOwner::reset_f_store_exact erase the sender out from under it.
 struct InFlightGuard {
-    explicit InFlightGuard(bool* flag) noexcept : flag_(flag) { *flag_ = true; }
-    ~InFlightGuard() { *flag_ = false; }
+    explicit InFlightGuard(size_t* count) noexcept : count_(count) { ++*count_; }
+    ~InFlightGuard() { --*count_; }
     InFlightGuard(const InFlightGuard&) = delete;
     InFlightGuard& operator=(const InFlightGuard&) = delete;
 
 private:
-    bool* flag_;
+    size_t* count_;
 };
 
 bool route_history_profile(ProfileId profile) noexcept {
@@ -398,10 +404,12 @@ struct P50ZstdSourceSender::Impl {
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
-    // Set for the entire duration of one transfer_bytes() coroutine call,
-    // across every co_await suspension; see InFlightGuard above and
-    // P50ZstdSourceSender::transfer_in_flight().
-    bool transfer_in_flight = false;
+    // Set (nonzero) for the entire duration of each transfer_bytes()
+    // coroutine call, across every co_await suspension; see InFlightGuard
+    // above and P50ZstdSourceSender::transfer_in_flight(). A counter, not
+    // a bool: overlapped pipelined transfers (K>1) each hold one count, so
+    // the flag reads "any transfer in flight".
+    size_t transfers_in_flight = 0;
 };
 
 P50ZstdSourceSender::P50ZstdSourceSender(CStoreGuid c_store_guid,
@@ -419,7 +427,7 @@ P50ZstdSourceSender::P50ZstdSourceSender(
 P50ZstdSourceSender::~P50ZstdSourceSender() = default;
 
 bool P50ZstdSourceSender::transfer_in_flight() const noexcept {
-    return impl_->transfer_in_flight;
+    return impl_->transfers_in_flight != 0;
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -555,7 +563,7 @@ P50ZstdSourceSender::transfer_bytes(
     std::optional<Digest128> known_digest,
     std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
     std::function<void()> write_complete) {
-    InFlightGuard in_flight_guard(&impl_->transfer_in_flight);
+    InFlightGuard in_flight_guard(&impl_->transfers_in_flight);
     if (!valid_deadline(deadline, impl_->config.maximum_duration, Clock::now()))
         co_return impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
     if (!nonzero_request(request) ||
