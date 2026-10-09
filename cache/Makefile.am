@@ -37,6 +37,8 @@ libprotocol50_a_SOURCES = \
 	p50_input_record.h \
 	p50_input_backing_reaper.cpp \
 	p50_input_backing_reaper.h \
+	p50_input_buffer_pool.cpp \
+	p50_input_buffer_pool.h \
 	p50_source_identity.cpp \
 	p50_source_identity.h \
 	p50_phase_open.cpp \
