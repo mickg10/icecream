@@ -7813,7 +7813,16 @@ struct PreparkTripleRace {
     std::atomic<bool>* head_pending = nullptr;
     std::atomic<bool>* head_route_ready = nullptr;
     std::atomic<bool> s1_begin_written{false};
+    // k3 storm: set right after S1's HELLO write (the releaser waits for
+    // both HELLOs, then a short delay -- the head must commit inside the
+    // successors' HELLO-to-BEGIN windows).
+    std::atomic<bool> s1_hello_written{false};
     std::atomic<bool> s2_hello_written{false};
+    // Stage-gap variant: set by S1's server-session outbound observer when
+    // its SESSION_STATE (the fall-through stage's own write) has left F --
+    // provably inside S1's stage-to-install window. S2's BEGIN is written
+    // only after it.
+    std::atomic<bool> s1_state_written{false};
     // Set by the raw head after its TX_COMMIT read (release_parked_at ran
     // synchronously inside that commit: the gap/collision window is open).
     std::atomic<bool> head_committed{false};
@@ -7837,7 +7846,8 @@ struct PreparkTripleRace {
 // S2's HELLO. S1's commit read is the gate for the whole leg's order.
 asio::awaitable<void> raw_prepark_triple_s1(
     tcp::endpoint remote, CStoreGuid c_guid, const ZstdTuEnvelope& s1_tu,
-    HistoryNonce nonce, PreparkTripleRace& race, bool hold_tail_for_gap) {
+    HistoryNonce nonce, PreparkTripleRace& race, bool hold_tail_for_gap,
+    int begin_delay_ms = 100, bool probe = true) {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect(remote, asio::use_awaitable);
@@ -7871,10 +7881,16 @@ asio::awaitable<void> raw_prepark_triple_s1(
         socket.close(ignored);
         co_return;
     }
-    // The missed-peek delay: BEGIN lands only after F consumed HELLO.
-    asio::steady_timer delay(executor);
-    delay.expires_after(std::chrono::milliseconds(100));
-    co_await delay.async_wait(asio::use_awaitable);
+    race.s1_hello_written.store(true, std::memory_order_release);
+    // The missed-peek delay: BEGIN lands only after F consumed HELLO. The
+    // k3 storm passes its own (shorter) delay so the head's commit lands
+    // inside the HELLO-to-BEGIN window while both successors are still
+    // begin-unknown at their release.
+    if (begin_delay_ms > 0) {
+        asio::steady_timer delay(executor);
+        delay.expires_after(std::chrono::milliseconds(begin_delay_ms));
+        co_await delay.async_wait(asio::use_awaitable);
+    }
     // The prefix: the BEGIN frame plus (for the gap shape) the first half
     // of the first BODY frame; the whole batch in ONE contiguous raw send
     // (the single-delivery shape, wide buffers pinned by the driver).
@@ -7893,22 +7909,27 @@ asio::awaitable<void> raw_prepark_triple_s1(
     // be parked, not staged. Recorded, never thrown. This has to run
     // BEFORE the gap hold below: past the hold, the head's commit has
     // released S1 and its STATE legitimately arrives -- a probe there
-    // would false-red the green path.
-    asio::steady_timer probe(executor);
-    for (int iteration = 0; iteration != 20; ++iteration) {
-        probe.expires_after(std::chrono::milliseconds(10));
-        boost::system::error_code ignored;
-        co_await probe.async_wait(
-            asio::redirect_error(asio::use_awaitable, ignored));
-        boost::system::error_code available_error;
-        const std::size_t available = socket.available(available_error);
-        if (available != 0) {
-            race.s1_probe_saw_bytes.store(true, std::memory_order_release);
-            if (race.s1_detail.empty())
-                race.s1_detail =
-                    "S1 received bytes while its predecessor was still "
-                    "pending (stage() ran early, or a terminal ERROR "
-                    "arrived)";
+    // would false-red the green path. The k3 storm disables it: the head
+    // commits inside S1's HELLO-to-BEGIN window by design, so its release
+    // lands while the probe would still be ticking.
+    if (probe) {
+        asio::steady_timer probe_timer(executor);
+        for (int iteration = 0; iteration != 20; ++iteration) {
+            probe_timer.expires_after(std::chrono::milliseconds(10));
+            boost::system::error_code ignored;
+            co_await probe_timer.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+            boost::system::error_code available_error;
+            const std::size_t available = socket.available(available_error);
+            if (available != 0) {
+                race.s1_probe_saw_bytes.store(true,
+                                              std::memory_order_release);
+                if (race.s1_detail.empty())
+                    race.s1_detail =
+                        "S1 received bytes while its predecessor was still "
+                        "pending (stage() ran early, or a terminal ERROR "
+                        "arrived)";
+            }
         }
     }
     if (hold_tail_for_gap) {
@@ -7996,7 +8017,9 @@ asio::awaitable<void> raw_prepark_triple_s1(
 asio::awaitable<void> raw_prepark_triple_s2(
     tcp::endpoint remote, CStoreGuid c_guid, const ZstdTuEnvelope& s2_tu,
     HistoryNonce nonce, PreparkTripleRace& race, bool begin_after_s1_commit,
-    bool hello_in_gap) {
+    bool hello_in_gap, int begin_delay_ms = 100,
+    bool begin_after_s1_state = false,
+    bool hello_after_s1_begin = false) {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect(remote, asio::use_awaitable);
@@ -8013,6 +8036,18 @@ asio::awaitable<void> raw_prepark_triple_s2(
             gap_wait.expires_after(std::chrono::milliseconds(1));
             boost::system::error_code ignored;
             co_await gap_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+    } else if (!hello_after_s1_begin) {
+        // k3 storm and stage-gap variant: HELLO lands while the head's TX
+        // is still pending, WITHOUT waiting for S1's batch (both
+        // successors register their pre-park begin-unknown before either
+        // BEGIN is on the wire).
+        asio::steady_timer pending_wait(executor);
+        while (!race.head_pending->load(std::memory_order_acquire)) {
+            pending_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await pending_wait.async_wait(
                 asio::redirect_error(asio::use_awaitable, ignored));
         }
     } else {
@@ -8053,16 +8088,32 @@ asio::awaitable<void> raw_prepark_triple_s2(
             co_await commit_wait.async_wait(
                 asio::redirect_error(asio::use_awaitable, ignored));
         }
+    } else if (begin_after_s1_state) {
+        // Stage-gap variant: S2's BEGIN is written only after S1's own
+        // fall-through stage() SESSION_STATE has left F (the per-session
+        // outbound observer flips s1_state_written) -- provably inside
+        // S1's stage-to-install window, the exact gap the cursor claim
+        // must cover. S2 then decides by its BEGIN's rel_seq after the
+        // drain, never on the stale pre-release route.
+        asio::steady_timer state_wait(executor);
+        while (!race.s1_state_written.load(std::memory_order_acquire)) {
+            state_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await state_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
     } else {
-        // Gap shape: the BEGIN must NOT be peekable at HELLO time (the
-        // step-5b peek path parks through it -- pre-fix AND post-fix --
-        // and the gap hole is about the PRE-PARK decision). A 100 ms
-        // delay after the HELLO write keeps the peek empty, exactly the
-        // pair legs' missed-peek delay: F processes the HELLO with
+        // Gap shape and k3 storm: the BEGIN must NOT be peekable at HELLO
+        // time (the step-5b peek path parks through it -- pre-fix AND
+        // post-fix -- and the hole under test is the PRE-PARK decision).
+        // The delay after the HELLO write keeps the peek empty, exactly
+        // the pair legs' missed-peek delay: F processes the HELLO with
         // nothing behind it, and the pre-park/claim decision is the one
-        // under test.
+        // under test. The k3 storm passes its own (uneven) delay so both
+        // successors are begin-unknown through the head's commit.
         asio::steady_timer begin_delay(executor);
-        begin_delay.expires_after(std::chrono::milliseconds(100));
+        begin_delay.expires_after(
+            std::chrono::milliseconds(begin_delay_ms));
         co_await begin_delay.async_wait(asio::use_awaitable);
     }
     // The production two-write order: BEGIN, then the BODY frames. S2 parks
@@ -8181,6 +8232,21 @@ struct PreparkTriplePlan {
     // commit (the re-arm path).
     bool gap_shape = true;
     size_t zstd_cap = 1U << 20;
+    // k3 storm (farm K>2 hole): both successors HELLO while the head is
+    // pending, both pre-park begin-unknown at the SAME next_rel + 1 key,
+    // and their BEGINs are delayed past the head's commit (uneven, so the
+    // later one waits while the earlier one installs). The gate frees a
+    // short fixed delay after BOTH HELLOs -- inside the HELLO-to-BEGIN
+    // windows.
+    bool k3_storm = false;
+    int s1_begin_delay_ms = 100;
+    int s2_begin_delay_ms = 100;
+    int release_delay_ms = 25;
+    // Stage-gap variant of the k3 storm: S2's BEGIN is written only after
+    // S1's fall-through stage SESSION_STATE left F (the per-session
+    // outbound observer) -- inside S1's stage-to-install window, the gap
+    // the cursor claim must cover.
+    bool s2_begin_after_s1_state = false;
 };
 
 void run_prepark_triple(const PreparkTriplePlan& plan) {
@@ -8223,6 +8289,19 @@ void run_prepark_triple(const PreparkTriplePlan& plan) {
     PreparkTripleRace race;
     race.head_pending = &head_materialize_entered;
     race.head_route_ready = &head_route_ready;
+    // Stage-gap variant only: the per-session outbound observer flips
+    // s1_state_written when S1's fall-through stage SESSION_STATE has left
+    // F -- inside S1's stage-to-install window (the write suspends, the
+    // dispatch/install is the synchronous continuation right after).
+    EndpointIoControl s1_server_control;
+    if (plan.s2_begin_after_s1_state) {
+        s1_server_control.outbound_message_observer =
+            [&race](ActorSide, const Message& message) {
+                if (std::holds_alternative<SessionState>(message))
+                    race.s1_state_written.store(true,
+                                                std::memory_order_release);
+            };
+    }
     asio::io_context context;
     tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor s1_acceptor(context, {asio::ip::address_v4::loopback(), 0});
@@ -8231,7 +8310,8 @@ void run_prepark_triple(const PreparkTriplePlan& plan) {
         context, server.accept_one(head_acceptor, head_server_control),
         asio::use_future);
     std::future<ServerRunResult> s1_server = asio::co_spawn(
-        context, server.accept_one(s1_acceptor), asio::use_future);
+        context, server.accept_one(s1_acceptor, s1_server_control),
+        asio::use_future);
     std::future<ServerRunResult> s2_server = asio::co_spawn(
         context, server.accept_one(s2_acceptor), asio::use_future);
     std::future<void> head_client = asio::co_spawn(
@@ -8242,13 +8322,24 @@ void run_prepark_triple(const PreparkTriplePlan& plan) {
     std::future<void> s1_client = asio::co_spawn(
         context,
         raw_prepark_triple_s1(s1_acceptor.local_endpoint(), guids.c, s1_tu,
-                              nonce, race, plan.gap_shape),
+                              nonce, race, plan.gap_shape,
+                              /*begin_delay_ms=*/
+                              plan.k3_storm ? plan.s1_begin_delay_ms : 100,
+                              /*probe=*/!plan.k3_storm),
         asio::use_future);
     std::future<void> s2_client = asio::co_spawn(
         context,
         raw_prepark_triple_s2(s2_acceptor.local_endpoint(), guids.c, s2_tu,
-                              nonce, race, /*begin_after_s1_commit=*/!plan.gap_shape,
-                              /*hello_in_gap=*/plan.gap_shape),
+                              nonce, race,
+                              /*begin_after_s1_commit=*/!plan.gap_shape &&
+                                             !plan.k3_storm,
+                              /*hello_in_gap=*/plan.gap_shape,
+                              /*begin_delay_ms=*/
+                              plan.k3_storm ? plan.s2_begin_delay_ms : 100,
+                              /*begin_after_s1_state=*/
+                              plan.s2_begin_after_s1_state,
+                              /*hello_after_s1_begin=*/!plan.gap_shape &&
+                                         !plan.k3_storm),
         asio::use_future);
     // Fixed-delay releaser (the pair legs' rule): the gate is freed even
     // when a red run kills a successor early, so the leg fails instead of
@@ -8262,17 +8353,33 @@ void run_prepark_triple(const PreparkTriplePlan& plan) {
     // in the gap shape S2 writes HELLO the instant head_committed flips,
     // and the 400 ms delay is plenty; in the collision shape S2's HELLO
     // lands while the head is still gated, well before the release.
+    // The k3 storm instead frees the gate a short fixed delay after BOTH
+    // HELLOs -- provably inside both successors' HELLO-to-BEGIN windows
+    // (their BEGINs are withheld past it), so both pre-parks are
+    // begin-unknown at their release.
     std::future<void> releaser = asio::co_spawn(
         context,
         [&]() -> asio::awaitable<void> {
             asio::steady_timer timer(co_await asio::this_coro::executor);
-            while (!race.s1_begin_written.load()) {
-                timer.expires_after(std::chrono::milliseconds(1));
-                boost::system::error_code ignored;
-                co_await timer.async_wait(
-                    asio::redirect_error(asio::use_awaitable, ignored));
+            if (plan.k3_storm) {
+                while (!(race.s1_hello_written.load() &&
+                         race.s2_hello_written.load())) {
+                    timer.expires_after(std::chrono::milliseconds(1));
+                    boost::system::error_code ignored;
+                    co_await timer.async_wait(
+                        asio::redirect_error(asio::use_awaitable, ignored));
+                }
+                timer.expires_after(
+                    std::chrono::milliseconds(plan.release_delay_ms));
+            } else {
+                while (!race.s1_begin_written.load()) {
+                    timer.expires_after(std::chrono::milliseconds(1));
+                    boost::system::error_code ignored;
+                    co_await timer.async_wait(
+                        asio::redirect_error(asio::use_awaitable, ignored));
+                }
+                timer.expires_after(std::chrono::milliseconds(400));
             }
-            timer.expires_after(std::chrono::milliseconds(400));
             boost::system::error_code ignored;
             co_await timer.async_wait(
                 asio::redirect_error(asio::use_awaitable, ignored));
@@ -8394,6 +8501,57 @@ void test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release() {
     plan.gap_shape = false;
     plan.s1_input = bytes("triple k3: S1 TU\n");
     plan.s2_input = bytes("triple k3: S2 TU\n");
+    run_prepark_triple(plan);
+}
+
+// Farm K>2 hole (k24/k24st legs, te=3 "pipelined successor STATE differs
+// from the predicted route witness", 2026-10-09): S1 (rel 1) and S2 (rel 2)
+// both HELLO while the head's TX is pending, so both pre-park
+// begin-unknown at the SAME next_rel + 1 key; the head commits inside
+// both successors' HELLO-to-BEGIN windows (the gate frees a fixed 25 ms
+// after both HELLOs, their BEGINs withheld 60/190 ms past their HELLOs --
+// uneven, the farm shape). Neither released waiter is begin_known, so NO
+// cursor claim is set and the route is momentarily free: pre-fix BOTH
+// fell through and raced the same stage() against cursor 1, and S2's
+// STATE carried the wrong cursor. Post-fix neither may fall through
+// without its own first frame (has_other_begin_unknown_parked): S1's
+// BEGIN drains first (rel == cursor -> fall-through, claim, install,
+// commit), S2's then re-keys onto rel 2 and commits after it -- 0,1,2.
+void test_route_pipeline_prepark_k3_storm_two_begin_unknown_release() {
+    PreparkTriplePlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_k3_storm_two_begin_unknown_"
+        "release";
+    plan.gap_shape = false;
+    plan.k3_storm = true;
+    plan.s1_begin_delay_ms = 60;
+    plan.s2_begin_delay_ms = 190;
+    plan.release_delay_ms = 25;
+    plan.s1_input = bytes("k3 storm: S1 TU\n");
+    plan.s2_input = bytes("k3 storm: S2 TU\n");
+    run_prepark_triple(plan);
+}
+
+// The stage-to-install slice of the same hole: S1's fall-through stage()
+// SESSION_STATE write suspends before the dispatch installs S1's pending
+// TX, and S2's BEGIN (written only after the per-session outbound
+// observer saw that STATE leave F -- provably inside the window) must be
+// decided by its rel_seq AFTER the drain, never by the stale pre-drain
+// route: it re-keys onto rel 2 and commits after S1, instead of racing
+// S1's install with a fall-through stage against cursor 1.
+void test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap() {
+    PreparkTriplePlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_"
+        "gap";
+    plan.gap_shape = false;
+    plan.k3_storm = true;
+    plan.s1_begin_delay_ms = 60;
+    plan.s2_begin_delay_ms = 190;
+    plan.release_delay_ms = 25;
+    plan.s2_begin_after_s1_state = true;
+    plan.s1_input = bytes("k3 stage gap: S1 TU\n");
+    plan.s2_input = bytes("k3 stage gap: S2 TU\n");
     run_prepark_triple(plan);
 }
 
@@ -10183,6 +10341,8 @@ int main(int argc, char** argv) {
         test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
         test_route_pipeline_prepark_third_hello_in_release_to_install_gap();
         test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
+        test_route_pipeline_prepark_k3_storm_two_begin_unknown_release();
+        test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap();
         test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
@@ -10258,6 +10418,8 @@ int main(int argc, char** argv) {
     test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
     test_route_pipeline_prepark_third_hello_in_release_to_install_gap();
     test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
+    test_route_pipeline_prepark_k3_storm_two_begin_unknown_release();
+    test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap();
     test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
