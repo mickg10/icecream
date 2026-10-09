@@ -6552,6 +6552,10 @@ void test_p29v1_k2_pipeline_straight_line() {
                 " reconnect=" +
                 std::to_string(
                     static_cast<uint8_t>(run.successor.reconnect)) +
+                " terminal=" +
+                (run.successor.terminal_error.has_value()
+                     ? run.successor.terminal_error->detail
+                     : std::string("<none>")) +
                 ")");
     require(run.successor_begin.rel_seq.value ==
                 run.head_begin.rel_seq.value + 1,
