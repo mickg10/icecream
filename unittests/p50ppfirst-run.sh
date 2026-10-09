@@ -41,9 +41,11 @@ set -u
 
 fail() {
     echo "p50ppfirst: FAIL: $1" >&2
-    echo "--- scheduler log:" >&2; tail -30 "${work:-}/sched.log" >&2 || true
-    echo "--- worker log:" >&2;   tail -30 "${work:-}/remote.log" >&2 || true
-    echo "--- submitter log:" >&2; tail -20 "${work:-}/local.log" >&2 || true
+    echo "--- scheduler log:" >&2; head -40 "${work:-}/sched.log" >&2 || true
+    echo "--- worker log:" >&2;   head -40 "${work:-}/remote.log" >&2 || true
+    echo "--- submitter log:" >&2; head -20 "${work:-}/local.log" >&2 || true
+    echo "--- live icecc processes:" >&2
+    ps -ef 2>/dev/null | grep -E "iceccd|icecc-scheduler|icecc-cache" | grep -v grep >&2 || true
     for f in "${work:-}"/client-*.log; do
         [ -f "$f" ] || continue
         echo "--- client log ($f):" >&2; tail -40 "$f" >&2
