@@ -972,7 +972,25 @@ struct P50PreparationAuthority::Impl {
         uint64_t references = 1;
         uint64_t retained_bytes = 0;
         bool committed = false;
+        // Set when a uniform chain invalidation (abandon_route, release's
+        // non-tail path) removed this entry from its route's outstanding
+        // successor deque, so a later abandon of the same handle is
+        // recognized as already done instead of an unknown successor.
+        bool chain_abandoned = false;
     };
+
+    // The uniform outstanding-chain invalidation shared by abandon_route and
+    // release's non-tail path: every member is remembered as abandoned
+    // before the deque is cleared.
+    void abandon_chain(RouteState& route, bool abandon_p29v1) {
+        for (const uint64_t member : route.uncommitted_route_entries) {
+            if (const auto found = entries.find(member); found != entries.end())
+                found->second.chain_abandoned = true;
+        }
+        route.uncommitted_route_entries.clear();
+        if (abandon_p29v1 && route.p29_route)
+            route.p29_route->abandon_active();
+    }
 
     Impl(CStoreGuid c_store_guid_value, ZstdTuLimits zstd_limits_value,
          PreparationAuthorityLimits authority_limits_value, int compression_level,
@@ -1594,9 +1612,7 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
         // other outstanding successor on this route too, not just this one.
         // CRoute::abandon_active() already clears its whole active_queue_
         // uniformly; mirror that here so the two structures never diverge.
-        route.uncommitted_route_entries.clear();
-        if (entry.route.profile == ProfileId::P29V1 && route.p29_route)
-            route.p29_route->abandon_active();
+        impl_->abandon_chain(route, entry.route.profile == ProfileId::P29V1);
     }
     impl_->retained_bytes -= entry.retained_bytes;
     const PreparationRouteKey route_key = entry.route;
@@ -1842,24 +1858,35 @@ void P50PreparationAuthority::abandon_route(PreparedTuHandle handle) {
     if (position == impl_->entries.end())
         throw std::invalid_argument("prepared-TU handle has been released");
     Impl::Entry& entry = position->second;
-    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+    if (entry.route.profile != ProfileId::P29V1)
         throw std::invalid_argument(
             "prepared-TU handle is not active P29V1");
     Impl::RouteState& route = impl_->route_state(entry.route);
+    // A committed TX whose sender observes another TX's pipeline poison:
+    // nothing of its own to abandon, but the poison still tears the
+    // outstanding chain down uniformly before the endpoint's cold reset.
+    if (entry.committed) {
+        impl_->abandon_chain(route, true);
+        return;
+    }
     if (!route.p29_route ||
         std::find(route.uncommitted_route_entries.begin(),
                   route.uncommitted_route_entries.end(),
-                  handle.entry_id_) == route.uncommitted_route_entries.end())
+                  handle.entry_id_) == route.uncommitted_route_entries.end()) {
+        // Already removed by an earlier uniform invalidation of its chain
+        // (another member's abandon or release): done, not unknown.
+        if (entry.chain_abandoned)
+            return;
         throw std::logic_error(
             "abandon_route does not identify the route successor");
-    route.p29_route->abandon_active();
+    }
     // Step 4d core (P50_ROUTE_PIPELINING.md section 1.1 errata): a pipeline
     // poison invalidates the WHOLE outstanding chain uniformly --
     // CRoute::abandon_active() clears its active_queue_, and the authority's
     // own uncommitted-successor deque must not survive either, or the next
     // TX's commit() finds a stale front ("is not its prepared successor")
     // and the route is stranded. Same uniform clear the release path applies.
-    route.uncommitted_route_entries.clear();
+    impl_->abandon_chain(route, true);
 }
 
 ProfileId P50PreparationAuthority::profile() const {
@@ -4773,10 +4800,23 @@ P50ClientEndpoint::run_connected_successor(
     // Deviation (brief point 5): stop opening successors, close every
     // successor socket, wake every waiter, and return this transfer's own
     // failure status. Never a reconcile branch for a successor.
+    //
+    // A successor that observes a NEWER pipeline epoch belongs to a chain
+    // reset_after_pipeline_poison() already tore down: it still fails, but
+    // must not re-poison the fresh route. At depth > 2 the second stale
+    // successor otherwise re-raised the poison, and its sender then
+    // abandon_route()d a handle the first abandon had already cleared
+    // ("abandon_route does not identify the route successor"), which the
+    // sender's catch-all escalated to a whole-C sidecar replacement (farm
+    // leg K2-4-C2, 2026-10-09).
+    const auto poison_current_epoch = [&]() {
+        if (impl_->pipeline_epoch == epoch_at_open)
+            impl_->poison_pipeline();
+    };
     const auto deviate = [&](ClientRunStatus status,
                              ClientRunObservation observation,
                              EndpointReconnectOutcome reconnect) {
-        impl_->poison_pipeline();
+        poison_current_epoch();
         result.status = status;
         result.observation = observation;
         result.reconnect = reconnect;
@@ -5051,16 +5091,16 @@ P50ClientEndpoint::run_connected_successor(
         close_now(socket);
     } catch (const ClientTerminalResult& terminal) {
         close_now(socket);
-        impl_->poison_pipeline();
+        poison_current_epoch();
         set_client_terminal_result(result, terminal.error());
     } catch (const StaleCompletion&) {
         close_now(socket);
-        impl_->poison_pipeline();
+        poison_current_epoch();
         result.status = ClientRunStatus::Disconnected;
         result.observation = ClientRunObservation::Disconnected;
     } catch (const boost::system::system_error&) {
         close_now(socket);
-        impl_->poison_pipeline();
+        poison_current_epoch();
         result.status = io->expired || deadline_crossed()
                             ? ClientRunStatus::DeadlineExceeded
                             : ClientRunStatus::Disconnected;
@@ -5072,7 +5112,7 @@ P50ClientEndpoint::run_connected_successor(
         // detail rides on terminal_error, the route is poisoned, and the
         // status is the ordinary disconnected observation.
         close_now(socket);
-        impl_->poison_pipeline();
+        poison_current_epoch();
         set_client_terminal_result(
             result, bounded_error(3, error.what(), terminal_cap));
         result.status = ClientRunStatus::Disconnected;
@@ -5080,7 +5120,7 @@ P50ClientEndpoint::run_connected_successor(
         result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
     } catch (...) {
         close_now(socket);
-        impl_->poison_pipeline();
+        poison_current_epoch();
         result.status = ClientRunStatus::Disconnected;
         result.observation = ClientRunObservation::Disconnected;
         result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
