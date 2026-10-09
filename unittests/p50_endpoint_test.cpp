@@ -6315,7 +6315,8 @@ asio::awaitable<void> raw_parked_f_serve_connection(
         out_body.insert(out_body.end(), body.bytes.begin(), body.bytes.end());
     }
     for (const NeedMessage& need :
-         state->store.p29v1_need_frames(state->session))
+         encode_p29v1_need_messages(
+             state->store.p29v1_need_frames(state->session), cap, 1 << 20))
         co_await raw_write(socket, Message{need});
     if (state->head_drop_after_need.load() && !park) {
         // T4: abrupt head drop with the successor outstanding. Everything
