@@ -3991,12 +3991,15 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
     service::SidecarRuntime c_runtime(std::move(c_config));
 
     CapacityFront front(f_runtime, kFStoreGeneration);
-    // Hold the head's F-side materialization so the deviator's short budget
-    // expires while it is still an outstanding parked successor -- the
-    // deterministic stand-in for the farm's multi-hundred-ms F materialize
-    // of a cold-route head under load. The gate frees only after every
-    // successor transfer finished, so the head's own commit lands after
-    // the storm and its result reflects the production interleaving.
+    // Hold the FIRST F-side materialization (whichever member arms first --
+    // head or deviator, the arming order races): that member has its
+    // HELLO+BEGIN+BODY+FILL batch ON THE WIRE and sits mid-transaction at F
+    // -- the farm shape where the abandoning member's FILL is already out.
+    // Both the head and the deviator carry budgets short enough to expire
+    // MID-TRANSACTION while gated (2 s and 700 ms), so the gated member
+    // always deviates by its own deadline with wire writes in flight, and
+    // the stale successors behind it wake into the fresh epoch. The gate
+    // frees after every transfer finished.
     HeadMaterializeGate gate;
     front.arm_control = [&gate]() {
         EndpointIoControl control;
@@ -4005,9 +4008,26 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
     };
     const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity,
-                              std::chrono::milliseconds budget) {
-        const std::string text = "stale-epoch-" + std::to_string(identity) + "\n";
-        std::vector<uint8_t> source(text.begin(), text.end());
+                              std::chrono::milliseconds budget,
+                              size_t source_bytes = 0) {
+        std::vector<uint8_t> source;
+        if (source_bytes != 0) {
+            // Seeded pseudo-random bytes: incompressible, so the 8 MiB
+            // deviator's F materialize is the multi-hundred-ms production
+            // cold-route shape.
+            source.resize(source_bytes);
+            uint32_t state = static_cast<uint32_t>(0x6d2b79f5U ^ identity);
+            for (uint8_t& byte : source) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                byte = static_cast<uint8_t>(state);
+            }
+        } else {
+            const std::string text =
+                "stale-epoch-" + std::to_string(identity) + "\n";
+            source.assign(text.begin(), text.end());
+        }
         const auto absolute = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
             std::chrono::steady_clock::now() + budget,
             clock.clock_domain_id, clock.time_namespace_id);
@@ -4019,7 +4039,8 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
     StaleEpochStormResult storm;
     storm.stale_successor_count = depth - 2;
     // The head: long budget, launches first, holds the route lock.
-    std::thread head_thread([&] { storm.head = transfer(600, std::chrono::seconds(20)); });
+    std::thread head_thread(
+        [&] { storm.head = transfer(600, std::chrono::seconds(2)); });
     // A: the deviator -- admitted second, parks behind the head with a
     // SHORT budget that expires while it is still a successor (the head
     // holds the lock through its own commit read, so A cannot have been
@@ -4091,21 +4112,30 @@ void stale_epoch_storm_asserts(const StaleEpochStormResult& storm,
     // the stale successors and the head through the sender's
     // chain-abandoned retirement (RetryExhausted, route_local_failure,
     // no sticky latch).
-    CHECK(storm.head.code != local::SourceTransferResultCode::Committed);
+    // Whichever member armed F first is the gated FILL-on-wire one; the
+    // arming order races, so either or both of the head/deviator may be
+    // the mid-transaction deviator (if the head is gated, the deviator
+    // parks behind it and its own budget expires too). The class contract
+    // is order-independent: NO member ends sticky-replacement-required.
     CHECK(storm.head.error_code != replacement_code);
-    CHECK(storm.deviator.code != local::SourceTransferResultCode::Committed);
     CHECK(storm.deviator.error_code != replacement_code);
     for (size_t index = 0; index != storm.stale_successor_count; ++index) {
         CHECK(storm.stale_successors[index].code !=
               local::SourceTransferResultCode::Committed);
         CHECK(storm.stale_successors[index].error_code != replacement_code);
     }
-    // The after-storm transfer exists only to observe the latch state; the
-    // deviator's own DeadlineExceeded quarantine (pre-existing sender
-    // semantics, out of this fix's scope) may refuse it on the same sender.
-    // The class contract above is what the farm cares about: no whole-C
-    // sticky replacement out of the stale-epoch retirement.
-    (void)storm.after_storm_ran;
+    // The after-storm transfer is the LATCH probe: with the reorder
+    // nothing in this storm latches (the deviator's mid-transaction
+    // DeadlineExceeded retirement is route-local through the
+    // chain-abandoned check, the stale successors' retirements are
+    // route-local), so the fresh assignment commits on the same C sidecar.
+    // Pre-reorder the deviator's DeadlineExceeded branch ran first and
+    // quarantined/latched route_replacement_required, and this transfer
+    // was refused Unavailable at attempts=0 -- the K4-1 farm leg's
+    // whole-C replacement shape (22 generations per leg).
+    CHECK(storm.after_storm_ran);
+    CHECK(storm.after_storm.code == local::SourceTransferResultCode::Committed);
+    CHECK(storm.after_storm.error_code != replacement_code);
 }
 
 void test_k3_stale_epoch_successor_does_not_repoison_or_replace() {
