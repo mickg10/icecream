@@ -421,6 +421,15 @@ struct P50ZstdSourceSender::Impl {
     bool used = false;
     bool route_replacement_required = false;
     bool route_transport_quarantined = false;
+    // Backstop for the route-local retirement of witness-class terminals
+    // (te=3: F refused this chain-abandoned encoding's STATE/TX_COMMIT
+    // witness; a route reset re-encodes and cures it). The first few are
+    // route-local by design, but a route that keeps producing them has a
+    // C-side problem a reset cannot cure: after kWitnessRetireBackstop
+    // consecutive witness-class retirements without an intervening commit,
+    // escalate to the existing sticky whole-C replacement path.
+    static constexpr size_t kWitnessRetireBackstop = 8;
+    size_t witness_class_retirements = 0;
     // Set (nonzero) for the entire duration of each transfer_bytes()
     // coroutine call, across every co_await suspension; see InFlightGuard
     // above and P50ZstdSourceSender::transfer_in_flight(). A counter, not
@@ -761,6 +770,10 @@ P50ZstdSourceSender::transfer_bytes(
         // its timer may close the owned socket, so a later clock sample must
         // never discard it.
         if (run.status == ClientRunStatus::Committed) {
+            // A healthy commit clears the witness-class retirement streak:
+            // the backstop escalates only on REPEATED witness failures
+            // without an intervening commit.
+            impl_->witness_class_retirements = 0;
             ZstdSourceTransferResult result = impl_->committed_from_witness(
                 run, source->size(), raw_digest, attempt, prepare_route_ns);
             impl_->bind_wire_evidence(result);
@@ -803,6 +816,54 @@ P50ZstdSourceSender::transfer_bytes(
             }
             co_return result;
         }
+        // A failed run -- ANY non-committed status, checked BEFORE the
+        // deadline and terminal branches -- whose prepared handle was
+        // abandoned with its chain (another member's deviation tore the
+        // outstanding chain down and cold-reset the route) must not take
+        // the sticky path and must not retry on that handle: the fresh route
+        // re-encodes from its own cursor, and a retry dispatched on the
+        // stale admitted rel/pre-state fails the F witness (K>2 farm legs,
+        // 2026-10-09: te=3 "pipelined successor STATE differs from the
+        // predicted route witness" / "TX_COMMIT does not close C's active
+        // transaction", or the authority identification logic_error), and
+        // the DeadlineExceeded/TerminalError branches would have latched a
+        // whole-C sticky replacement for exactly this route-local
+        // condition (K4-1 farm leg: every cluster ORIGINATOR was a
+        // chain-abandoned handle whose F answer arrived as a te=3
+        // terminal). Retire the entry and fail ROUTE-LOCALLY instead: no
+        // sticky replacement, no retry on the dead encoding -- the client
+        // takes its existing fresh-assignment path and re-prepares under a
+        // new request key on this same sender.
+        if (impl_->authority->prepared_chain_abandoned(prepared)) {
+            try {
+                (void)impl_->authority->release(prepared);
+            } catch (...) {
+            }
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
+            result.attempts = attempt;
+            if (run.status == ClientRunStatus::TerminalError)
+                result.terminal_error = run.terminal_error;
+            impl_->bind_wire_evidence(result);
+            // Route-local, deliberately NOT the sticky path: the route
+            // encoding this handle was prepared under is gone, nothing about
+            // the C sidecar is broken, and the fresh assignment re-prepares
+            // under a new request key on this same sender -- EXCEPT under
+            // the backstop: a route that keeps producing witness-class
+            // terminals (te=3) without an intervening commit has a C-side
+            // problem a route reset cannot cure, and escalates to the
+            // existing sticky whole-C replacement path.
+            if (run.status == ClientRunStatus::TerminalError &&
+                run.terminal_error.has_value() &&
+                run.terminal_error->code == 3 &&
+                ++impl_->witness_class_retirements >=
+                    impl_->kWitnessRetireBackstop) {
+                impl_->require_replacement(result, explicit_route);
+                co_return result;
+            }
+            result.route_local_failure = true;
+            co_return result;
+        }
         if (run.status == ClientRunStatus::DeadlineExceeded) {
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
@@ -818,34 +879,6 @@ P50ZstdSourceSender::transfer_bytes(
             result.terminal_error = run.terminal_error;
             impl_->bind_wire_evidence(result);
             impl_->require_replacement(result, explicit_route);
-            co_return result;
-        }
-        // A failed run whose prepared handle was abandoned with its chain
-        // (another member's deviation tore the outstanding chain down and
-        // cold-reset the route) must NOT retry on that handle: the fresh
-        // route re-encodes from its own cursor, and a retry dispatched on
-        // the stale admitted rel/pre-state fails the F witness (K>2 farm
-        // legs, 2026-10-09: te=3 "pipelined successor STATE differs from
-        // the predicted route witness" / "TX_COMMIT does not close C's
-        // active transaction", or the authority identification
-        // logic_error escalated to a whole-C sidecar replacement). Retire
-        // the entry and fail ROUTE-LOCALLY instead: no sticky replacement,
-        // no retry on the dead encoding -- the client takes its existing
-        // fresh-assignment path and re-prepares under a new request key.
-        if (impl_->authority->prepared_chain_abandoned(prepared)) {
-            try {
-                (void)impl_->authority->release(prepared);
-            } catch (...) {
-            }
-            ZstdSourceTransferResult result =
-                impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
-            result.attempts = attempt;
-            impl_->bind_wire_evidence(result);
-            // Route-local, deliberately NOT the sticky path: the route
-            // encoding this handle was prepared under is gone, nothing about
-            // the C sidecar is broken, and the fresh assignment re-prepares
-            // under a new request key on this same sender.
-            result.route_local_failure = true;
             co_return result;
         }
         if (attempt == 2) {
