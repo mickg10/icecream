@@ -239,9 +239,10 @@ start_farm() {  # <fence-mode> (daemons + scheduler into the trap-owned pids)
                           --cache-runtime-dir "$sockdir/cache-local-$mode")
     fi
 
-    : >"$work/sched.log"
-    : >"$work/remote.log"
-    : >"$work/local.log"
+    # The farm members run as the (possibly dropped) unprivileged user:
+    # a root-owned pre-created log file would be unwritable for them and
+    # every diagnostic would silently vanish.  Remove instead of truncate.
+    rm -f "$work/sched.log" "$work/remote.log" "$work/local.log"
 
     "$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
         --assignment-fence-mode "$mode" -l "$work/sched.log" -vvv &
@@ -398,9 +399,7 @@ echo "p50ppfirst: scheduler-local row (pre-capture dropped on a local assignment
 # flag-ON pre-capture must be dropped harmlessly.
 SCHED_PORT=$(pick_seed_port $((21000 + $$ % 9000))) || fail "no free scheduler port"
 NETNAME="ppflocalonly$$"
-: >"$work/sched.log"
-: >"$work/remote.log"
-: >"$work/local.log"
+rm -f "$work/sched.log" "$work/remote.log" "$work/local.log"
 "$top/scheduler/icecc-scheduler" -p "$SCHED_PORT" -n "$NETNAME" \
     --assignment-fence-mode legacy -l "$work/sched.log" -vvv &
 SCHED_PID=$!
