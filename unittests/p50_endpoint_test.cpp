@@ -6660,13 +6660,18 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
                                       false, third_begin_wire,
                                       third_body_wire),
         asio::use_future);
+    std::atomic<ClientStallStage> third_stage{ClientStallStage::Connecting};
+    EndpointIoControl third_control;
+    third_control.stall_stage = &third_stage;
     std::future<ClientRunResult> third_result = asio::co_spawn(
         third_context,
         run.client->endpoint.run(third_acceptor.local_endpoint(),
-                                 third_handle, EndpointIoControl{}),
+                                 third_handle, third_control),
         asio::use_future);
     third_context.run();
     const ClientRunResult cold = third_result.get();
+    std::cerr << "K2DBG: cold TX stall="
+              << static_cast<uint8_t>(third_stage.load()) << std::endl;
     require(cold.status == ClientRunStatus::Committed,
             std::string("K2 successor-deviation: the post-reset TX did not "
                         "run cold and commit (status=") +
