@@ -1,5 +1,6 @@
 #include "cache/codec/p29_intern.h"
 #include "cache/codec/p29_wire.h"
+#include "cache/p50_input_buffer_pool.h"
 #include "cache/p50_slice0.h"
 #include "codec_golden_compare.h"
 
@@ -366,6 +367,40 @@ static_assert(icecc::codec::P29SenderProvider<ResearchProvider>);
 static_assert(icecc::codec::P29ReceiverProvider<ResearchProvider>);
 static_assert(icecc::codec::P29SenderProvider<ProductProvider>);
 static_assert(icecc::codec::P29ReceiverProvider<ProductProvider>);
+
+// Adds the optional get_pooled_materialize_buffer() hook (see the SFINAE
+// concept icecc::codec::p29_wire_detail::P29ReceiverProvidesPooledMaterializeBuffer
+// in cache/codec/p29_wire.h) on top of ResearchProvider, so receive_fill()'s
+// pool-consultation branch has something to call. Owns its own
+// InputBufferPool instance -- never the process-wide
+// InputBufferPool::instance() singleton -- so tests stay isolated from each
+// other and from any other pool user in this binary.
+class PooledResearchProvider : public ResearchProvider {
+public:
+  explicit PooledResearchProvider(std::uint64_t cap_bytes)
+      : pool_(std::make_shared<icecc::p50::InputBufferPool>(cap_bytes)) {}
+
+  [[nodiscard]] std::vector<std::uint8_t>
+  get_pooled_materialize_buffer(std::size_t min_capacity) {
+    return pool_->get(min_capacity);
+  }
+
+  [[nodiscard]] const std::shared_ptr<icecc::p50::InputBufferPool> &
+  pool() const {
+    return pool_;
+  }
+
+private:
+  std::shared_ptr<icecc::p50::InputBufferPool> pool_;
+};
+
+static_assert(icecc::codec::P29ReceiverProvider<PooledResearchProvider>);
+static_assert(icecc::codec::p29_wire_detail::
+                  P29ReceiverProvidesPooledMaterializeBuffer<
+                      PooledResearchProvider>);
+static_assert(!icecc::codec::p29_wire_detail::
+                   P29ReceiverProvidesPooledMaterializeBuffer<
+                       ResearchProvider>);
 
 struct LogicalTu {
   fs::path path;
@@ -1317,6 +1352,82 @@ void run_materialize_thp_switch_controls() {
   }
 }
 
+// Pool-path regression for the InputBufferPool hook (cache/p50_input_buffer_
+// pool.h, cache/codec/p29_wire.h's receive_fill()): a Provider that offers
+// get_pooled_materialize_buffer() must have receive_fill() actually reuse a
+// returned buffer -- proven here by pointer equality of the materialized
+// span's data() across two TUs on the same deserializer, with the first
+// TU's buffer handed back to the pool exactly as the production custom
+// deleter does (cache/p50_input_record.cpp's prepare_validated_publish()) --
+// and reuse must not perturb a single materialized byte relative to an
+// unpooled baseline over the same input.
+void run_input_buffer_pool_reuse_and_parity() {
+  constexpr std::size_t kFillBytes = 256u * 1024;
+  const std::vector<std::uint8_t> payload(kFillBytes, std::uint8_t{'p'});
+  const std::vector<std::uint8_t> control =
+      literal_control(1, kFillBytes, kFillBytes);
+  const std::vector<std::uint8_t> fill = make_fill(control, payload);
+  const std::vector<std::uint8_t> body = single_region_body();
+
+  // Unpooled baseline: identical input, pooling disabled via cap_bytes=0
+  // (InputBufferPool::enabled() is false, get()/put() are no-ops -- today's
+  // behavior exactly).
+  std::vector<std::uint8_t> baseline_bytes;
+  {
+    PooledResearchProvider provider(/*cap_bytes=*/0);
+    P29Deserializer<PooledResearchProvider> deserializer(provider);
+    (void)deserializer.receive_body(body);
+    const std::span<const std::uint8_t> materialized =
+        deserializer.receive_fill(fill, true, kFillBytes);
+    baseline_bytes.assign(materialized.begin(), materialized.end());
+    deserializer.commit();
+  }
+
+  PooledResearchProvider provider(/*cap_bytes=*/16u * 1024 * 1024);
+  P29Deserializer<PooledResearchProvider> deserializer(provider);
+
+  (void)deserializer.receive_body(body);
+  const std::span<const std::uint8_t> first_materialized =
+      deserializer.receive_fill(fill, true, kFillBytes);
+  require(first_materialized.size() == kFillBytes,
+          "pool reuse test: first materialized size differs from the FILL");
+  require(std::equal(first_materialized.begin(), first_materialized.end(),
+                      baseline_bytes.begin(), baseline_bytes.end()),
+          "pool reuse test: pooled-run materialized bytes differ from the "
+          "unpooled baseline");
+  const std::uint8_t *const first_data = first_materialized.data();
+
+  wire::MaterializedBuffer taken = deserializer.take_materialized();
+  deserializer.commit();
+  require(taken.data() == first_data,
+          "pool reuse test: take_materialized() returned different storage "
+          "than receive_fill() handed back");
+  // Models the production custom deleter in prepare_validated_publish():
+  // once the last InputRecord/InputCursor reference to the backing drops,
+  // the deleter does nothing but move the vector into pool.put().
+  provider.pool()->put(std::move(taken));
+
+  (void)deserializer.receive_body(body);
+  const std::span<const std::uint8_t> second_materialized =
+      deserializer.receive_fill(fill, true, kFillBytes);
+  require(second_materialized.data() == first_data,
+          "pool reuse test: second receive_fill() did not reuse the pooled "
+          "buffer (data() pointer differs)");
+  require(second_materialized.size() == kFillBytes,
+          "pool reuse test: second materialized size differs from the FILL");
+  require(std::equal(second_materialized.begin(), second_materialized.end(),
+                      baseline_bytes.begin(), baseline_bytes.end()),
+          "pool reuse test: second pooled materialized bytes differ from "
+          "the unpooled baseline");
+  deserializer.commit();
+
+  const icecc::p50::InputBufferPool::Stats stats = provider.pool()->stats();
+  require(stats.hits >= 1, "pool reuse test: pool recorded no hits");
+
+  std::cout << "input buffer pool reuse + parity: OK (" << kFillBytes
+            << " bytes, pool hits=" << stats.hits << ")\n";
+}
+
 // Regression test for a decode-side bug found while building the THP
 // switch test above (see research/reports/P50_PERF_OPT_REPORT.md): a
 // payload whose decoded size is an exact multiple of the decoder's
@@ -1449,6 +1560,7 @@ int main(int argc, char **argv) {
     run_wire_controls(corpus, interner);
     run_golden_comparison_controls();
     run_materialize_thp_switch_controls();
+    run_input_buffer_pool_reuse_and_parity();
     run_continuing_decoder_exact_multiple_regression();
 
     const auto total_start = Clock::now();
