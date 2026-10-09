@@ -3603,8 +3603,15 @@ struct RouteStormResult {
 // (no env), 2 runs ICECC_P50_ROUTE_PIPELINE_DEPTH=2 with the test-unsafe
 // escape. Both keep the DEFAULT sidecar endpoint_caps.profile (ZSTD_TU,
 // the production client-sidecar shape) and issue P29V1 requests.
+// `source_bytes` selects the payload shape: 0 keeps the tiny
+// "storm-N\n" text; any larger value makes EVERY source (the head, all
+// successors, and the after-storm transfer) that many bytes of seeded
+// pseudo-random data -- the production cold-route shape, where one
+// successor's BEGIN+BODY routinely crosses F's 1 MiB pre-park drain
+// ceiling and its BODY straddles the head's commit.
 RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
-                                        RouteStormObservation& observe) {
+                                        RouteStormObservation& observe,
+                                        size_t source_bytes = 0) {
     CHECK(pipeline_depth == 1 || pipeline_depth == 2);
     for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
                              "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
@@ -3656,8 +3663,24 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     const auto clock = sidecar::process_monotonic_clock_identity();
     const uint64_t identity_base = pipeline_depth == 2 ? 300 : 100;
     const auto transfer = [&](uint64_t identity) {
-        const std::string text = "storm-" + std::to_string(identity) + "\n";
-        const std::vector<uint8_t> source(text.begin(), text.end());
+        std::vector<uint8_t> source;
+        if (source_bytes != 0) {
+            // Seeded pseudo-random bytes: incompressible, so the encoded
+            // body stays the same order as the raw input (the production
+            // cold-route shape), and distinct per identity by seeding with
+            // the identity.
+            source.resize(source_bytes);
+            uint32_t state = static_cast<uint32_t>(0x6d2b79f5U ^ identity);
+            for (uint8_t& byte : source) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                byte = static_cast<uint8_t>(state);
+            }
+        } else {
+            const std::string text = "storm-" + std::to_string(identity) + "\n";
+            source.assign(text.begin(), text.end());
+        }
         const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
             std::chrono::steady_clock::now() + std::chrono::seconds(20),
             clock.clock_domain_id, clock.time_namespace_id);
@@ -3835,6 +3858,73 @@ void test_k2_concurrent_same_route_transfers_admit_two_deep() {
               local::SourceTransferErrorCode::RouteReplacementRequired));
     CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
     CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+}
+
+// Large-source storm legs: every source is 2 MiB of seeded pseudo-random
+// bytes instead of "storm-N\n". That is the production cold-route shape the
+// K2-2 farm leg showed broken: while the head is stalled at F's
+// materialize, an admitted successor parks on F and its multi-MB
+// BEGIN+BODY batch drains through the pre-park loop in one high-BDP
+// receive-buffer pass. The small-text storm can never cross the 1 MiB
+// pre-BEGIN drain ceiling; this one must, and must still commit every
+// transfer with no sticky replacement. K=1 keeps the serialization
+// invariant under the same payload (no successor is ever admitted while
+// the head is uncommitted); K=2 admits exactly one.
+void storm_assert_all_committed(const RouteStormResult& storm,
+                                RouteStormObservation& observe,
+                                bool expect_successor_prepare,
+                                uint32_t pipeline_depth) {
+    std::fprintf(stderr,
+                 "p50cacheservice: K=%u large storm head_gate=%d "
+                 "successor_prepare=%d prepare_settled=%zu "
+                 "completed_stalled=%zu replacements=%zu\n",
+                 pipeline_depth, int(storm.head_gate_entered),
+                 int(storm.successor_entered_prepare),
+                 storm.prepare_entries_at_settle, storm.completed_while_stalled,
+                 observe.replacement_results.load());
+    CHECK(storm.head_gate_entered);
+    CHECK(storm.successor_entered_prepare == expect_successor_prepare);
+    CHECK(storm.prepare_entries_at_settle == (expect_successor_prepare ? 2 : 1));
+    CHECK(storm.completed_while_stalled == 0);
+    for (const auto& result : storm.results) {
+        CHECK(result.code == local::SourceTransferResultCode::Committed);
+        CHECK(result.error_code != static_cast<uint16_t>(
+                  local::SourceTransferErrorCode::RouteReplacementRequired));
+        CHECK(result.attempts >= 1);
+        CHECK(result.valid());
+    }
+    std::vector<uint64_t> storm_tu_seqs;
+    for (const auto& result : storm.results)
+        storm_tu_seqs.push_back(result.tu_seq);
+    std::sort(storm_tu_seqs.begin(), storm_tu_seqs.end());
+    std::vector<uint64_t> expected_tu_seqs;
+    for (uint64_t seq = 0; seq != kStormTransfers; ++seq)
+        expected_tu_seqs.push_back(seq);
+    CHECK(storm_tu_seqs == expected_tu_seqs);
+    CHECK(observe.replacement_results.load() == 0);
+    CHECK(observe.fail_stops.load() == 0);
+    CHECK(storm.after_storm_ran);
+    CHECK(storm.after_storm.code == local::SourceTransferResultCode::Committed);
+    CHECK(storm.after_storm.error_code != static_cast<uint16_t>(
+              local::SourceTransferErrorCode::RouteReplacementRequired));
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+}
+
+void test_k1_large_source_storm_serializes_on_route_lock() {
+    RouteStormObservation observe;
+    constexpr size_t kLargeSource = 2U << 20;
+    const RouteStormResult storm =
+        run_stalled_head_storm(1, observe, kLargeSource);
+    storm_assert_all_committed(storm, observe, false, 1);
+}
+
+void test_k2_large_source_storm_admits_two_deep() {
+    RouteStormObservation observe;
+    constexpr size_t kLargeSource = 2U << 20;
+    const RouteStormResult storm =
+        run_stalled_head_storm(2, observe, kLargeSource);
+    storm_assert_all_committed(storm, observe, true, 2);
 }
 
 int connect_after_sidecar_ready(uint16_t port) {
@@ -4471,6 +4561,8 @@ int main(int argc, char** argv) {
             std::strcmp(argv[1], "--route-pipeline-concurrency") == 0) {
             test_k1_concurrent_same_route_transfers_serialize_on_route_lock();
             test_k2_concurrent_same_route_transfers_admit_two_deep();
+            test_k1_large_source_storm_serializes_on_route_lock();
+            test_k2_large_source_storm_admits_two_deep();
             return 0;
         }
         CHECK(argc == 1);

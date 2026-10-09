@@ -2835,6 +2835,39 @@ asio::awaitable<void> raw_write_bytes(tcp::socket& socket,
     co_return;
 }
 
+// One raw ::send loop on the native descriptor: asio's async_write caps
+// every internal write_some near 64 KiB, which splits a multi-MiB batch
+// into dozens of kernel deliveries -- F's pre-park drain then sees a
+// small first chunk, completes the BEGIN frame inside a sub-1-MiB drain,
+// and raises the drain ceiling before it is ever crossed. A single
+// send() with a pinned-wide SO_SNDBUF hands the whole batch to the kernel
+// in one delivery, so F's first drain carries BEGIN plus the BODY: the
+// high-BDP farm shape, made deterministic.
+//
+// `sent_failed` records the failure instead of throwing: a red run (a
+// reverted fix on the F side) can kill this socket's peer (an ERROR
+// frame then EOF), and a coroutine that dies mid-dialogue leaves the
+// leg's io_context busy until run_for expires -- a hang instead of the
+// intended clean failure. Everything after the first recorded failure
+// is skipped.
+asio::awaitable<void> raw_send_all(tcp::socket& socket,
+                                   std::span<const uint8_t> bytes_to_send,
+                                   std::atomic<bool>* sent_failed = nullptr) {
+    size_t offset = 0;
+    while (offset != bytes_to_send.size()) {
+        const ssize_t sent = ::send(socket.native_handle(),
+                                     bytes_to_send.data() + offset,
+                                     bytes_to_send.size() - offset, MSG_NOSIGNAL);
+        if (sent <= 0) {
+            if (sent_failed != nullptr)
+                sent_failed->store(true, std::memory_order_release);
+            break;
+        }
+        offset += static_cast<size_t>(sent);
+    }
+    co_return;
+}
+
 asio::awaitable<Frame> raw_read(tcp::socket& socket, uint32_t max_payload) {
     std::array<uint8_t, 4> raw_header{};
     co_await asio::async_read(socket, asio::buffer(raw_header), asio::use_awaitable);
@@ -7216,51 +7249,182 @@ struct PreparkRace {
     // process HELLO with no pending TX on the route and (correctly, per
     // the design) fall through to stage() instead of pre-parking.
     std::atomic<bool>* head_pending = nullptr;
+    // Set by the raw head right after its HISTORY_RESET was acknowledged:
+    // the F route exists. A peek-time-park successor (whose HELLO shares
+    // its single write with BEGIN) waits for this before writing anything:
+    // its park decision needs an established route, and a HELLO processed
+    // before the head's reset would (correctly) see no route and fall
+    // through.
+    std::atomic<bool>* head_route_ready = nullptr;
     std::atomic<bool> begin_written{false};
-    // Set by the successor coroutine after its no-stage probe loop: the
-    // gate releaser waits for it, so the head stays gated (its TX pending)
-    // through the whole probe window -- deterministic ordering, no
-    // sleep-based handoff.
+    // Recorded outcomes (never thrown from inside the coroutine): a red
+    // run (a reverted fix) must land in these fields and let the successor
+    // coroutine unwind through its whole dialogue, or the leg hangs inside
+    // io_context::run_for instead of failing. The driver asserts them all
+    // after run_for; `detail` is written at most once, before the
+    // coroutine's future turns ready.
+    std::atomic<bool> probe_saw_bytes{false};
+    std::atomic<bool> send_failed{false};
+    std::atomic<bool> state_witness_matched{false};
+    std::atomic<bool> commit_witness_matched{false};
+    std::string detail;
+    // Set by the raw head after its TX_COMMIT read: the head has committed
+    // and -- synchronously inside that commit -- release_parked_at() ran.
+    // A straddling successor waits for it before writing its BODY-frame
+    // tail, so the park/pre-park drain provably exits holding a partial
+    // frame (the farm shape: one drain routinely stops mid-frame).
+    std::atomic<bool> head_committed{false};
+    // Set by the successor coroutine after its no-stage probe loop: kept
+    // for the original test's shape (nothing waits on it any more -- the
+    // releaser fires on a fixed delay so a dead successor cannot wedge the
+    // leg); probe_done records that the whole window ran clean.
     std::atomic<bool> probe_done{false};
 };
+
+// How the raw successor lands its bytes on the wire. The production C side
+// writes SESSION_HELLO, then TX_BEGIN, then BODY as separate async writes;
+// a high-BDP route coalesces them into the same socket receive-buffer drain.
+struct PreparkSuccessorShape {
+    // HELLO in the same contiguous write as the BEGIN+BODY prefix: F reads
+    // HELLO and its step-5b peek then sees the BEGIN -- the peek-time park
+    // path (cache/p50_endpoint.cpp step 5c), not the pre-park.
+    bool batch_hello_with_frames = false;
+    // BEGIN and the BODY prefix as ONE contiguous write (vs the production
+    // two-write order): they then land in the same drain.
+    bool batch_begin_with_body = false;
+    // Write only the first half of the first BODY frame in the prefix and
+    // hold the rest until HEAD_COMMITTED: the drain then provably stops
+    // holding a straddling frame (355a35aa regression shape).
+    bool split_first_body_frame = false;
+    // SO_SNDBUF on the successor's own socket (paired with SO_RCVBUF on
+    // its acceptor, set by the driver): with both pinned wide, the whole
+    // batch lands in ONE kernel delivery and F's first drain carries the
+    // BEGIN plus the BODY. Auto-tuned buffers start near 128 KiB, which
+    // splits the write into small deliveries and lets the pre-fix ceiling
+    // check see the BEGIN frame complete (and raise the ceiling) inside a
+    // small first drain -- the fixture would never trip it.
+    size_t socket_buffer = 0;
+};
+
+// The successor's whole wire batch: the BEGIN frame plus its BODY frames
+// (chunked at the negotiated frame cap, exactly as F's own
+// async_write_component does for payloads above one frame).
+std::vector<std::vector<uint8_t>> successor_wire_frames(
+    const ZstdTuEnvelope& successor_tu, uint32_t max_frame_payload) {
+    std::vector<std::vector<uint8_t>> frames;
+    frames.push_back(encode_frame(Message{successor_tu.begin}));
+    const std::vector<uint8_t>& body = successor_tu.body;
+    for (size_t offset = 0; offset < body.size();) {
+        const size_t count =
+            std::min<size_t>(max_frame_payload, body.size() - offset);
+        Message body_message = BodyMessage{
+            std::vector<uint8_t>(body.begin() + offset,
+                                 body.begin() + offset + count)};
+        frames.push_back(encode_frame(std::move(body_message)));
+        offset += count;
+    }
+    return frames;
+}
 
 asio::awaitable<void> raw_prepark_successor(tcp::endpoint remote, CStoreGuid c_guid,
                                             const ZstdTuEnvelope& successor_tu,
                                             HistoryNonce nonce,
-                                            PreparkRace& race) {
+                                            PreparkRace& race,
+                                            PreparkSuccessorShape shape) {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect(remote, asio::use_awaitable);
-    // Do not write HELLO until the head's TX is installed and pending on
-    // the route at F (the gate-entered flag is that deterministic signal):
-    // the pre-park condition is route->pending owned by another serial.
-    asio::steady_timer pending_wait(executor);
-    while (!race.head_pending->load(std::memory_order_acquire)) {
-        pending_wait.expires_after(std::chrono::milliseconds(1));
-        boost::system::error_code ignored;
-        co_await pending_wait.async_wait(
-            asio::redirect_error(asio::use_awaitable, ignored));
+    if (shape.socket_buffer != 0) {
+        boost::system::error_code sndbuf_error;
+        socket.set_option(asio::socket_base::send_buffer_size(
+                              shape.socket_buffer),
+                          sndbuf_error);
+        require(!sndbuf_error,
+                "pre-park fixture could not enlarge the successor send "
+                "buffer (netns wmem_max caps the option)");
     }
     SessionHello hello;
     hello.c_store_guid = c_guid;
     hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
     hello.limits = {};
-    co_await raw_write(socket, hello);
-    // The hook-controlled delay: BEGIN (and BODY) land only after F has
-    // certainly consumed HELLO -- beyond the peek's reach.
-    asio::steady_timer delay(executor);
-    delay.expires_after(std::chrono::milliseconds(100));
-    co_await delay.async_wait(asio::use_awaitable);
-    co_await raw_write(socket, successor_tu.begin);
-    Message body_message = BodyMessage{successor_tu.body};
-    co_await raw_write(socket, std::move(body_message));
+    const std::vector<std::vector<uint8_t>> frames =
+        successor_wire_frames(successor_tu, hello.limits.max_frame_payload);
+    // The prefix that lands before the head commits: the BEGIN frame plus
+    // the BODY frames -- whole, or just the first half of the first one
+    // when the shape straddles (the tail then waits for head_committed).
+    std::vector<uint8_t> prefix;
+    for (const std::vector<uint8_t>& frame : frames) {
+        if (shape.split_first_body_frame && !prefix.empty()) {
+            // Split INSIDE this BODY frame -- never at a frame boundary, or
+            // the drain would stop clean and there would be nothing to
+            // finish.
+            const size_t keep = frame.size() / 2;
+            prefix.insert(prefix.end(), frame.begin(), frame.begin() + keep);
+            break;
+        }
+        prefix.insert(prefix.end(), frame.begin(), frame.end());
+    }
+    if (!shape.batch_hello_with_frames) {
+        // Do not write HELLO until the head's TX is installed and pending on
+        // the route at F (the gate-entered flag is that deterministic
+        // signal): the pre-park condition is route->pending owned by another
+        // serial.
+        asio::steady_timer pending_wait(executor);
+        while (!race.head_pending->load(std::memory_order_acquire)) {
+            pending_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await pending_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        co_await raw_write(socket, hello);
+        // The hook-controlled delay: BEGIN (and BODY) land only after F has
+        // certainly consumed HELLO -- beyond the peek's reach.
+        asio::steady_timer delay(executor);
+        delay.expires_after(std::chrono::milliseconds(100));
+        co_await delay.async_wait(asio::use_awaitable);
+    } else {
+        // Peek-time-park shape: HELLO shares the single write with the
+        // frames, after the head's route exists (its reset ack).
+        asio::steady_timer route_wait(executor);
+        while (!race.head_route_ready->load(std::memory_order_acquire)) {
+            route_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await route_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        const std::vector<uint8_t> hello_frame = encode_frame(Message{hello});
+        prefix.insert(prefix.begin(), hello_frame.begin(), hello_frame.end());
+    }
+    if (shape.batch_hello_with_frames || shape.batch_begin_with_body) {
+        // ONE contiguous send: HELLO/BEGIN/BODY all land in the same socket
+        // receive buffer, so one drain carries them together -- the
+        // high-BDP production shape.
+        co_await raw_send_all(socket, prefix, &race.send_failed);
+    } else {
+        // The production order: BEGIN first, then the BODY frames, as two
+        // writes.
+        co_await raw_write(socket, successor_tu.begin);
+        Message body_message = BodyMessage{successor_tu.body};
+        co_await raw_write(socket, std::move(body_message));
+    }
     race.begin_written.store(true);
+    if (race.send_failed.load(std::memory_order_acquire)) {
+        // The batch never fully landed (peer died first): record and
+        // unwind -- the driver turns it into the leg's failure.
+        race.detail = "pre-park successor could not land its wire batch";
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
     // Park proof: while the head's materialization is still gated (its TX
     // pending on the route), no byte may arrive on this socket. A
     // fall-through stage() would have written SESSION_STATE immediately
     // (microseconds after the missed peek), so a short level-triggered
-    // probe window on available() is a complete refutation; the gate is
-    // held through this whole window (probe_done gates the releaser).
+    // probe window on available() is a complete refutation. Recorded, not
+    // thrown: a red run must still unwind through the whole dialogue or
+    // the leg hangs in run_for. The gate stays held through this window
+    // (the releaser fires 400 ms after begin_written, well past the last
+    // probe tick) so a clean-green probe really proves no stage() ran.
     asio::steady_timer probe(executor);
     for (int iteration = 0; iteration != 20; ++iteration) {
         probe.expires_after(std::chrono::milliseconds(10));
@@ -7269,26 +7433,107 @@ asio::awaitable<void> raw_prepark_successor(tcp::endpoint remote, CStoreGuid c_g
             asio::redirect_error(asio::use_awaitable, ignored));
         boost::system::error_code available_error;
         const std::size_t available = socket.available(available_error);
-        require(!available_error && available == 0,
-                "pre-park successor received bytes while its predecessor "
-                "was still pending (stage() ran early)");
+        if (available_error != boost::system::errc::success ||
+            available != 0) {
+            race.probe_saw_bytes.store(true, std::memory_order_release);
+            if (race.detail.empty()) {
+                race.detail = available_error != boost::system::errc::success
+                                   ? "probe tick errored"
+                                   : ("pre-park successor received " +
+                                      std::to_string(available) +
+                                      " bytes while its predecessor was "
+                                      "still pending (stage() ran early, or "
+                                      "a pre-fix terminal ERROR frame "
+                                      "arrived)");
+            }
+        }
     }
     race.probe_done.store(true);
+    if (shape.split_first_body_frame) {
+        // The head commits (release_parked_at ran inside that commit): the
+        // drain has provably stopped holding half a BODY frame. Only now
+        // write the tail.
+        asio::steady_timer commit_wait(executor);
+        while (!race.head_committed.load(std::memory_order_acquire)) {
+            commit_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await commit_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        std::vector<uint8_t> tail;
+        // frames[0] is the BEGIN frame (already in the prefix); frames[1]
+        // is the straddling BODY frame: its second half opens the tail.
+        for (size_t index = 1; index != frames.size(); ++index) {
+            const std::vector<uint8_t>& frame = frames[index];
+            if (index == 1) {
+                const size_t keep = frame.size() / 2;
+                tail.insert(tail.end(), frame.begin() + keep, frame.end());
+                continue;
+            }
+            tail.insert(tail.end(), frame.begin(), frame.end());
+        }
+        co_await raw_send_all(socket, tail);
+    }
+    if (race.probe_saw_bytes.load(std::memory_order_acquire) &&
+        !shape.split_first_body_frame) {
+        // Red path: F answered a terminal ERROR frame (or staged early) and
+        // this socket's dialogue is dead. Drain whatever arrived (so the
+        // close is orderly) and unwind; the driver asserts the recorded
+        // outcome. A straddling shape never reaches here on red the same
+        // way (its prefix half-frame stays parked), so it presses on to the
+        // STATE read, which itself records a mismatch if F died.
+        asio::steady_timer drain(executor);
+        for (int iteration = 0; iteration != 40; ++iteration) {
+            drain.expires_after(std::chrono::milliseconds(10));
+            boost::system::error_code ignored;
+            co_await drain.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+            boost::system::error_code available_error;
+            (void)socket.available(available_error);
+        }
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
     // The gate released (the test's watcher frees it once begin_written);
     // the STATE read completes only through the head's commit release, and
-    // it must carry this successor's OWN predicted cursor.
-    const SessionState state = raw_decode<SessionState>(
-        co_await raw_read(socket, hello.limits.max_frame_payload));
-    require(state.route_present && state.history_nonce == nonce &&
-                state.next_rel_seq.value == 1 &&
-                state.state_digest == successor_tu.begin.pre_state_digest,
-            "pre-park successor observed a route cursor that never advanced "
-            "to its own predicted witness");
-    const TxCommit commit = raw_decode<TxCommit>(
-        co_await raw_read(socket, state.limits.max_frame_payload));
-    require(commit.transaction_digest == successor_tu.begin.transaction_digest &&
-                commit.raw_digest == successor_tu.begin.raw_digest,
-            "pre-park successor received a different TX_COMMIT");
+    // it must carry this successor's OWN predicted cursor. Both reads are
+    // wrapped: a red path can kill this half of the dialogue with an EOF
+    // or a terminal ERROR frame instead of SESSION_STATE, and an exception
+    // escaping a coroutine that still owes a close is exactly the
+    // die-mid-dialogue shape that wedges the leg. Everything here records
+    // and unwinds.
+    try {
+        const SessionState state = raw_decode<SessionState>(
+            co_await raw_read(socket, hello.limits.max_frame_payload));
+        const bool state_witness =
+            state.route_present && state.history_nonce == nonce &&
+            state.next_rel_seq.value == 1 &&
+            state.state_digest == successor_tu.begin.pre_state_digest;
+        race.state_witness_matched.store(state_witness,
+                                         std::memory_order_release);
+        if (!state_witness && race.detail.empty()) {
+            race.detail =
+                "pre-park successor observed a route cursor that never "
+                "advanced to its own predicted witness";
+        } else {
+            const TxCommit commit = raw_decode<TxCommit>(
+                co_await raw_read(socket, state.limits.max_frame_payload));
+            const bool commit_witness =
+                commit.transaction_digest ==
+                    successor_tu.begin.transaction_digest &&
+                commit.raw_digest == successor_tu.begin.raw_digest;
+            race.commit_witness_matched.store(commit_witness,
+                                              std::memory_order_release);
+            if (!commit_witness && race.detail.empty())
+                race.detail = "pre-park successor received a different "
+                              "TX_COMMIT";
+        }
+    } catch (const std::exception& error) {
+        if (race.detail.empty())
+            race.detail = std::string("pre-park successor dialogue died: ") +
+                          error.what();
+    }
     boost::system::error_code ignored;
     socket.close(ignored);
     co_return;
@@ -7309,6 +7554,8 @@ asio::awaitable<void> raw_prepark_head(tcp::endpoint remote, CStoreGuid c_guid,
                 reset_ack.state_digest == initial_route_digest(c_guid, nonce) &&
                 reset_ack.next_rel_seq.value == 0,
             "pre-park head did not establish its fresh route");
+    if (race.head_route_ready != nullptr)
+        race.head_route_ready->store(true, std::memory_order_release);
     const TxBegin begin =
         make_begin(head_tu, nonce, reset_ack.state_digest,
                    reset_ack.next_rel_seq);
@@ -7329,17 +7576,41 @@ asio::awaitable<void> raw_prepark_head(tcp::endpoint remote, CStoreGuid c_guid,
     require(commit.transaction_digest == begin.transaction_digest &&
                 commit.raw_digest == begin.raw_digest,
             "pre-park head received a different TX_COMMIT");
+    // The commit read completing proves F wrote TX_COMMIT, which is strictly
+    // after release_parked_at() ran inside that commit: every released
+    // successor (and its straddling drain) is now live.
+    race.head_committed.store(true, std::memory_order_release);
     boost::system::error_code ignored;
     socket.close(ignored);
     co_return;
 }
 
-void test_route_pipeline_prepark_when_begin_lands_after_hello() {
+// One pre-park/park pair leg: a gated raw head (rel 0) plus one raw
+// successor (rel 1) whose wire shape, payload and socket buffer the plan
+// selects. Everything the original missed-peek test asserted is asserted
+// here for every shape: park (no early stage), both commit in order, exact
+// bytes, and the successor's STATE carrying its OWN predicted witness.
+struct PreparkPairPlan {
+    const char* name = "";
+    std::vector<uint8_t> successor_input;
+    PreparkSuccessorShape shape;
+    // caps.zstd.max_raw_bytes == max_encoded_body_bytes.
+    size_t zstd_cap = 1U << 20;
+    // SO_RCVBUF set on the successor acceptor before accept (accepted
+    // sockets inherit it): one big receive buffer makes one drain carry the
+    // whole BEGIN+BODY batch, the high-BDP production shape.
+    size_t successor_receive_buffer = 0;
+    // The peek-time park (HELLO batched with BEGIN) records the peeked rel;
+    // the pre-park (delayed BEGIN) must not.
+    bool expect_peeked_begin = false;
+};
+
+void run_prepark_pair(const PreparkPairPlan& plan) {
     const P5coStoreGuids guids = p5co_store_guids(48);
     EndpointCaps caps;
     caps.profile = ProfileId::ZSTD_TU;
-    caps.zstd.max_raw_bytes = 1U << 20;
-    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    caps.zstd.max_raw_bytes = plan.zstd_cap;
+    caps.zstd.max_encoded_body_bytes = plan.zstd_cap;
     ActionTrace actions;
     P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
     const HistoryNonce nonce{481};
@@ -7355,11 +7626,12 @@ void test_route_pipeline_prepark_when_begin_lands_after_hello() {
         head_tu.begin.transaction_digest);
     const ZstdTuEnvelope successor_tu =
         encode_zstd_tu(nonce, RelSeq{1}, TuSeq{4811}, successor_pre_state,
-                       bytes("pre-park: successor TU\n"));
+                       plan.successor_input);
 
     std::promise<void> release_head;
     std::future<void> head_gate = release_head.get_future();
     std::atomic<bool> head_materialize_entered{false};
+    std::atomic<bool> head_route_ready{false};
     EndpointIoControl head_server_control;
     head_server_control.before_materialize_on_worker = [&]() {
         if (!head_materialize_entered.exchange(true))
@@ -7367,12 +7639,23 @@ void test_route_pipeline_prepark_when_begin_lands_after_hello() {
     };
     PreparkRace race;
     race.head_pending = &head_materialize_entered;
+    race.head_route_ready = &head_route_ready;
     asio::io_context context;
     // Separate acceptors per leg: no accept-order race between head and
     // successor.
     tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor successor_acceptor(
         context, {asio::ip::address_v4::loopback(), 0});
+    if (plan.successor_receive_buffer != 0) {
+        boost::system::error_code buffer_error;
+        successor_acceptor.set_option(
+            asio::socket_base::receive_buffer_size(
+                plan.successor_receive_buffer),
+            buffer_error);
+        require(!buffer_error,
+                "pre-park fixture could not enlarge the successor receive "
+                "buffer");
+    }
     std::future<ServerRunResult> head_server = asio::co_spawn(
         context, server.accept_one(head_acceptor, head_server_control),
         asio::use_future);
@@ -7383,55 +7666,104 @@ void test_route_pipeline_prepark_when_begin_lands_after_hello() {
         raw_prepark_head(head_acceptor.local_endpoint(), guids.c, head_tu,
                          nonce, race),
         asio::use_future);
+    // The same wide buffer on the sender side: one async_write then hands
+    // the whole batch to the kernel in a single delivery.
+    PreparkSuccessorShape successor_shape = plan.shape;
+    if (plan.successor_receive_buffer != 0)
+        successor_shape.socket_buffer = plan.successor_receive_buffer;
     std::future<void> successor_client = asio::co_spawn(
         context,
         raw_prepark_successor(successor_acceptor.local_endpoint(), guids.c,
-                              successor_tu, nonce, race),
+                              successor_tu, nonce, race, successor_shape),
         asio::use_future);
-    // Release the head's materialization once the successor has landed its
-    // full batch: the head commits, release_parked_at wakes the pre-parked
-    // successor, and both dialogues complete.
+    // Release the head's materialization on a fixed delay after the
+    // successor landed its batch. The probe window (200 ms) always runs
+    // inside that delay; the gate is freed even when the successor
+    // coroutine dies early (a pre-fix red throws inside the probe or the
+    // STATE read), where a releaser that waited for probe_done would
+    // leave the head's codec worker blocked in the gate forever and the
+    // leg would hang instead of failing.
     std::future<void> releaser = asio::co_spawn(
         context,
         [&]() -> asio::awaitable<void> {
             asio::steady_timer timer(co_await asio::this_coro::executor);
-            while (!race.begin_written.load() || !race.probe_done.load()) {
+            while (!race.begin_written.load()) {
                 timer.expires_after(std::chrono::milliseconds(1));
                 boost::system::error_code ignored;
                 co_await timer.async_wait(
                     asio::redirect_error(asio::use_awaitable, ignored));
             }
+            timer.expires_after(std::chrono::milliseconds(400));
+            boost::system::error_code ignored;
+            co_await timer.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
             release_head.set_value();
             co_return;
         },
         asio::use_future);
-    context.run_for(std::chrono::seconds(10));
-    require(head_server.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready &&
-                successor_server.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready &&
-                head_client.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready &&
-                successor_client.wait_for(std::chrono::seconds(0)) ==
-                    std::future_status::ready,
-            "test_route_pipeline_prepark_when_begin_lands_after_hello: "
-            "hung (pre-park regression?)");
+    context.run_for(std::chrono::seconds(20));
+    // Nothing throws from inside the coroutines any more: a leg that ends
+    // with anything less than all four futures ready means a coroutine died
+    // mid-dialogue (an unexpected exception -- a fixture bug), not a
+    // production regression.
+    const bool head_server_done =
+        head_server.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready;
+    const bool successor_server_done =
+        successor_server.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready;
+    const bool head_client_done =
+        head_client.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready;
+    const bool successor_client_done =
+        successor_client.wait_for(std::chrono::seconds(0)) ==
+        std::future_status::ready;
+    require(head_server_done && successor_server_done && head_client_done &&
+                successor_client_done,
+            std::string(plan.name) +
+                ": hung (coroutine died mid-dialogue -- fixture bug, not a "
+                "pre-park regression)");
     head_client.get();
     successor_client.get();
     const ServerRunResult head_run = head_server.get();
     const ServerRunResult successor_run = successor_server.get();
+    if (successor_run.terminal_error.has_value())
+        std::fprintf(stderr,
+                     "p50_endpoint_test: %s: successor session ended "
+                     "TerminalError code=%u detail=%s\n",
+                     plan.name,
+                     static_cast<unsigned>(successor_run.terminal_error->code),
+                     successor_run.terminal_error->detail.c_str());
+    // The successor's recorded outcomes, asserted OUTSIDE the io_context:
+    // a red run (a reverted fix) records its failure here and unwinds
+    // cleanly, so the leg fails -- not hangs -- with this exact message.
+    require(!race.probe_saw_bytes.load(std::memory_order_acquire) &&
+                !race.send_failed.load(std::memory_order_acquire) &&
+                race.state_witness_matched.load(std::memory_order_acquire) &&
+                race.commit_witness_matched.load(std::memory_order_acquire),
+            std::string(plan.name) + ": " +
+                (race.detail.empty()
+                     ? std::string("pre-park successor outcome was not "
+                                   "recorded (fixture bug)")
+                     : race.detail));
     require(head_run.status == ServerRunStatus::Completed &&
                 successor_run.status == ServerRunStatus::Completed,
             "pre-park pair did not complete both sessions");
     require(head_run.f_rel_seq.value == 0 &&
                 successor_run.f_rel_seq.value == 1,
             "pre-park pair did not run at its declared rel_seq");
-    // The successor's HELLO-time peek must NOT have seen its own BEGIN: the
-    // 100 ms delay is the whole fixture (the head's own session never peeks
-    // a TX_BEGIN on its own connection).
-    require(!successor_run.f_hello_time_peeked_begin_rel_seq.has_value(),
-            "pre-park fixture broke: the successor's delayed BEGIN was "
-            "peekable at HELLO time");
+    // The successor's HELLO-time peek: the delayed-BEGIN shapes must NOT
+    // have seen their own BEGIN (the 100 ms delay is the whole fixture);
+    // the batched-HELLO shape MUST have (and exactly at its own rel 1 --
+    // the peek-time park key).
+    require(successor_run.f_hello_time_peeked_begin_rel_seq.has_value() ==
+                plan.expect_peeked_begin,
+            "pre-park fixture broke: the successor's BEGIN was "
+            "(un)peekable at HELLO time against the plan");
+    if (plan.expect_peeked_begin)
+        require(successor_run.f_hello_time_peeked_begin_rel_seq->value == 1,
+                "pre-park fixture broke: the peeked BEGIN was not the "
+                "successor's own rel 1");
     (void)releaser;
     // Commit order and exact bytes on the F route.
     std::vector<uint64_t> f_commit_order;
@@ -7444,9 +7776,77 @@ void test_route_pipeline_prepark_when_begin_lands_after_hello() {
     require(f_commit_order == std::vector<uint64_t>{0, 1},
             "pre-park pair committed its TUs out of route order");
     require(copy_input(server, guids.c) ==
-                std::optional<std::vector<uint8_t>>(
-                    bytes("pre-park: successor TU\n")),
+                std::optional<std::vector<uint8_t>>(plan.successor_input),
             "pre-park successor did not materialize exact bytes");
+}
+
+void test_route_pipeline_prepark_when_begin_lands_after_hello() {
+    PreparkPairPlan plan;
+    plan.name = "test_route_pipeline_prepark_when_begin_lands_after_hello";
+    plan.successor_input = bytes("pre-park: successor TU\n");
+    run_prepark_pair(plan);
+}
+
+// Large-TU regression (farm bug fixed in 54158e17): the pre-park drain
+// ceiling used to be checked BEFORE the first-frame decision. A single
+// drain carrying the successor's TX_BEGIN plus several MB of its BODY (one
+// contiguous write into a 16 MiB receive buffer -- the high-BDP production
+// shape) tripped the 1 MiB pre-BEGIN ceiling and F answered "pre-parked
+// connection exceeded its declared TX size" (ERROR code 1) for exactly the
+// successor whose BEGIN declares that size. The TU is >= 3 MiB of seeded
+// pseudo-random bytes: incompressible, so the encoded body is the same
+// order as the raw input and no test cap can be satisfied by accident.
+void test_route_pipeline_prepark_large_tu_single_drain_decides_from_first_frame() {
+    PreparkPairPlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_large_tu_single_drain_decides_from_"
+        "first_frame";
+    plan.successor_input = pseudo_random_bytes(3U << 20);
+    plan.shape.batch_begin_with_body = true;
+    plan.zstd_cap = 16U << 20;
+    plan.successor_receive_buffer = 16U << 20;
+    run_prepark_pair(plan);
+}
+
+// Straddling-BODY regression for the PRE-PARK loop (farm bug fixed in
+// 355a35aa): the successor lands BEGIN plus only the FIRST HALF of its
+// first BODY frame; the head then commits and the pre-park is released
+// holding that half frame in its parser. F must finish the frame from the
+// socket (the tail is written only after the head's TX_COMMIT was read)
+// before the unchanged dispatch sees it -- pre-fix the live reads resumed
+// mid-frame and failed with "unknown frame type" / "frame payload exceeds
+// configured cap".
+void test_route_pipeline_prepark_straddling_body_frame_finishes_before_dispatch() {
+    PreparkPairPlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_straddling_body_frame_finishes_before_"
+        "dispatch";
+    plan.successor_input = pseudo_random_bytes(3U << 20);
+    plan.shape.batch_begin_with_body = true;
+    plan.shape.split_first_body_frame = true;
+    plan.zstd_cap = 16U << 20;
+    plan.successor_receive_buffer = 16U << 20;
+    run_prepark_pair(plan);
+}
+
+// The same straddling shape through the PEEK-TIME park loop (step 5c, BEGIN
+// readable at HELLO): HELLO, BEGIN and the half BODY frame land in one
+// contiguous write, so the step-5b peek records the BEGIN and the
+// peek-time park takes the connection. Its drain stops on the same
+// straddling frame at the release, and the same finish_partial_frame must
+// run.
+void test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch() {
+    PreparkPairPlan plan;
+    plan.name =
+        "test_route_pipeline_park_straddling_body_frame_finishes_before_"
+        "dispatch";
+    plan.successor_input = pseudo_random_bytes(3U << 20);
+    plan.shape.batch_hello_with_frames = true;
+    plan.shape.split_first_body_frame = true;
+    plan.zstd_cap = 16U << 20;
+    plan.successor_receive_buffer = 16U << 20;
+    plan.expect_peeked_begin = true;
+    run_prepark_pair(plan);
 }
 
 // T-F grace leg (Fix F): HELLO with no further bytes while the head's TX is
@@ -9168,6 +9568,9 @@ int main(int argc, char** argv) {
         test_route_pipeline_prepark_when_begin_lands_after_hello();
         test_route_pipeline_prepark_grace_falls_through_after_head_commit();
         test_route_pipeline_prepark_grace_expiry_falls_through_not_throws();
+        test_route_pipeline_prepark_large_tu_single_drain_decides_from_first_frame();
+        test_route_pipeline_prepark_straddling_body_frame_finishes_before_dispatch();
+        test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
         test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
@@ -9238,6 +9641,9 @@ int main(int argc, char** argv) {
     test_route_pipeline_prepark_when_begin_lands_after_hello();
     test_route_pipeline_prepark_grace_falls_through_after_head_commit();
     test_route_pipeline_prepark_grace_expiry_falls_through_not_throws();
+    test_route_pipeline_prepark_large_tu_single_drain_decides_from_first_frame();
+    test_route_pipeline_prepark_straddling_body_frame_finishes_before_dispatch();
+    test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
     test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
