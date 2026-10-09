@@ -274,36 +274,47 @@ OwnerWatchdog::~OwnerWatchdog() {
 void OwnerWatchdog::run() {
     ::pthread_setname_np(::pthread_self(), "p50-ownerwd");
 
-    while (!stop_.load(std::memory_order_acquire)) {
+    for (;;) {
         for (int waited_ms = 0; waited_ms < 50 && !stop_.load(std::memory_order_acquire);
              waited_ms += 10) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        if (stop_.load(std::memory_order_acquire))
-            break;
+
+        // Always tick once more here, even if stop_ is now set: this is the
+        // only chance to observe a heartbeat that resumed (StallEnded) or a
+        // stall that just started (Dump) during the final 50ms poll window
+        // before the destructor tears this thread down. Skipping this tick
+        // on the stopping path would silently lose that last transition --
+        // e.g. a caller that constructs+immediately-destroys a watchdog
+        // right as the owner recovers (exactly what the unit test does, and
+        // plausible in production if SidecarRuntime is shutting down right
+        // as the owner thread comes back).
+        const bool stopping = stop_.load(std::memory_order_acquire);
 
         const int64_t now = steady_now_ns();
         const int64_t hb = heartbeat_ns_.load(std::memory_order_acquire);
         const int tid = owner_tid_.load(std::memory_order_acquire);
-        if (tid <= 0)
-            continue; // owner thread hasn't published its tid yet
+        if (tid > 0) {
+            const OwnerStallDumpGate::Action action = gate_.tick(now, hb);
+            if (action == OwnerStallDumpGate::Action::Dump) {
+                // Kernel-side diagnostics first -- see header comment: SIGPROF
+                // delivery wakes the thread and would make these stale.
+                print_proc_file(tid, "wchan");
+                print_proc_file(tid, "syscall");
 
-        const OwnerStallDumpGate::Action action = gate_.tick(now, hb);
-        if (action == OwnerStallDumpGate::Action::Dump) {
-            // Kernel-side diagnostics first -- see header comment: SIGPROF
-            // delivery wakes the thread and would make these stale.
-            print_proc_file(tid, "wchan");
-            print_proc_file(tid, "syscall");
-
-            if (handler_installed_by_us_) {
-                g_pending_stalled_ms.store(gate_.stalled_ms(), std::memory_order_relaxed);
-                g_pending_dump_index.store(gate_.dump_count(), std::memory_order_relaxed);
-                syscall(SYS_tgkill, getpid(), tid, SIGPROF);
+                if (handler_installed_by_us_) {
+                    g_pending_stalled_ms.store(gate_.stalled_ms(), std::memory_order_relaxed);
+                    g_pending_dump_index.store(gate_.dump_count(), std::memory_order_relaxed);
+                    syscall(SYS_tgkill, getpid(), tid, SIGPROF);
+                }
+            } else if (action == OwnerStallDumpGate::Action::StallEnded) {
+                std::fprintf(stderr, "P50_OWNER_STALL_END tid=%d stalled_ms=%lld\n", tid,
+                             static_cast<long long>(gate_.stalled_ms()));
             }
-        } else if (action == OwnerStallDumpGate::Action::StallEnded) {
-            std::fprintf(stderr, "P50_OWNER_STALL_END tid=%d stalled_ms=%lld\n", tid,
-                         static_cast<long long>(gate_.stalled_ms()));
         }
+
+        if (stopping)
+            break;
     }
 }
 
