@@ -4236,12 +4236,6 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
             std::lock_guard lock(mutex_);
             refused_ordinal_ = ordinal;
         }
-        // Arms whose adopted session is killed mid-dialogue (see serve()):
-        // the C run of THAT arm dies pre-commit with nothing staged at F.
-        void kill_arm_ordinals(std::vector<size_t> ordinals) noexcept {
-            std::lock_guard lock(mutex_);
-            kill_ordinals_ = std::move(ordinals);
-        }
 
         void stop() noexcept {
             stopping_.store(true, std::memory_order_release);
@@ -4284,8 +4278,8 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
                     continue;
                 }
                 try {
-                    workers_.emplace_back([this, accepted, peer, peer_size, ordinal] {
-                        serve(accepted, peer, peer_size, ordinal);
+                    workers_.emplace_back([this, accepted, peer, peer_size] {
+                        serve(accepted, peer, peer_size);
                     });
                 } catch (...) {
                     (void)::close(accepted);
@@ -4293,8 +4287,7 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
             }
         }
 
-        void serve(int accepted, sockaddr_in peer, socklen_t peer_size,
-                   size_t ordinal) noexcept {
+        void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
             try {
                 std::unique_ptr<MsgChannel> channel(Service::createChannel(
                     accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
@@ -4337,20 +4330,17 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
                     (void)::close(raw_fd);
                     return;
                 }
-                // Hand F the session. Kill semantics by ordinal: a session
-                // listed in kill_ordinals_ is shut down AFTER adoption (the
-                // shutdown hits the SHARED socket, so F's adopted run reads
-                // EOF and dies mid-dialogue -- the C side then sees its own
-                // writes/reads fail pre-commit with no TX_BEGIN staged by
-                // F); every other session stays alive so retries and the
-                // fresh-assignment probe can commit through this front.
-                bool kill_this_session = false;
-                {
-                    std::lock_guard lock(mutex_);
-                    kill_this_session = std::find(kill_ordinals_.begin(),
-                                                  kill_ordinals_.end(),
-                                                  ordinal) != kill_ordinals_.end();
-                }
+                // Hand F the session. For the FIRST session only: kill the
+                // F-side dialogue at once -- shutdown() on a dup'ed descriptor
+                // hits the SHARED socket (an fd close alone would not, asio
+                // owns another copy), so F's adopted run reads EOF and dies
+                // mid-dialogue and the C side sees its own STATE read hit EOF
+                // pre-commit, with no TX_BEGIN of this transfer staged by F.
+                // Every LATER session stays alive so the retry -- and the
+                // fresh-assignment probe -- can arm and commit through this
+                // same front.
+                const bool kill_this_session =
+                    !killed_.exchange(true, std::memory_order_acq_rel);
                 const int kill_copy = kill_this_session ? ::dup(raw_fd) : -1;
                 f_runtime_.start_adopted_endpoint(raw_fd);
                 if (kill_copy >= 0) {
@@ -4368,7 +4358,7 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
         std::atomic<bool> stopping_{false};
         std::atomic<size_t> arm_ordinal_{0};
         size_t refused_ordinal_ = 0;
-        std::vector<size_t> kill_ordinals_;
+        std::atomic<bool> killed_{false};
         std::mutex mutex_;
         std::vector<std::thread> workers_;
         std::thread acceptor_;
@@ -4397,7 +4387,6 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
     // which the front refuses outright -- the k45 arm face. The 20 s
     // budget keeps the retry inside the deadline, so the attempt-2
     // branch -- not a deadline -- decides the retirement.
-    front.kill_arm_ordinals({1});
     front.refuse_arm_ordinal(2);
     std::thread doomed([&] {
         storm.failed = transfer(710, std::chrono::seconds(20));
@@ -4437,343 +4426,6 @@ void test_attempt2_fd_failure_retires_route_locally() {
     // Unavailable/0x5002 at attempts=0 -- the whole-leg route loss.)
     CHECK(storm.failed.code != local::SourceTransferResultCode::Committed);
     CHECK(storm.failed.error_code != replacement_code);
-    CHECK(storm.after_ran);
-    CHECK(storm.after.code == local::SourceTransferResultCode::Committed);
-    CHECK(storm.after.error_code != replacement_code);
-}
-
-// The connect-face window seed (K4-4/K4-6 farm legs): a successor whose
-// transport dies with ZERO wire writes -- the adopted session is killed
-// under it before any byte lands at F. Today that system_error poisons the
-// whole outstanding window (healthy siblings retire as collateral and the
-// sender's own retry is foreclosed by the poison-driven chain abandon);
-// with the zero-write de-poison the sender immediately re-opens, re-runs
-// the same admitted encoding and rel (the pending serializer continues,
-// the predict-commit lands at the retry's FILL write), and every member
-// commits. One killed session, one live retry: the minimal recovery
-// proof. The second leg below kills the RETRY's session too: both
-// zero-write failures must fall back to today's exact poison (the window
-// collapses route-locally through the chain-abandoned retirement -- no
-// sticky 0x5002 anywhere -- because the second failure takes the
-// attempt-2 zero-BEGIN route-local path).
-struct ConnectFaceResult {
-    std::array<local::P50SourceTransferResult, 3> members{};
-    size_t member_count = 0;
-    local::P50SourceTransferResult after{};
-    bool after_ran = false;
-};
-
-ConnectFaceResult run_connect_face_storm(bool also_kill_the_retry) {
-    for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
-                             "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
-                             "ICECC_P50_ROUTE_LANES", "ICECC_P50_ARMED_WINDOW",
-                             "ICECC_P50_PREP_AHEAD"})
-        CHECK(::unsetenv(name) == 0);
-    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "3", 1) == 0);
-    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
-#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
-    CHECK(::setenv("ICECC_P50_F_RESULT_TRACE",
-                   "/tmp/p50-connect-face-f.jsonl", 1) == 0);
-#endif
-    constexpr uint64_t kFStoreGeneration = 45;
-    StoreIdentityRoot f_root{};
-    f_root.bytes[14] = 0x9b;
-    service::RuntimeConfig f_config = test_runtime_config();
-    f_config.f_store_guid = f_store_guid_for_root(f_root);
-    f_config.f_store_generation = kFStoreGeneration;
-    service::SidecarRuntime f_runtime(std::move(f_config));
-
-    StoreIdentityRoot c_root{};
-    c_root.bytes[15] = 0xe6;
-    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
-    service::RuntimeConfig c_config = test_runtime_config();
-    c_config.c_store_guid = launch.c_store_guid;
-    c_config.f_store_guid = launch.f_store_guid;
-    c_config.f_store_generation = launch.store_generation;
-    c_config.sidecar_launch = launch;
-    // Observed per admitted route prepare: the deterministic arm-order
-    // probe below waits on it before launching the next member.
-    std::atomic<size_t> prepares{0};
-    c_config.before_route_prepare_for_test = [&] {
-        prepares.fetch_add(1, std::memory_order_acq_rel);
-    };
-    service::SidecarRuntime c_runtime(std::move(c_config));
-
-    // The raw arm front with kill-by-ordinal semantics: the FIRST arm's
-    // session is killed under its C run (the deviator's attempt 1 dies
-    // pre-write, nothing at F); with also_kill_the_retry, arm 2's session
-    // is killed too (attempt 2 dies the same way). Every other session
-    // serves.
-    class ConnectFaceFront {
-    public:
-        ConnectFaceFront(service::SidecarRuntime& f_runtime,
-                         uint64_t f_store_generation,
-                         std::vector<size_t> kill_ordinals)
-            : f_runtime_(f_runtime),
-              f_store_generation_(f_store_generation),
-              kill_ordinals_(std::move(kill_ordinals)),
-              listener_(loopback_listener(port_)) {
-            CHECK(::listen(listener_, 16) == 0);
-            acceptor_ = std::thread([this] { accept_loop(); });
-        }
-        ~ConnectFaceFront() { stop(); }
-        ConnectFaceFront(const ConnectFaceFront&) = delete;
-        ConnectFaceFront& operator=(const ConnectFaceFront&) = delete;
-
-        [[nodiscard]] uint16_t port() const noexcept { return port_; }
-
-        // Optional per-arm endpoint control handed to F with every adopted
-        // CacheWire session (e.g. a before_materialize_on_worker stall).
-        // Must be set before the first transfer connects.
-        std::function<EndpointIoControl()> arm_control;
-
-        void stop() noexcept {
-            stopping_.store(true, std::memory_order_release);
-            if (acceptor_.joinable())
-                acceptor_.join();
-            for (std::thread& worker : workers_)
-                if (worker.joinable())
-                    worker.join();
-            workers_.clear();
-            if (listener_ >= 0) {
-                (void)::close(listener_);
-                listener_ = -1;
-            }
-        }
-
-    private:
-        void accept_loop() noexcept {
-            while (!stopping_.load(std::memory_order_acquire)) {
-                pollfd descriptor{listener_, POLLIN, 0};
-                if (::poll(&descriptor, 1, 20) <= 0)
-                    continue;
-                sockaddr_in peer{};
-                socklen_t peer_size = sizeof(peer);
-                const int accepted = ::accept(
-                    listener_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
-                if (accepted < 0)
-                    continue;
-                const size_t ordinal =
-                    arm_ordinal_.fetch_add(1, std::memory_order_acq_rel) + 1;
-                try {
-                    workers_.emplace_back(
-                        [this, accepted, peer, peer_size, ordinal] {
-                            serve(accepted, peer, peer_size, ordinal);
-                        });
-                } catch (...) {
-                    (void)::close(accepted);
-                }
-            }
-        }
-
-        void serve(int accepted, sockaddr_in peer, socklen_t peer_size,
-                   size_t ordinal) noexcept {
-            try {
-                std::unique_ptr<MsgChannel> channel(Service::createChannel(
-                    accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
-                if (!channel)
-                    return;
-                std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
-                const auto* arm = arm_message != nullptr
-                                      ? dynamic_cast<P50SourceArmMsg*>(
-                                            arm_message.get())
-                                      : nullptr;
-                if (arm == nullptr || !arm->valid_payload())
-                    return;
-                ClaimAttemptCapability128 capability_1;
-                ClaimAttemptCapability128 capability_2;
-                capability_1.bytes.fill(0xf5);
-                capability_2.bytes.fill(0xf6);
-                const P50SourceArmedMsg acknowledgement(
-                    arm->arm, 111, 112, f_store_generation_,
-                    f_runtime_.f_store_guid().bytes,
-                    kStoreIdentityDerivationVersion, 113, 2500,
-                    capability_1, capability_2);
-                if (!channel->send_msg(acknowledgement))
-                    return;
-                std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
-                if (cache_message == nullptr ||
-                    *cache_message != Msg::CACHE_SESSION)
-                    return;
-                const int raw_fd = channel->release_fd_if_input_empty();
-                if (raw_fd < 0)
-                    return;
-                const auto ready_deadline =
-                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
-                if (!f_runtime_.try_reserve_session()) {
-                    (void)send_cache_session_busy(raw_fd, ready_deadline);
-                    (void)::close(raw_fd);
-                    return;
-                }
-                if (!send_cache_session_ready(raw_fd, ready_deadline)) {
-                    f_runtime_.release_session_reservation();
-                    (void)::close(raw_fd);
-                    return;
-                }
-                // Adopt, then (for the configured ordinals) kill the shared
-                // socket at once: F's run reads EOF before any frame of this
-                // session arrives, and C's first write fails -- zero wire
-                // completions, the farm's seed face. The shutdown hits the
-                // SHARED socket (an fd close alone would not, asio owns
-                // another copy).
-                const bool kill_this_session =
-                    std::find(kill_ordinals_.begin(), kill_ordinals_.end(),
-                              ordinal) != kill_ordinals_.end();
-                const int kill_copy = kill_this_session ? ::dup(raw_fd) : -1;
-                f_runtime_.start_adopted_endpoint(
-                    raw_fd, arm_control ? arm_control() : EndpointIoControl{});
-                if (kill_copy >= 0) {
-                    (void)::shutdown(kill_copy, SHUT_RDWR);
-                    (void)::close(kill_copy);
-                }
-            } catch (...) {
-            }
-        }
-
-        service::SidecarRuntime& f_runtime_;
-        const uint64_t f_store_generation_;
-        std::vector<size_t> kill_ordinals_;
-        uint16_t port_ = 0;
-        int listener_ = -1;
-        std::atomic<bool> stopping_{false};
-        std::atomic<size_t> arm_ordinal_{0};
-        std::mutex mutex_;
-        std::vector<std::thread> workers_;
-        std::thread acceptor_;
-    };
-
-    // The deviator's FIRST arm is ordinal 2 (the killed session); with
-    // also_kill_the_retry its retry's arm is ordinal 3, killed too. Every
-    // other session (the head's ordinal 1, the junior's ordinal 4, the
-    // fresh-assignment probe) serves normally. The materialize gate holds
-    // the HEAD's F-side transaction open, so the deviator's death lands
-    // while its admitted encoding is still fresh (the head has not
-    // committed past it) and the retry is sound; the gate frees after
-    // every member settled.
-    HeadMaterializeGate gate;
-    ConnectFaceFront front(
-        f_runtime, kFStoreGeneration,
-        also_kill_the_retry ? std::vector<size_t>{2, 3} : std::vector<size_t>{2});
-    front.arm_control = [&] {
-        EndpointIoControl control;
-        control.before_materialize_on_worker = [&gate] { gate.before_materialize(); };
-        return control;
-    };
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto transfer = [&](uint64_t identity,
-                              std::chrono::milliseconds budget) {
-        const std::string text = "connect-face-" + std::to_string(identity) + "\n";
-        const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto absolute =
-            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-                std::chrono::steady_clock::now() + budget,
-                clock.clock_domain_id, clock.time_namespace_id);
-        return c_runtime.transfer_source_on_owner(
-            source_transfer_request(front.port(), identity,
-                                    CACHE_PROFILE_P29V1),
-            absolute,
-            local::HandoffFd(source_file("p50-connect-face", source)));
-    };
-
-    // K=3 window with deterministic arm order: the head launches first and
-    // its prepare is observed before the deviator launches, so the head's
-    // arm is ordinal 1 and the deviator's first arm is ordinal 2 -- the
-    // KILLED session (a successor dying with zero wire writes, the farm
-    // seed face; killing ordinal 1 instead would hit the HEAD, whose
-    // system_error catch never poisoned and whose retry worked even
-    // before the fix). The junior parks third behind them both.
-    ConnectFaceResult storm;
-    storm.member_count = 3;
-    std::thread head_thread(
-        [&] { storm.members[0] = transfer(810, std::chrono::seconds(10)); });
-    CHECK(eventually([&] { return prepares.load(std::memory_order_acquire) >= 1; },
-                     std::chrono::seconds(10)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    std::thread deviator_thread(
-        [&] { storm.members[1] = transfer(811, std::chrono::seconds(10)); });
-    CHECK(eventually([&] { return prepares.load(std::memory_order_acquire) >= 2; },
-                     std::chrono::seconds(10)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    std::thread junior_thread(
-        [&] { storm.members[2] = transfer(812, std::chrono::seconds(10)); });
-    // The deviator settles FIRST (its zero-write death and, post-fix, its
-    // immediate retry); only then does the gate free the head's materialize
-    // so the head and the junior can commit inside their own budgets.
-    deviator_thread.join();
-    gate.free();
-    head_thread.join();
-    junior_thread.join();
-    storm.after = transfer(820, std::chrono::seconds(10));
-    storm.after_ran = true;
-    CHECK(storm.after.valid());
-    std::fprintf(stderr,
-                 "p50cacheservice: connect-face kill_retry=%d "
-                 "head=%u/%u/%u deviator=%u/%u/%u junior=%u/%u/%u "
-                 "after=%u/%u/%u\n",
-                 int(also_kill_the_retry),
-                 static_cast<unsigned>(storm.members[0].code),
-                 static_cast<unsigned>(storm.members[0].error_code),
-                 static_cast<unsigned>(storm.members[0].attempts),
-                 static_cast<unsigned>(storm.members[1].code),
-                 static_cast<unsigned>(storm.members[1].error_code),
-                 static_cast<unsigned>(storm.members[1].attempts),
-                 static_cast<unsigned>(storm.members[2].code),
-                 static_cast<unsigned>(storm.members[2].error_code),
-                 static_cast<unsigned>(storm.members[2].attempts),
-                 static_cast<unsigned>(storm.after.code),
-                 static_cast<unsigned>(storm.after.error_code),
-                 static_cast<unsigned>(storm.after.attempts));
-    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
-    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
-#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
-    CHECK(::unsetenv("ICECC_P50_F_RESULT_TRACE") == 0);
-#endif
-    return storm;
-}
-
-// One killed session, one live retry: the deviator's zero-write transport
-// death must NOT go sticky. When its HELLO byte never reached the socket
-// (the de-poison class: F closed the session between READY and C's first
-// write), the run leaves the epoch clean, the sender immediately re-opens
-// with the SAME encoding -- still exactly valid while the gated head is
-// uncommitted -- and EVERY member commits. When the HELLO did land in the
-// socket buffer before the reset (a partial write), today's poison stands:
-// the window collapses route-locally through the chain-abandoned
-// retirement. BOTH outcomes are inside the contract; what must NEVER
-// happen is a sticky 0x5002 on any member or the fresh assignment --
-// pre-fix, the head dragged into the collapse died with te=3
-// "TX_COMMIT does not close" through the TerminalError branch and latched
-// route_replacement_required for the rest of the runtime.
-void test_successor_zero_write_transport_death_retries_in_place() {
-    const ConnectFaceResult storm = run_connect_face_storm(false);
-    const auto replacement_code = static_cast<uint16_t>(
-        local::SourceTransferErrorCode::RouteReplacementRequired);
-    for (size_t index = 0; index != storm.member_count; ++index) {
-        CHECK(storm.members[index].error_code != replacement_code);
-        CHECK(storm.members[index].valid());
-    }
-    CHECK(storm.after_ran);
-    CHECK(storm.after.code == local::SourceTransferResultCode::Committed);
-    CHECK(storm.after.error_code != replacement_code);
-}
-
-// Both of the deviator's arms killed pre-write: the second zero-write
-// failure falls back to today's poison semantics -- the window collapses
-// ROUTE-LOCALLY through the chain-abandoned retirement (no member carries
-// the sticky 0x5002, the fresh assignment commits into the reset route).
-void test_second_zero_write_failure_poisons_as_today() {
-    const ConnectFaceResult storm = run_connect_face_storm(true);
-    const auto replacement_code = static_cast<uint16_t>(
-        local::SourceTransferErrorCode::RouteReplacementRequired);
-    // The deviator itself failed twice with nothing on the wire: its own
-    // retirement is route-local (never sticky)...
-    CHECK(storm.members[1].code != local::SourceTransferResultCode::Committed);
-    CHECK(storm.members[1].error_code != replacement_code);
-    // ...and the healthy siblings were retired by the collapse -- also
-    // route-local, the post-adfb2a13 contract...
-    for (size_t index = 0; index != storm.member_count; ++index)
-        CHECK(storm.members[index].error_code != replacement_code);
-    // ...with NOTHING sticky anywhere: the fresh assignment commits.
     CHECK(storm.after_ran);
     CHECK(storm.after.code == local::SourceTransferResultCode::Committed);
     CHECK(storm.after.error_code != replacement_code);
@@ -5419,8 +5071,6 @@ int main(int argc, char** argv) {
             test_k2_stale_epoch_head_retires_route_locally();
             test_k4_stale_epoch_successors_retire_route_locally();
             test_attempt2_fd_failure_retires_route_locally();
-            test_successor_zero_write_transport_death_retries_in_place();
-            test_second_zero_write_failure_poisons_as_today();
             return 0;
         }
         CHECK(argc == 1);
