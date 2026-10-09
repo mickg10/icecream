@@ -2237,6 +2237,12 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     route_config.authority_limits.route_pipeline_depth =
         RouteGate::route_pipeline_depth(CACHE_PROFILE_P29V1);
     route_pipeline_depth_ = route_config.authority_limits.route_pipeline_depth;
+    if (route_pipeline_depth_ > 1) {
+        std::fprintf(stderr,
+                     "P50_ROUTE_PIPELINE_DEPTH effective=%u scope=P29V1\n",
+                     route_pipeline_depth_);
+        std::fflush(stderr);
+    }
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);
@@ -2527,8 +2533,12 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             auto& gate = source_route_gates_[RouteEndpointKey{
                 request.selected_f_host, request.selected_f_cache_port}];
             if (!gate) {
-                const uint32_t pipeline_depth =
-                    RouteGate::route_pipeline_depth(request.cache_profile);
+                // The process-lifetime K read once at construction: calling
+                // RouteGate::route_pipeline_depth(request.cache_profile) here
+                // re-parsed the env per gate and printed a misleading
+                // "CLAMPED reason=profile" whenever the first request to an
+                // endpoint was not P29V1, although K itself was unaffected.
+                const uint32_t pipeline_depth = route_pipeline_depth_;
                 uint32_t lane_count = RouteGate::route_lane_count(
                     config_.endpoint_config.owner_limits.max_live_sessions);
                 // Pipelining and lanes would both multiply this route's
