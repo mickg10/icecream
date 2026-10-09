@@ -7033,8 +7033,9 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     // (4096): the successor's NEED could outgrow a socket buffer, so the
     // dispatch must keep it on the head path.
     std::vector<uint8_t> huge;
-    for (uint32_t index = 0; index < 6000; ++index) {
-        const std::string line = "u" + std::to_string(index) + "\n";
+    for (uint32_t index = 0; index < 20000; ++index) {
+        const std::string line =
+            "unique-source-line-" + std::to_string(index) + "\n";
         huge.insert(huge.end(), line.begin(), line.end());
     }
     const std::vector<uint8_t> small = bytes("# 1 \"/tmp/k2-t7.cc\"\nsmall\n");
