@@ -7787,6 +7787,616 @@ void test_route_pipeline_prepark_when_begin_lands_after_hello() {
     run_prepark_pair(plan);
 }
 
+// ---- Triple-session pre-park legs (660cc787 regressions) ----
+//
+// Two holes the pair legs cannot reach, both fixed by the cursor-claim
+// re-arm (660cc787):
+//   (a) the release-to-install gap: release_parked_at() wakes the successor
+//       whose BEGIN equals the new cursor, but it installs its pending TX
+//       only after it resumes and finishes its straddling drain. A third
+//       session's HELLO landing in that gap saw NO pending TX and staged
+//       against a cursor the claimant was about to consume. Post-fix the
+//       route carries cursor_claim_serial through the gap and the third
+//       session pre-parks on the claim.
+//   (b) K>2 key collision: a pre-park registers at next_rel + 1 BEFORE it
+//       knows its own rel_seq -- at depth > 2 that is an earlier
+//       successor's key. When that key is released, the pre-parked session
+//       whose first frame is still unknown must RE-ARM one past the new
+//       cursor (the route is still busy: the released successor's claim),
+//       not fall through.
+//
+// Recorded-outcome style throughout (same as the pair legs): nothing
+// throws inside a coroutine; every witness is compared after run_for.
+
+struct PreparkTripleRace {
+    // Set by the head's materialize gate: its TX is pending on the route.
+    std::atomic<bool>* head_pending = nullptr;
+    std::atomic<bool>* head_route_ready = nullptr;
+    std::atomic<bool> s1_begin_written{false};
+    std::atomic<bool> s2_hello_written{false};
+    // Set by the raw head after its TX_COMMIT read (release_parked_at ran
+    // synchronously inside that commit: the gap/collision window is open).
+    std::atomic<bool> head_committed{false};
+    // Set by S1 after ITS TX_COMMIT read: its install and commit have both
+    // happened, so S2's re-armed key and its own BEGIN are the live ones.
+    std::atomic<bool> s1_committed{false};
+    std::atomic<bool> s1_probe_saw_bytes{false};
+    std::atomic<bool> s1_state_witness_matched{false};
+    std::atomic<bool> s1_commit_witness_matched{false};
+    std::string s1_detail;
+    std::atomic<bool> s2_begin_written{false};
+    std::atomic<bool> s2_state_witness_matched{false};
+    std::atomic<bool> s2_commit_witness_matched{false};
+    std::string s2_detail;
+};
+
+// S1 (rel 1): the standard missed-peek successor -- HELLO while the head is
+// pending, then a delayed BEGIN -- with one addition for the gap shape: its
+// BODY frame straddles (only the first half lands up front), and the tail
+// waits for s2_hello_written so the release-to-install gap provably covers
+// S2's HELLO. S1's commit read is the gate for the whole leg's order.
+asio::awaitable<void> raw_prepark_triple_s1(
+    tcp::endpoint remote, CStoreGuid c_guid, const ZstdTuEnvelope& s1_tu,
+    HistoryNonce nonce, PreparkTripleRace& race, bool hold_tail_for_gap) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    SessionHello hello;
+    hello.c_store_guid = c_guid;
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    hello.limits = {};
+    const std::vector<std::vector<uint8_t>> frames =
+        successor_wire_frames(s1_tu, hello.limits.max_frame_payload);
+    // HELLO only after the head's TX is installed and pending (the gate
+    // flag): the pre-park condition is route-busy, and HELLO before the
+    // head's reset would see no route at all.
+    asio::steady_timer pending_wait(executor);
+    while (!race.head_pending->load(std::memory_order_acquire)) {
+        pending_wait.expires_after(std::chrono::milliseconds(1));
+        boost::system::error_code ignored;
+        co_await pending_wait.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+    }
+    // Every asio write on a raw peer is wrapped: a red run kills this
+    // session at F (terminal ERROR -> socket closed), and an EPIPE escaping
+    // the co_await resumption propagates straight out of the io_context
+    // (terminate), not into the co_spawn future. Recorded, never thrown.
+    try {
+        co_await raw_write(socket, hello);
+    } catch (const boost::system::system_error& error) {
+        if (race.s1_detail.empty())
+            race.s1_detail = std::string("S1 HELLO write died: ") +
+                              error.what();
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    // The missed-peek delay: BEGIN lands only after F consumed HELLO.
+    asio::steady_timer delay(executor);
+    delay.expires_after(std::chrono::milliseconds(100));
+    co_await delay.async_wait(asio::use_awaitable);
+    // The prefix: the BEGIN frame plus (for the gap shape) the first half
+    // of the first BODY frame; the whole batch in ONE contiguous raw send
+    // (the single-delivery shape, wide buffers pinned by the driver).
+    std::vector<uint8_t> prefix;
+    for (const std::vector<uint8_t>& frame : frames) {
+        if (hold_tail_for_gap && !prefix.empty()) {
+            const size_t keep = frame.size() / 2;
+            prefix.insert(prefix.end(), frame.begin(), frame.begin() + keep);
+            break;
+        }
+        prefix.insert(prefix.end(), frame.begin(), frame.end());
+    }
+    co_await raw_send_all(socket, prefix);
+    race.s1_begin_written.store(true, std::memory_order_release);
+    // No-stage probe FIRST: while the head is still gated (pending), S1 must
+    // be parked, not staged. Recorded, never thrown. This has to run
+    // BEFORE the gap hold below: past the hold, the head's commit has
+    // released S1 and its STATE legitimately arrives -- a probe there
+    // would false-red the green path.
+    asio::steady_timer probe(executor);
+    for (int iteration = 0; iteration != 20; ++iteration) {
+        probe.expires_after(std::chrono::milliseconds(10));
+        boost::system::error_code ignored;
+        co_await probe.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+        boost::system::error_code available_error;
+        const std::size_t available = socket.available(available_error);
+        if (available != 0) {
+            race.s1_probe_saw_bytes.store(true, std::memory_order_release);
+            if (race.s1_detail.empty())
+                race.s1_detail =
+                    "S1 received bytes while its predecessor was still "
+                    "pending (stage() ran early, or a terminal ERROR "
+                    "arrived)";
+        }
+    }
+    if (hold_tail_for_gap) {
+        // The release-to-install hold: the head commits (releases S1 at
+        // the cursor; its claim is now the route's only owner) and S2's
+        // HELLO lands in that gap -- only then does the tail complete S1's
+        // frame so F can install. The extra 100 ms after both flags is
+        // what makes the gap provably cover S2's HELLO PROCESSING (not
+        // just its write): S1's finish_partial_frame read is already
+        // armed at release time and epoll would happily service the
+        // tail's readability first, installing S1 before F ever looked
+        // at S2's HELLO -- the fixture would pass pre-fix. Withholding
+        // the tail 100 ms after the HELLO write leaves F nothing to do
+        // but service the ready HELLO read (loopback, an otherwise idle
+        // io_context), so S2's park/stage decision provably precedes
+        // S1's install. This is the same class of margin as the pair
+        // legs' HELLO-consumed delay.
+        asio::steady_timer gap_wait(executor);
+        while (!(race.head_committed.load(std::memory_order_acquire) &&
+                 race.s2_hello_written.load(std::memory_order_acquire))) {
+            gap_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await gap_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+        gap_wait.expires_after(std::chrono::milliseconds(100));
+        boost::system::error_code gap_ignored;
+        co_await gap_wait.async_wait(
+            asio::redirect_error(asio::use_awaitable, gap_ignored));
+        std::vector<uint8_t> tail;
+        for (size_t index = 1; index != frames.size(); ++index) {
+            const std::vector<uint8_t>& frame = frames[index];
+            if (index == 1) {
+                const size_t keep = frame.size() / 2;
+                tail.insert(tail.end(), frame.begin() + keep, frame.end());
+                continue;
+            }
+            tail.insert(tail.end(), frame.begin(), frame.end());
+        }
+        co_await raw_send_all(socket, tail);
+    }
+    // STATE / TX_COMMIT witness (S1's OWN predicted cursor 1): wrapped, all
+    // red shapes record and unwind.
+    try {
+        const SessionState state = raw_decode<SessionState>(
+            co_await raw_read(socket, hello.limits.max_frame_payload));
+        const bool state_witness =
+            state.route_present && state.history_nonce == nonce &&
+            state.next_rel_seq.value == 1 &&
+            state.state_digest == s1_tu.begin.pre_state_digest;
+        race.s1_state_witness_matched.store(state_witness,
+                                            std::memory_order_release);
+        if (state_witness) {
+            const TxCommit commit = raw_decode<TxCommit>(co_await raw_read(
+                socket, state.limits.max_frame_payload));
+            const bool commit_witness =
+                commit.transaction_digest == s1_tu.begin.transaction_digest &&
+                commit.raw_digest == s1_tu.begin.raw_digest;
+            race.s1_commit_witness_matched.store(commit_witness,
+                                                 std::memory_order_release);
+            if (!commit_witness && race.s1_detail.empty())
+                race.s1_detail = "S1 received a different TX_COMMIT";
+        } else if (race.s1_detail.empty()) {
+            race.s1_detail =
+                "S1 observed a route cursor that never advanced to its "
+                "own predicted witness";
+        }
+    } catch (const std::exception& error) {
+        if (race.s1_detail.empty())
+            race.s1_detail =
+                std::string("S1 dialogue died: ") + error.what();
+    }
+    race.s1_committed.store(true, std::memory_order_release);
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+// S2 (rel 2): the third session. Its HELLO lands while the route is busy --
+// for the gap shape inside S1's release-to-install window (the claim), for
+// the collision shape while the head is still gated (pending). Its BEGIN is
+// held back (the collision shape keeps S2's first frame unknown through the
+// head's commit so the re-arm path is the one that runs). STATE must carry
+// S2's OWN predicted cursor 2.
+asio::awaitable<void> raw_prepark_triple_s2(
+    tcp::endpoint remote, CStoreGuid c_guid, const ZstdTuEnvelope& s2_tu,
+    HistoryNonce nonce, PreparkTripleRace& race, bool begin_after_s1_commit,
+    bool hello_in_gap) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    SessionHello hello;
+    hello.c_store_guid = c_guid;
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    hello.limits = {};
+    if (hello_in_gap) {
+        // The gap shape: HELLO lands strictly between the head's commit
+        // (S1 released at the cursor, its claim set) and S1's install
+        // (the tail). Both flags are level-triggered waits.
+        asio::steady_timer gap_wait(executor);
+        while (!race.head_committed.load(std::memory_order_acquire)) {
+            gap_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await gap_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+    } else {
+        // The collision shape: HELLO lands while the head's TX is still
+        // pending (the route busy on pending), alongside S1's own pre-park.
+        asio::steady_timer pending_wait(executor);
+        while (!(race.head_pending->load(std::memory_order_acquire) &&
+                 race.s1_begin_written.load(std::memory_order_acquire))) {
+            pending_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await pending_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+    }
+    // Every asio write on a raw peer is wrapped (same rule as S1): a red
+    // run kills this session at F and an EPIPE escaping the co_await
+    // resumption would terminate the process instead of failing the leg.
+    try {
+        co_await raw_write(socket, hello);
+    } catch (const boost::system::system_error& error) {
+        if (race.s2_detail.empty())
+            race.s2_detail = std::string("S2 HELLO write died: ") +
+                             error.what();
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    race.s2_hello_written.store(true, std::memory_order_release);
+    if (begin_after_s1_commit) {
+        // Collision shape: S2's BEGIN is held back until S1 has committed,
+        // so through the head's commit release S2's first frame is unknown
+        // and the RE-ARM path is the one that must run (a release of the
+        // colliding key while the route is still busy).
+        asio::steady_timer commit_wait(executor);
+        while (!race.s1_committed.load(std::memory_order_acquire)) {
+            commit_wait.expires_after(std::chrono::milliseconds(1));
+            boost::system::error_code ignored;
+            co_await commit_wait.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+        }
+    } else {
+        // Gap shape: the BEGIN must NOT be peekable at HELLO time (the
+        // step-5b peek path parks through it -- pre-fix AND post-fix --
+        // and the gap hole is about the PRE-PARK decision). A 100 ms
+        // delay after the HELLO write keeps the peek empty, exactly the
+        // pair legs' missed-peek delay: F processes the HELLO with
+        // nothing behind it, and the pre-park/claim decision is the one
+        // under test.
+        asio::steady_timer begin_delay(executor);
+        begin_delay.expires_after(std::chrono::milliseconds(100));
+        co_await begin_delay.async_wait(asio::use_awaitable);
+    }
+    // The production two-write order: BEGIN, then the BODY frames. S2 parks
+    // (gap shape: on S1's claim; collision shape: re-armed at the new key
+    // after the head's commit) and its BEGIN then drains in the park loop.
+    try {
+        co_await raw_write(socket, s2_tu.begin);
+        Message body_message = BodyMessage{s2_tu.body};
+        co_await raw_write(socket, std::move(body_message));
+    } catch (const boost::system::system_error& error) {
+        if (race.s2_detail.empty())
+            race.s2_detail = std::string("S2 BEGIN/BODY write died: ") +
+                             error.what();
+        race.s2_begin_written.store(true, std::memory_order_release);
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    race.s2_begin_written.store(true, std::memory_order_release);
+    // No probe on S2: the head's gate is long released by the time S2's
+    // BEGIN lands (both shapes), so "no bytes while pending" is not
+    // provable here -- the red/green signal is S2's STATE witness (a
+    // fall-through stage() against a foreign cursor answers with the wrong
+    // cursor, and any terminal ERROR kills the dialogue).
+    try {
+        const SessionState state = raw_decode<SessionState>(
+            co_await raw_read(socket, hello.limits.max_frame_payload));
+        const bool state_witness =
+            state.route_present && state.history_nonce == nonce &&
+            state.next_rel_seq.value == 2 &&
+            state.state_digest == s2_tu.begin.pre_state_digest;
+        race.s2_state_witness_matched.store(state_witness,
+                                            std::memory_order_release);
+        if (state_witness) {
+            const TxCommit commit = raw_decode<TxCommit>(co_await raw_read(
+                socket, state.limits.max_frame_payload));
+            const bool commit_witness =
+                commit.transaction_digest == s2_tu.begin.transaction_digest &&
+                commit.raw_digest == s2_tu.begin.raw_digest;
+            race.s2_commit_witness_matched.store(commit_witness,
+                                                 std::memory_order_release);
+            if (!commit_witness && race.s2_detail.empty())
+                race.s2_detail = "S2 received a different TX_COMMIT";
+        } else if (race.s2_detail.empty()) {
+            race.s2_detail =
+                "S2 observed a route cursor that never advanced to its "
+                "own predicted witness (staged against a foreign cursor: "
+                "the release-to-install gap / K>2 key collision class)";
+        }
+    } catch (const std::exception& error) {
+        if (race.s2_detail.empty())
+            race.s2_detail =
+                std::string("S2 dialogue died: ") + error.what();
+    }
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+// The raw head is exactly the pair leg's (gated materialize, commit read,
+// head_committed flag). Reused verbatim through the same PreparkRace
+// plumbing? The triple race has different field names, so a thin adapter:
+// the head needs head_pending (gate), head_route_ready (unused), and
+// head_committed.
+asio::awaitable<void> raw_prepark_triple_head(
+    tcp::endpoint remote, CStoreGuid c_guid, const ZstdTuEnvelope& head_tu,
+    HistoryNonce nonce, PreparkTripleRace& race) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    const SessionState reset_ack = co_await raw_reset(socket, open, nonce);
+    require(reset_ack.route_present && reset_ack.history_nonce == nonce &&
+                reset_ack.state_digest == initial_route_digest(c_guid, nonce) &&
+                reset_ack.next_rel_seq.value == 0,
+            "triple head did not establish its fresh route");
+    const TxBegin begin =
+        make_begin(head_tu, nonce, reset_ack.state_digest,
+                   reset_ack.next_rel_seq);
+    co_await raw_write(socket, begin);
+    Message body_message = BodyMessage{head_tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    // Deterministic level-triggered wait: the head's commit read happens
+    // only after S1's batch is on the wire. NOT S2's: in the gap shape S2's
+    // BEGIN lands only after head_committed (which this read sets), and in
+    // the collision shape only after s1_committed -- waiting for it here
+    // is a fixture deadlock. S2's HELLO registration is instead guaranteed
+    // by the releaser's own wait (plus its fixed delay) before the gate
+    // frees.
+    asio::steady_timer wait(executor);
+    while (!race.s1_begin_written.load()) {
+        wait.expires_after(std::chrono::milliseconds(1));
+        boost::system::error_code ignored;
+        co_await wait.async_wait(
+            asio::redirect_error(asio::use_awaitable, ignored));
+    }
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, reset_ack.limits.max_frame_payload));
+    require(commit.transaction_digest == begin.transaction_digest &&
+                commit.raw_digest == begin.raw_digest,
+            "triple head received a different TX_COMMIT");
+    // Strictly after release_parked_at() ran inside that commit: the
+    // release-to-install gap / the collision window is now provably open.
+    race.head_committed.store(true, std::memory_order_release);
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+struct PreparkTriplePlan {
+    const char* name = "";
+    std::vector<uint8_t> s1_input;
+    std::vector<uint8_t> s2_input;
+    // Gap shape (660cc787 hole 1): S1 straddles, S2's HELLO lands inside
+    // S1's release-to-install window. Collision shape (hole 2): S2's
+    // HELLO lands while the head is pending and its BEGIN waits for S1's
+    // commit (the re-arm path).
+    bool gap_shape = true;
+    size_t zstd_cap = 1U << 20;
+};
+
+void run_prepark_triple(const PreparkTriplePlan& plan) {
+    const P5coStoreGuids guids = p5co_store_guids(52);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = plan.zstd_cap;
+    caps.zstd.max_encoded_body_bytes = plan.zstd_cap;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    const HistoryNonce nonce{482};
+    const ZstdTuEnvelope head_tu =
+        encode_zstd_tu(nonce, RelSeq{0}, TuSeq{4820},
+                        initial_route_digest(guids.c, nonce),
+                        bytes("triple: head TU\n"));
+    const Digest128 s1_pre_state = compute_post_state_digest(
+        head_tu.begin.pre_state_digest, head_tu.begin.history_nonce,
+        head_tu.begin.rel_seq, head_tu.begin.tu_seq,
+        head_tu.begin.transaction_digest);
+    const ZstdTuEnvelope s1_tu =
+        encode_zstd_tu(nonce, RelSeq{1}, TuSeq{4821}, s1_pre_state,
+                       plan.s1_input);
+    const Digest128 s2_pre_state = compute_post_state_digest(
+        s1_tu.begin.pre_state_digest, s1_tu.begin.history_nonce,
+        s1_tu.begin.rel_seq, s1_tu.begin.tu_seq,
+        s1_tu.begin.transaction_digest);
+    const ZstdTuEnvelope s2_tu =
+        encode_zstd_tu(nonce, RelSeq{2}, TuSeq{4822}, s2_pre_state,
+                       plan.s2_input);
+
+    std::promise<void> release_head;
+    std::future<void> head_gate = release_head.get_future();
+    std::atomic<bool> head_materialize_entered{false};
+    std::atomic<bool> head_route_ready{false};
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&]() {
+        if (!head_materialize_entered.exchange(true))
+            head_gate.wait();
+    };
+    PreparkTripleRace race;
+    race.head_pending = &head_materialize_entered;
+    race.head_route_ready = &head_route_ready;
+    asio::io_context context;
+    tcp::acceptor head_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor s1_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    tcp::acceptor s2_acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(head_acceptor, head_server_control),
+        asio::use_future);
+    std::future<ServerRunResult> s1_server = asio::co_spawn(
+        context, server.accept_one(s1_acceptor), asio::use_future);
+    std::future<ServerRunResult> s2_server = asio::co_spawn(
+        context, server.accept_one(s2_acceptor), asio::use_future);
+    std::future<void> head_client = asio::co_spawn(
+        context,
+        raw_prepark_triple_head(head_acceptor.local_endpoint(), guids.c,
+                                head_tu, nonce, race),
+        asio::use_future);
+    std::future<void> s1_client = asio::co_spawn(
+        context,
+        raw_prepark_triple_s1(s1_acceptor.local_endpoint(), guids.c, s1_tu,
+                              nonce, race, plan.gap_shape),
+        asio::use_future);
+    std::future<void> s2_client = asio::co_spawn(
+        context,
+        raw_prepark_triple_s2(s2_acceptor.local_endpoint(), guids.c, s2_tu,
+                              nonce, race, /*begin_after_s1_commit=*/!plan.gap_shape,
+                              /*hello_in_gap=*/plan.gap_shape),
+        asio::use_future);
+    // Fixed-delay releaser (the pair legs' rule): the gate is freed even
+    // when a red run kills a successor early, so the leg fails instead of
+    // hanging. The delay covers S1's probe window. In the gap shape the
+    // release must additionally come AFTER S2's HELLO landed (the gap is
+    // only open once the head commits; before that the route is busy on
+    // pending, not the claim -- waiting for s2_hello_written here would
+    // deadlock: S2's HELLO in the gap shape needs head_committed, which
+    // needs this release). So: wait for S1's batch, then a fixed delay
+    // (400 ms) that S2's HELLO has certainly landed within by then --
+    // in the gap shape S2 writes HELLO the instant head_committed flips,
+    // and the 400 ms delay is plenty; in the collision shape S2's HELLO
+    // lands while the head is still gated, well before the release.
+    std::future<void> releaser = asio::co_spawn(
+        context,
+        [&]() -> asio::awaitable<void> {
+            asio::steady_timer timer(co_await asio::this_coro::executor);
+            while (!race.s1_begin_written.load()) {
+                timer.expires_after(std::chrono::milliseconds(1));
+                boost::system::error_code ignored;
+                co_await timer.async_wait(
+                    asio::redirect_error(asio::use_awaitable, ignored));
+            }
+            timer.expires_after(std::chrono::milliseconds(400));
+            boost::system::error_code ignored;
+            co_await timer.async_wait(
+                asio::redirect_error(asio::use_awaitable, ignored));
+            release_head.set_value();
+            co_return;
+        },
+        asio::use_future);
+    context.run_for(std::chrono::seconds(30));
+    const bool all_done =
+        head_server.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready &&
+        s1_server.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready &&
+        s2_server.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready &&
+        head_client.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready &&
+        s1_client.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready &&
+        s2_client.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready;
+    require(all_done, std::string(plan.name) +
+                          ": hung (coroutine died mid-dialogue -- fixture "
+                          "bug, not a pre-park regression)");
+    head_client.get();
+    s1_client.get();
+    s2_client.get();
+    const ServerRunResult head_run = head_server.get();
+    const ServerRunResult s1_run = s1_server.get();
+    const ServerRunResult s2_run = s2_server.get();
+    if (s1_run.terminal_error.has_value())
+        std::fprintf(stderr,
+                     "p50_endpoint_test: %s: S1 session ended TerminalError "
+                     "code=%u detail=%s\n",
+                     plan.name,
+                     static_cast<unsigned>(s1_run.terminal_error->code),
+                     s1_run.terminal_error->detail.c_str());
+    if (s2_run.terminal_error.has_value())
+        std::fprintf(stderr,
+                     "p50_endpoint_test: %s: S2 session ended TerminalError "
+                     "code=%u detail=%s\n",
+                     plan.name,
+                     static_cast<unsigned>(s2_run.terminal_error->code),
+                     s2_run.terminal_error->detail.c_str());
+    // S1's recorded outcomes (identical rule to the pair legs).
+    require(!race.s1_probe_saw_bytes.load(std::memory_order_acquire) &&
+                race.s1_state_witness_matched.load(
+                    std::memory_order_acquire) &&
+                race.s1_commit_witness_matched.load(
+                    std::memory_order_acquire),
+            std::string(plan.name) + ": S1: " +
+                (race.s1_detail.empty()
+                     ? std::string("outcome was not recorded (fixture bug)")
+                     : race.s1_detail));
+    // S2's recorded outcomes: the red class of BOTH holes lands here -- a
+    // stage() against the claimant's cursor serves a STATE whose witness
+    // is not S2's own (or kills the dialogue outright).
+    require(race.s2_state_witness_matched.load(std::memory_order_acquire) &&
+                race.s2_commit_witness_matched.load(
+                    std::memory_order_acquire),
+            std::string(plan.name) + ": S2: " +
+                (race.s2_detail.empty()
+                     ? std::string("outcome was not recorded (fixture bug)")
+                     : race.s2_detail));
+    require(head_run.status == ServerRunStatus::Completed &&
+                s1_run.status == ServerRunStatus::Completed &&
+                s2_run.status == ServerRunStatus::Completed,
+            "triple did not complete all three sessions");
+    require(head_run.f_rel_seq.value == 0 &&
+                s1_run.f_rel_seq.value == 1 &&
+                s2_run.f_rel_seq.value == 2,
+            "triple did not run at its declared rel_seq");
+    // All three commit in route order, and the route holds exactly the
+    // last successor's bytes.
+    std::vector<uint64_t> f_commit_order;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor != ActorSide::F || record.c_store_guid != guids.c)
+            continue;
+        if (record.action == ActionType::INPUT_COMMITTED)
+            f_commit_order.push_back(record.rel_seq.value);
+    }
+    require(f_commit_order == std::vector<uint64_t>{0, 1, 2},
+            "triple committed its TUs out of route order");
+    (void)releaser;
+}
+
+// 660cc787 hole 1 -- the release-to-install gap. S1 (rel 1) is released at
+// the cursor when the head commits, but its install is held by its
+// straddling BODY frame (the tail lands only after S2's HELLO). S2's HELLO
+// lands in exactly that window: the route has NO pending TX, only S1's
+// claim. Pre-fix S2 saw a free route and staged against the cursor S1 was
+// about to consume ("TX_BEGIN differs from the F route cursor" on the
+// K2-2 farm leg); post-fix it pre-parks on the claim, and all three commit
+// in order with S2's STATE carrying its OWN cursor-2 witness.
+void test_route_pipeline_prepark_third_hello_in_release_to_install_gap() {
+    PreparkTriplePlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_third_hello_in_release_to_install_"
+        "gap";
+    plan.gap_shape = true;
+    plan.s1_input = bytes("triple gap: S1 TU\n");
+    plan.s2_input = bytes("triple gap: S2 TU\n");
+    run_prepark_triple(plan);
+}
+
+// 660cc787 hole 2 -- the K>2 key collision. S1 (rel 1) and S2 (rel 2) both
+// HELLO while the head is gated; both pre-park at next_rel + 1 = 1 (S2's own
+// rel_seq is unknown to it then) -- the SAME key. S2's BEGIN is held until
+// S1 has committed, so through the head's commit S2's first frame is
+// unknown: the release of key 1 must RE-ARM S2 one past the new cursor (the
+// route is still busy -- first S1's claim, then S1's pending), not fall
+// through. Pre-fix the collision release dropped S2 out of its pre-park
+// and it staged against S1's in-flight cursor.
+void test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release() {
+    PreparkTriplePlan plan;
+    plan.name =
+        "test_route_pipeline_prepark_k3_collision_re_arms_on_busy_"
+        "release";
+    plan.gap_shape = false;
+    plan.s1_input = bytes("triple k3: S1 TU\n");
+    plan.s2_input = bytes("triple k3: S2 TU\n");
+    run_prepark_triple(plan);
+}
+
 // Large-TU regression (farm bug fixed in 54158e17): the pre-park drain
 // ceiling used to be checked BEFORE the first-frame decision. A single
 // drain carrying the successor's TX_BEGIN plus several MB of its BODY (one
@@ -9571,6 +10181,8 @@ int main(int argc, char** argv) {
         test_route_pipeline_prepark_large_tu_single_drain_decides_from_first_frame();
         test_route_pipeline_prepark_straddling_body_frame_finishes_before_dispatch();
         test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
+        test_route_pipeline_prepark_third_hello_in_release_to_install_gap();
+        test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
         test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
@@ -9644,6 +10256,8 @@ int main(int argc, char** argv) {
     test_route_pipeline_prepark_large_tu_single_drain_decides_from_first_frame();
     test_route_pipeline_prepark_straddling_body_frame_finishes_before_dispatch();
     test_route_pipeline_park_straddling_body_frame_finishes_before_dispatch();
+    test_route_pipeline_prepark_third_hello_in_release_to_install_gap();
+    test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
     test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
