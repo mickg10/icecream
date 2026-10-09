@@ -174,7 +174,13 @@ struct P29ReceiverRouteState {
   std::vector<P29MixedFLineView> public_lines{{}};
   std::vector<P29FBlockView> blocks;
   std::vector<std::uint32_t> block_children;
-  std::vector<std::uint32_t> occurrences;
+  // The mirror occurrence stream: one entry per committed Region occurrence,
+  // appended at every commit for the whole route life.  Same size class as
+  // the matcher's occurrences_ on the C side (10^8 uint32 late in a leg), so
+  // it uses the same mremap-growing buffer: a std::vector here doubled and
+  // memcpy'd the whole history per capacity crossing, stalling the F owner
+  // ~300 ms (2.6-5.4 s under THP-leg memory pressure).
+  p29::GrowBuffer<std::uint32_t> occurrences;
   std::size_t known_region_count = 0;
   std::size_t known_block_count = 0;
   std::uint64_t revision = 0;
@@ -2047,9 +2053,11 @@ public:
     p29_wire_detail::reserve_geometric(state.block_children,
                                        state.block_children.size() +
                                            added_block_children);
-    p29_wire_detail::reserve_geometric(state.occurrences,
-                                       state.occurrences.size() +
-                                           pending_.occurrences.size());
+    // GrowBuffer::reserve grows geometrically itself (never a byte copy);
+    // the pre-commit reserve keeps the provider-publication section below
+    // allocation-free exactly as the vector version did.
+    state.occurrences.reserve(state.occurrences.size() +
+                              pending_.occurrences.size());
     std::size_t region_slots = state.regions.size();
     for (const StagedRegion &region : pending_.regions)
       region_slots = std::max(region_slots, std::size_t(region.id) + 1);
@@ -2106,8 +2114,7 @@ public:
       state.blocks[block.id] = {
           offset, static_cast<std::uint32_t>(block.children.size()), true};
     }
-    state.occurrences.insert(state.occurrences.end(),
-                             pending_.occurrences.begin(),
+    state.occurrences.append(pending_.occurrences.begin(),
                              pending_.occurrences.end());
     state.known_region_count += pending_.regions.size();
     state.known_block_count += pending_.blocks.size();
@@ -2327,13 +2334,17 @@ private:
         if (kind == 1) {
           const std::uint64_t source = blocks.varint();
           const std::uint64_t length = blocks.varint();
-          const auto &occurrences = provider_.receiver_route().occurrences;
+          const p29::GrowBuffer<std::uint32_t> &occurrences =
+              provider_.receiver_route().occurrences;
           if (source > occurrences.size() ||
               length > occurrences.size() - source ||
               length > limits.max_block_children)
             fail("P29 BLOCKDEF copy is out of range");
-          block.children.assign(occurrences.begin() + source,
-                                occurrences.begin() + source + length);
+          // source is verified in range above, so view().data() + source is
+          // inside the committed prefix; the copy reads only committed bytes.
+          block.children.assign(occurrences.data() + source,
+                                occurrences.data() + source +
+                                    static_cast<std::size_t>(length));
         } else if (kind == 0) {
           const std::uint64_t length = blocks.varint();
           if (length > limits.max_block_children)

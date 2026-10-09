@@ -71,6 +71,7 @@ TESTS += p50_adopted_outcome_writer-run.sh \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
+TESTS += p29_grow_buffer p29_grow_identity
 TESTS += daemonqueue
 TESTS += pollreadiness
 TESTS += p50adapterautheofregression
@@ -264,6 +265,7 @@ check_PROGRAMS += p50daemoncontrol
 check_PROGRAMS += p50cachefdseam
 check_PROGRAMS += assignment_identity_test
 check_PROGRAMS += codec_parity codec_provider codec_intern codec_wire
+check_PROGRAMS += p29_grow_buffer p29_grow_identity
 check_PROGRAMS += daemonqueue
 daemonqueue_SOURCES = daemonqueue.cpp
 check_PROGRAMS += pollreadiness
@@ -282,6 +284,12 @@ codec_intern_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS)
 codec_wire_SOURCES = codec_wire_test.cpp
 codec_wire_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS)
+p29_grow_buffer_SOURCES = p29_grow_buffer_test.cpp
+p29_grow_buffer_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
+	$(LIBZSTD_LIBS)
+p29_grow_identity_SOURCES = p29_grow_identity_test.cpp
+p29_grow_identity_LDADD = ../cache/libprotocol50.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS)
 p50wire_SOURCES = p50_wire_test.cpp
 p50sourceingress_SOURCES = p50_source_ingress_test.cpp

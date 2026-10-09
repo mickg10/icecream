@@ -1,10 +1,13 @@
 #pragma once
 
+#include "p29_grow_buffer.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -322,8 +325,12 @@ private:
         }
 
         const uint32_t begin = static_cast<uint32_t>(occurrences_.size());
-        occurrences_.insert(occurrences_.end(), current_regions.begin(), current_regions.end());
+        occurrences_.append(current_regions.begin(), current_regions.end());
         const uint32_t end = static_cast<uint32_t>(occurrences_.size());
+        // mremap growth (never a byte copy), then a fill of only the newly
+        // exposed tail: the doubling-memcpy that caused the ~300 ms
+        // owner-thread stalls is gone; the append above still faults its own
+        // pages lazily.
         predecessors_.resize(occurrences_.size(), kNone);
 
         // Positions at the tail of the preceding committed prefix did not have a complete
@@ -407,7 +414,11 @@ private:
     }
 
 public:
-    const std::vector<uint32_t>& occurrences() const { return occurrences_; }
+    // Const access to the committed occurrence stream (the equivalence
+    // tests and the serializer's own bookkeeping read this).  GrowBuffer is
+    // a drop-in for the vector subset the call sites use; the span keeps the
+    // old call shape for anything expecting a contiguous range.
+    std::span<const uint32_t> occurrences() const { return occurrences_.view(); }
     const std::vector<Block>& blocks() const { return catalogue_->blocks(); }
     const BlockCatalogue& catalogue() const { return *catalogue_; }
 
@@ -484,8 +495,8 @@ private:
         // the argument above the stale tail is unreachable either way.  (I previously wrote
         // that build()'s grow-with-kNone resize depends on it; that was wrong -- build()
         // resizes to occurrences_.size() regardless.)
-        occurrences_.resize(journal_.occurrences);
-        predecessors_.resize(journal_.predecessor_count);
+        occurrences_.truncate(journal_.occurrences);
+        predecessors_.truncate(journal_.predecessor_count);
         journal_.clear();
     }
 
@@ -495,9 +506,16 @@ private:
     std::unique_ptr<BlockCatalogue> owned_;   // only for the standalone form; declared first
     BlockCatalogue* catalogue_ = nullptr;      // so it outlives catalogue_ and the matcher
     Config config_;
-    std::vector<uint32_t> occurrences_;
+    // Per-route occurrence streams.  occurrences_/predecessors_ hold the
+    // ENTIRE route's region-occurrence history (tens of millions of uint32
+    // late in a leg); with std::vector each capacity doubling memcpy'd the
+    // whole history, which is what stalled the single-threaded owner ~300 ms
+    // per growth.  GrowBuffer grows by mremap: no byte copy, lazy tail
+    // faults.  heads_ is the fixed 2^hash_bits anchor table, assigned once at
+    // start(); it never grows, so it stays a plain vector.
+    GrowBuffer<uint32_t> occurrences_;
     std::vector<uint32_t> heads_;
-    std::vector<uint32_t> predecessors_;
+    GrowBuffer<uint32_t> predecessors_;
 };
 
 }  // namespace p29

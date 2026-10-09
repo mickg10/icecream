@@ -107,6 +107,7 @@ EXTRA_DIST = \
 	codec/P29V1_FORMAT.md \
 	codec/ZSTD_FORMATS.md \
 	codec/README.md \
+	codec/p29_grow_buffer.h \
 	codec/p29_intern.h \
 	codec/p29_online_s1.h \
 	codec/p29_wire.h \
