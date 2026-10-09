@@ -2186,6 +2186,16 @@ struct P50ClientEndpoint::Impl {
         return (active ? 1u : 0u) + (awaiting_head ? 1u : 0u) +
                successors.size();
     }
+    // C1 (2026-10-09 admission-race fix): anything outstanding on this route
+    // -- a live head dialogue, any admitted-but-not-yet-promoted successor,
+    // or a head session still winding down (active_session is cleared only
+    // at the very end of the head's run coroutine, AFTER accept() already
+    // reset `active`, so the commit-to-promotion window is observable as
+    // active_session != 0 with nothing else set). The entry dispatch takes
+    // the pipelined branch on this, not on active_session alone.
+    [[nodiscard]] bool outstanding() const {
+        return active.has_value() || !successors.empty() || active_session != 0;
+    }
     // Deviation (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata):
     // stop opening successors, tear down every outstanding successor socket
     // (F bulk-releases its parked BEGINs through its own mismatch path),
@@ -3830,15 +3840,28 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         }
     }
     // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
-    // 2026-10-08 errata) -- entry dispatch. The single-dialogue guard below
-    // stays exactly today's behavior at depth 1; above depth 1 an active
-    // head admits a successor dialogue instead. `prepared` has already been
-    // admitted by the authority (the sender waits for a window slot BEFORE
-    // prepare_for_route), so reaching here with a live head means this TX
-    // is the route's next successor in rel_seq order.
-    if (impl_->active_session != 0) {
-        if (impl_->route_pipeline_depth() <= 1)
-            throw std::logic_error("C endpoint already has one active dialogue");
+    // 2026-10-08 errata; 2026-10-09 admission-race fixes) -- entry dispatch.
+    // The single-dialogue guards below stay exactly today's behavior at
+    // depth 1; above depth 1 the pipelined branch admits a successor
+    // dialogue instead. `prepared` has already been admitted by the
+    // authority (the sender waits for a window slot BEFORE
+    // prepare_for_route), so reaching here with anything outstanding means
+    // this TX is the route's next successor in rel_seq order.
+    //
+    // C1 (2026-10-09): the dispatch takes the pipelined branch on
+    // route_pipeline_depth() > 1 && outstanding() -- NOT on
+    // active_session != 0 alone. The commit-to-promotion gap is real: when
+    // the head commits, Impl::accept resets `active` and wakes every
+    // waiter, but the successor is promoted into `active` only when its
+    // own coroutine resumes. A third TX dispatched in that gap used to see
+    // active_session == 0 (head path -- then the later promotion threw
+    // "promoted over a live head"), or active_session != 0 with no
+    // `active` and a queued successor (the old full-window throw). Both
+    // poison the route through the sender's catch(std::logic_error).
+    // Taking `active || !successors.empty() || active_session != 0`
+    // closes it: a not-yet-promoted successor is as outstanding as a live
+    // head. Depth 1 keeps today's exact checks and throws.
+    if (impl_->route_pipeline_depth() > 1 && impl_->outstanding()) {
         // A poisoned route line never opens new successors: the cold reset
         // (transfer_bytes's abandon_route + reset_after_pipeline_poison)
         // must land before this endpoint admits more route work.
@@ -3850,31 +3873,31 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         if (!successor_input)
             throw std::invalid_argument(
                 "C endpoint successor run has no prepared transaction");
-        // T7 fallback (section 1.1 errata item 4): a would-be successor that
-        // cannot confirm its NEED through an eager FILL must not open a
-        // successor dialogue. Keep the route lock, wait level-triggered for
-        // the window to empty, then run the UNCHANGED head path (fresh-head
-        // dance, Site B).
+        // C2 (2026-10-09): the T7 fallback must not recurse through the
+        // pipelined branch (the old tail-call fell back into this same
+        // entry with active_session still set, which could spin without
+        // suspending, and at depth > 2 the window_size() < depth wait
+        // predicate admitted it into the successor path). Instead: keep
+        // the route lock, wait level-triggered on the NEW predicate
+        // "window empty" (!active && successors.empty() && active_session
+        // == 0) with the same deadline, poison/epoch handling, and
+        // window_slot_waiters wake list as wait_for_window_slot, then run
+        // the UNCHANGED head path directly below -- once, from here.
         const bool eager_fill =
             impl_->caps.profile != ProfileId::P29V1 ||
             impl_->preparation->p29v1_fill_before_need_possible(prepared);
-        if (!eager_fill)
+        if (!eager_fill) {
             impl_->awaiting_head = true;
-        const bool slot = co_await wait_for_window_slot(deadline);
-        if (!eager_fill)
+            const bool slot = co_await wait_for_empty_window(deadline);
             impl_->awaiting_head = false;
-        if (!slot) {
-            ClientRunResult result;
-            result.status = ClientRunStatus::DeadlineExceeded;
-            result.observation = ClientRunObservation::DeadlineExpired;
-            co_return result;
-        }
-        if (!impl_->active && impl_->successors.empty()) {
-            // The window emptied while waiting: this TX is the head now
-            // (T7 fallback, section 1.1 errata item 4). Its begun
-            // pre_state_digest equals the confirmed route state once the
-            // old head retired as predicted; anything else is a
-            // deviation of the predicted chain, not a reconcile case.
+            if (!slot) {
+                ClientRunResult result;
+                result.status = ClientRunStatus::DeadlineExceeded;
+                result.observation = ClientRunObservation::DeadlineExpired;
+                co_return result;
+            }
+            // Same pre_state_digest-vs-state poison gate the old tail
+            // recursion ran, now in front of the direct head path.
             if (impl_->route_known &&
                 successor_input->begin.pre_state_digest != impl_->state) {
                 impl_->poison_pipeline();
@@ -3884,17 +3907,45 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
                 co_return result;
             }
-            co_return co_await run_connected(
+            // The window emptied while waiting: this TX is the head now
+            // (T7 fallback, section 1.1 errata item 4). Its begun
+            // pre_state_digest equals the confirmed route state once the
+            // old head retired as predicted; anything else is a
+            // deviation of the predicted chain, not a reconcile case.
+            // Fall through to the head path below -- no recursion.
+        } else {
+            // C2 admission: admit as a successor whenever the window has a
+            // free slot. Do NOT require `active`: a not-yet-promoted
+            // successor is a valid predecessor. The full-window case is
+            // unreachable (the sender waited in wait_for_window_slot
+            // before prepare_for_route), so keep the guard as a
+            // logic_error invariant.
+            if ((impl_->active ? 1u : 0u) + impl_->successors.size() >=
+                impl_->route_pipeline_depth())
+                throw std::logic_error(
+                    "C endpoint already has one active dialogue");
+            // Guard: this TX's predecessor must be the newest outstanding
+            // rel_seq -- the successor deque's back, or the active head's
+            // own begin, whichever is newer. With neither outstanding the
+            // predecessor has already retired (next_rel == own rel) and
+            // run_connected_successor's retire-wait loop falls straight
+            // through; anything else is a dispatch-order deviation.
+            {
+                const RelSeq own_rel = successor_input->begin.rel_seq;
+                std::optional<RelSeq> newest;
+                if (!impl_->successors.empty())
+                    newest = impl_->successors.back().rel_seq;
+                else if (impl_->active)
+                    newest = impl_->active->begin.rel_seq;
+                if (newest && newest->value + 1 != own_rel.value)
+                    throw std::logic_error(
+                        "C endpoint successor dispatch order deviated from "
+                        "rel_seq order");
+            }
+            co_return co_await run_connected_successor(
                 remote, std::move(adopted), std::move(prepared),
-                std::move(control), deadline);
+                std::move(successor_input), std::move(control), deadline);
         }
-        if (!impl_->active ||
-            impl_->successors.size() >= impl_->route_pipeline_depth() - 1)
-            throw std::logic_error(
-                "C endpoint already has one active dialogue");
-        co_return co_await run_connected_successor(
-            remote, std::move(adopted), std::move(prepared),
-            std::move(successor_input), std::move(control), deadline);
     }
     if (impl_->active_session != 0)
         throw std::logic_error("C endpoint already has one active dialogue");
@@ -4197,6 +4248,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             close_now(socket);
             cancel_quietly(io->timer);
             impl_->active_session = 0;
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
             co_return result;
         }
         if (pipelined && (!exact || negotiated_f_fingerprint != *impl_->route_f_fingerprint ||
@@ -4225,6 +4278,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                       : EndpointReconnectOutcome::WrongAdoptedPeer;
             close_now(socket);
             impl_->active_session = 0;
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
             co_return result;
         }
         if (!pipelined && same_f && impl_->active && peer.last_commit && peer.namespace_present &&
@@ -4243,6 +4298,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             close_now(socket);
             cancel_quietly(io->timer);
             impl_->active_session = 0;
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
             co_return result;
         }
         if (same_f && impl_->active && !exact) {
@@ -4275,8 +4332,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                       : EndpointReconnectOutcome::ColdFStore;
             close_now(socket);
             cancel_quietly(io->timer);
-            if (impl_->active_session == serial)
+            if (impl_->active_session == serial) {
                 impl_->active_session = 0;
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
+            }
             co_return result;
         } else {
             result.reconnect = same_f ? EndpointReconnectOutcome::RouteHistoryReset
@@ -4498,8 +4558,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                  : ClientRunObservation::Disconnected;
     } catch (const std::bad_alloc&) {
         close_now(socket);
-        if (impl_->active_session == serial)
+        if (impl_->active_session == serial) {
             impl_->active_session = 0;
+        if (impl_->route_pipeline_depth() > 1)
+            impl_->wake_window_slot_waiters();
+        }
         cancel_quietly(io->timer);
         throw;
     } catch (const std::exception& error) {
@@ -4507,8 +4570,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         set_client_terminal_result(result, bounded_error(3, error.what(), terminal_cap));
     } catch (...) {
         close_now(socket);
-        if (impl_->active_session == serial)
+        if (impl_->active_session == serial) {
             impl_->active_session = 0;
+        if (impl_->route_pipeline_depth() > 1)
+            impl_->wake_window_slot_waiters();
+        }
         cancel_quietly(io->timer);
         throw;
     }
@@ -4549,8 +4615,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                 std::chrono::steady_clock::now() - *trace_commit_read_done)
                 .count());
     cancel_quietly(io->timer);
-    if (impl_->active_session == serial)
+    if (impl_->active_session == serial) {
         impl_->active_session = 0;
+        if (impl_->route_pipeline_depth() > 1)
+            impl_->wake_window_slot_waiters();
+    }
     co_return result;
 }
 
@@ -5038,6 +5107,8 @@ boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_window_slot(
     if (impl_->route_pipeline_depth() <= 1)
         co_return true;
     const auto executor = co_await asio::this_coro::executor;
+    // (C2 shares the body below through wait_for_empty_window; this legacy
+    // predicate is kept verbatim for the sender's pre-prepare wait.)
     // Level-triggered: re-check the predicate before arming and after every
     // wake (spurious included). A cancel from accept() /
     // reset_after_pipeline_poison() only ever means "re-check now". The
@@ -5073,6 +5144,51 @@ boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_window_slot(
         // Poisoned or a crossed epoch in the window means the route line
         // this transfer prepared against is gone: fail as a slot wait
         // timeout would, through the ordinary route-local path.
+        if (impl_->poisoned)
+            co_return false;
+    }
+}
+
+boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_empty_window(
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    impl_->owner.require();
+    // C2 (2026-10-09 admission-race fix): level-triggered wait for the NEW
+    // predicate "window empty" -- !active && successors.empty() &&
+    // active_session == 0. Used only by the T7 (no eager FILL) fallback,
+    // which must not open a successor dialogue and must instead run the
+    // unchanged head path -- but only once NOTHING is outstanding: a
+    // not-yet-promoted successor counts exactly like a live head (see
+    // Impl::outstanding), and active_session != 0 means the previous head
+    // session is still winding down. Same deadline / poison / wake-list
+    // mechanics as wait_for_window_slot: woken by accept(), by
+    // reset_after_pipeline_poison(), and by the C3 wake added to every
+    // head-path active_session reset. Unreachable at depth 1 (the entry
+    // dispatch never routes here), so it never changes K=1 bytes.
+    const auto executor = co_await asio::this_coro::executor;
+    for (;;) {
+        if (!impl_->active && impl_->successors.empty() &&
+            impl_->active_session == 0)
+            co_return true;
+        if (deadline && *deadline <= std::chrono::steady_clock::now())
+            co_return false;
+        const auto arm =
+            deadline
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                      *deadline - std::chrono::steady_clock::now())
+                : std::chrono::milliseconds(10);
+        auto timer = std::make_shared<asio::steady_timer>(executor, arm);
+        if (deadline)
+            impl_->window_slot_waiters.push_back(timer);
+        boost::system::error_code error;
+        co_await timer->async_wait(
+            asio::redirect_error(asio::use_awaitable, error));
+        const auto position = std::find(
+            impl_->window_slot_waiters.begin(),
+            impl_->window_slot_waiters.end(), timer);
+        if (position != impl_->window_slot_waiters.end())
+            impl_->window_slot_waiters.erase(position);
+        if (error && error != asio::error::operation_aborted)
+            co_return false;
         if (impl_->poisoned)
             co_return false;
     }

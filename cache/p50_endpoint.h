@@ -718,6 +718,15 @@ public:
     boost::asio::awaitable<bool> wait_for_window_slot(
         std::optional<std::chrono::steady_clock::time_point> deadline);
 
+    // C2 (2026-10-09 admission-race fix): level-triggered wait for the
+    // window to be completely EMPTY (!active && successors.empty() &&
+    // active_session == 0) -- the T7 (no eager FILL) fallback waits on
+    // this before taking the unchanged head path directly. Same deadline,
+    // poison, and window_slot_waiters wake mechanics as
+    // wait_for_window_slot; unreachable at depth 1.
+    boost::asio::awaitable<bool> wait_for_empty_window(
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
 private:
     boost::asio::awaitable<ClientRunResult> run_connected(
         std::optional<boost::asio::ip::tcp::endpoint> remote,
