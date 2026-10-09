@@ -6543,7 +6543,16 @@ void test_p29v1_k2_pipeline_straight_line() {
     require(run.head.status == ClientRunStatus::Committed,
             "K2 straight line: head TX did not commit");
     require(run.successor.status == ClientRunStatus::Committed,
-            "K2 straight line: successor TX did not commit");
+            std::string("K2 straight line: successor TX did not commit "
+                        "(status=") +
+                std::to_string(static_cast<uint8_t>(run.successor.status)) +
+                " observation=" +
+                std::to_string(
+                    static_cast<uint8_t>(run.successor.observation)) +
+                " reconnect=" +
+                std::to_string(
+                    static_cast<uint8_t>(run.successor.reconnect)) +
+                ")");
     require(run.successor_begin.rel_seq.value ==
                 run.head_begin.rel_seq.value + 1,
             "K2 straight line: successor rel_seq was not head+1");
