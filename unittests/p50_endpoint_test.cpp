@@ -6304,6 +6304,11 @@ asio::awaitable<void> raw_parked_f_serve_connection(
         Frame next = co_await raw_read(socket, cap);
         if (next.type == MessageType::HISTORY_RESET) {
             const HistoryReset reset = raw_decode<HistoryReset>(next);
+            // The real server drops the retained route before installing
+            // the reset one (FStore::start_route refuses an existing
+            // route; forget_route is the same legality gate the server
+            // applies: only outside ACTIVE_TX).
+            state->store.forget_route(state->session);
             state->store.start_route(state->session, reset.history_nonce,
                                       reset.initial_state_digest);
         } else {
