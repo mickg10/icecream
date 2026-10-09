@@ -593,6 +593,41 @@ single_region_body(std::uint32_t id = 0) {
   return make_body(root);
 }
 
+// Same as make_fill(), but the two zstd streams stay OPEN across calls so a
+// single P29Deserializer can consume several of these fills in sequence --
+// exactly the production FILL-per-TU shape (only the route's last fill closes
+// entropy). make_fill() itself ends each frame on every call, which is only
+// consumable with close_entropy=true and therefore only usable for a
+// deserializer's final TU.
+class ContinuingFillBuilder {
+public:
+  [[nodiscard]] std::vector<std::uint8_t>
+  make(std::span<const std::uint8_t> control_raw,
+       std::span<const std::uint8_t> literal_raw, bool close) {
+    const std::vector<std::uint8_t> control_encoded =
+        control_.encode(control_raw, close);
+    const std::vector<std::uint8_t> literal_encoded =
+        literal_.encode(literal_raw, close);
+    std::vector<std::uint8_t> result;
+    std::uint8_t mask = 0;
+    if (!control_encoded.empty()) {
+      wire::append_frame(result, P29WireKind::FillControl, control_encoded);
+      mask |= 1;
+    }
+    if (!literal_encoded.empty()) {
+      wire::append_frame(result, P29WireKind::FillLiteral, literal_encoded);
+      mask |= 2;
+    }
+    wire::append_frame(result, P29WireKind::TuEnd,
+                       std::span<const std::uint8_t>(&mask, 1));
+    return result;
+  }
+
+private:
+  wire::ContinuingEncoder control_;
+  wire::ContinuingEncoder literal_;
+};
+
 [[nodiscard]] std::vector<std::uint8_t>
 make_fill(std::span<const std::uint8_t> control_raw,
           std::span<const std::uint8_t> literal_raw,
@@ -1361,71 +1396,95 @@ void run_materialize_thp_switch_controls() {
 // deleter does (cache/p50_input_record.cpp's prepare_validated_publish()) --
 // and reuse must not perturb a single materialized byte relative to an
 // unpooled baseline over the same input.
+//
+// Protocol shape: one deserializer consumes a two-TU route where only the
+// SECOND fill closes entropy -- the production FILL-per-TU shape (see
+// run_dialogue(): close only on the last TU). Ending the zstd stream on the
+// first fill would leave the deserializer's entropy decoders closed, and the
+// route's own control test ("receiver accepted BODY after route entropy
+// close") pins that a subsequent receive_body() must then fail; the original
+// version of this test did exactly that and failed codec_wire.
 void run_input_buffer_pool_reuse_and_parity() {
   constexpr std::size_t kFillBytes = 256u * 1024;
   const std::vector<std::uint8_t> payload(kFillBytes, std::uint8_t{'p'});
   const std::vector<std::uint8_t> control =
       literal_control(1, kFillBytes, kFillBytes);
-  const std::vector<std::uint8_t> fill = make_fill(control, payload);
-  const std::vector<std::uint8_t> body = single_region_body();
+  const std::vector<std::uint8_t> body0 = single_region_body(/*id=*/0);
+  const std::vector<std::uint8_t> body1 = single_region_body(/*id=*/1);
 
-  // Unpooled baseline: identical input, pooling disabled via cap_bytes=0
-  // (InputBufferPool::enabled() is false, get()/put() are no-ops -- today's
-  // behavior exactly).
-  std::vector<std::uint8_t> baseline_bytes;
-  {
-    PooledResearchProvider provider(/*cap_bytes=*/0);
+  struct RunResult {
+    std::vector<std::uint8_t> first_bytes;
+    std::vector<std::uint8_t> second_bytes;
+    const std::uint8_t *first_data = nullptr;
+    const std::uint8_t *second_data = nullptr;
+    icecc::p50::InputBufferPool::Stats stats{};
+  };
+
+  // Identical two-TU dialogue for both runs; only the pool cap differs
+  // (cap_bytes=0 disables pooling entirely -- get()/put() no-ops, exactly
+  // today's pre-pool behavior).
+  const auto run_sequence = [&](std::uint64_t cap_bytes) {
+    PooledResearchProvider provider(cap_bytes);
     P29Deserializer<PooledResearchProvider> deserializer(provider);
-    (void)deserializer.receive_body(body);
-    const std::span<const std::uint8_t> materialized =
-        deserializer.receive_fill(fill, true, kFillBytes);
-    baseline_bytes.assign(materialized.begin(), materialized.end());
+    ContinuingFillBuilder fills;
+    RunResult result;
+
+    // TU 1: stage Region 0, keep the entropy streams open.
+    (void)deserializer.receive_body(body0);
+    const std::span<const std::uint8_t> first_materialized =
+        deserializer.receive_fill(fills.make(control, payload, /*close=*/false),
+                                  /*close_entropy=*/false, kFillBytes);
+    require(first_materialized.size() == kFillBytes,
+            "pool reuse test: first materialized size differs from the FILL");
+    result.first_bytes.assign(first_materialized.begin(),
+                              first_materialized.end());
+    result.first_data = first_materialized.data();
+    wire::MaterializedBuffer taken = deserializer.take_materialized();
     deserializer.commit();
-  }
+    require(taken.data() == result.first_data,
+            "pool reuse test: take_materialized() returned different storage "
+            "than receive_fill() handed back");
+    // Models the production custom deleter in prepare_validated_publish():
+    // once the last InputRecord/InputCursor reference to the backing drops,
+    // the deleter does nothing but move the vector into pool.put().
+    provider.pool()->put(std::move(taken));
 
-  PooledResearchProvider provider(/*cap_bytes=*/16u * 1024 * 1024);
-  P29Deserializer<PooledResearchProvider> deserializer(provider);
+    // TU 2: stage Region 1 (Region 0 is committed-known now) and close the
+    // route's entropy streams on this final fill.
+    (void)deserializer.receive_body(body1);
+    const std::span<const std::uint8_t> second_materialized =
+        deserializer.receive_fill(fills.make(control, payload, /*close=*/true),
+                                  /*close_entropy=*/true, kFillBytes);
+    require(second_materialized.size() == kFillBytes,
+            "pool reuse test: second materialized size differs from the FILL");
+    result.second_bytes.assign(second_materialized.begin(),
+                               second_materialized.end());
+    result.second_data = second_materialized.data();
+    deserializer.commit();
+    result.stats = provider.pool()->stats();
+    return result;
+  };
 
-  (void)deserializer.receive_body(body);
-  const std::span<const std::uint8_t> first_materialized =
-      deserializer.receive_fill(fill, true, kFillBytes);
-  require(first_materialized.size() == kFillBytes,
-          "pool reuse test: first materialized size differs from the FILL");
-  require(std::equal(first_materialized.begin(), first_materialized.end(),
-                      baseline_bytes.begin(), baseline_bytes.end()),
+  const RunResult baseline = run_sequence(/*cap_bytes=*/0);
+  const RunResult pooled = run_sequence(/*cap_bytes=*/16u * 1024 * 1024);
+
+  require(baseline.first_data != nullptr &&
+              baseline.second_data != nullptr,
+          "pool reuse test: unpooled baseline materialized nothing");
+  require(pooled.first_bytes == baseline.first_bytes &&
+              pooled.second_bytes == baseline.second_bytes,
           "pool reuse test: pooled-run materialized bytes differ from the "
           "unpooled baseline");
-  const std::uint8_t *const first_data = first_materialized.data();
-
-  wire::MaterializedBuffer taken = deserializer.take_materialized();
-  deserializer.commit();
-  require(taken.data() == first_data,
-          "pool reuse test: take_materialized() returned different storage "
-          "than receive_fill() handed back");
-  // Models the production custom deleter in prepare_validated_publish():
-  // once the last InputRecord/InputCursor reference to the backing drops,
-  // the deleter does nothing but move the vector into pool.put().
-  provider.pool()->put(std::move(taken));
-
-  (void)deserializer.receive_body(body);
-  const std::span<const std::uint8_t> second_materialized =
-      deserializer.receive_fill(fill, true, kFillBytes);
-  require(second_materialized.data() == first_data,
+  require(pooled.first_data != nullptr && pooled.second_data != nullptr,
+          "pool reuse test: pooled run materialized nothing");
+  require(pooled.second_data == pooled.first_data,
           "pool reuse test: second receive_fill() did not reuse the pooled "
           "buffer (data() pointer differs)");
-  require(second_materialized.size() == kFillBytes,
-          "pool reuse test: second materialized size differs from the FILL");
-  require(std::equal(second_materialized.begin(), second_materialized.end(),
-                      baseline_bytes.begin(), baseline_bytes.end()),
-          "pool reuse test: second pooled materialized bytes differ from "
-          "the unpooled baseline");
-  deserializer.commit();
-
-  const icecc::p50::InputBufferPool::Stats stats = provider.pool()->stats();
-  require(stats.hits >= 1, "pool reuse test: pool recorded no hits");
+  require(pooled.stats.hits >= 1,
+          "pool reuse test: pool recorded no hits");
 
   std::cout << "input buffer pool reuse + parity: OK (" << kFillBytes
-            << " bytes, pool hits=" << stats.hits << ")\n";
+            << " bytes per TU, pool hits=" << pooled.stats.hits << ")\n";
 }
 
 // Regression test for a decode-side bug found while building the THP
