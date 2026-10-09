@@ -4539,6 +4539,33 @@ int run(const Options& options) noexcept {
         return 2;
     }
     RuntimeConfig runtime_config;
+    // ICECC_P50_MAX_RETAINED_INPUT_MIB (default unset = the compiled-in
+    // 8 GiB): F's retained-input byte budget. A faster route keeps more
+    // delivered-but-not-yet-compiled inputs resident at once; when the only
+    // namespace is the incoming one nothing is evictable, and BEGIN fails
+    // with "InputRecordStore limit has no evictable namespace capacity"
+    // (a TerminalError the C escalates to a sidecar replacement). Accepts
+    // 1024..262144 MiB; anything else is a startup error. Local resource
+    // bound only -- nothing on the wire changes.
+    if (const char* raw = ::getenv("ICECC_P50_MAX_RETAINED_INPUT_MIB");
+        raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const unsigned long long mib = std::strtoull(raw, &end, 10);
+        if (end == raw || *end != '\0' || mib < 1024 || mib > 262144) {
+            std::fprintf(stderr,
+                         "ICECC_P50_MAX_RETAINED_INPUT_MIB must be 1024..262144\n");
+            cleanup_listener(listener, effective_options.socket_path, identity,
+                             prebound);
+            return 2;
+        }
+        runtime_config.endpoint_config.owner_limits.max_retained_input_bytes =
+            static_cast<uint64_t>(mib) << 20;
+        std::fprintf(stderr, "P50_MAX_RETAINED_INPUT_BYTES effective=%llu\n",
+                     static_cast<unsigned long long>(
+                         runtime_config.endpoint_config.owner_limits
+                             .max_retained_input_bytes));
+        std::fflush(stderr);
+    }
     const char* p29_fault = ::getenv("ICECC_P50_FAULT_INJECTION");
     if (!parse_p29_interner_fault_injection(
             p29_fault, runtime_config.p29_interner_fault_injection)) {
