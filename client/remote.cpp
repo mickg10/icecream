@@ -543,8 +543,13 @@ PreprocessFirstOutcome prepare_p50_source_preprocess_first(CompileJob &job)
         outcome.capture = PreprocessFirstCapture(
             std::string("/proc/self/fd/") + std::to_string(memfd), nullptr, memfd);
     } else {
+        // Materialize the path before moving the TempSourceFile holder:
+        // argument evaluation order is unspecified and reading through a
+        // moved-from unique_ptr is exactly the segfault the strict row
+        // caught here.
+        const std::string temporary_path(temporary->path());
         outcome.capture = PreprocessFirstCapture(
-            std::string(temporary->path()), std::move(temporary), -1);
+            temporary_path, std::move(temporary), -1);
     }
 
     icecc::stagetrace::stage_trace(
