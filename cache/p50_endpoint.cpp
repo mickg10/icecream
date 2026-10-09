@@ -2304,6 +2304,12 @@ struct P50ServerEndpoint::Impl {
     struct ParkedWaiter {
         std::weak_ptr<ServerIoState> io;
         bool released = false;
+        // The parked session, and whether its own TX_BEGIN rel_seq is known
+        // to equal the key it is parked under (always for the peek-time
+        // park; for a pre-park only once its first frame drained). Only
+        // such a waiter becomes the route's cursor claimant on release.
+        uint64_t serial = 0;
+        bool begin_known = false;
     };
 
     struct Route {
@@ -2326,7 +2332,22 @@ struct P50ServerEndpoint::Impl {
         // rel_seq they are waiting for. See research/designs/
         // P50_ROUTE_PIPELINING.md §1.2 point 5 for the release triggers.
         std::map<uint64_t, std::vector<std::shared_ptr<ParkedWaiter>>> parked;
+        // The session released by release_parked_at() to take the cursor
+        // (its own BEGIN == next_rel), from its release until it installs
+        // `pending` or ends. Between those two points the route has no
+        // pending TX, yet the cursor is spoken for: a third session's HELLO
+        // landing in that gap must pre-park, not stage() against a cursor
+        // the claimant is about to consume. 0 = unclaimed.
+        uint64_t cursor_claim_serial = 0;
     };
+
+    // Another live session owns the route's next step: its pending TX, or a
+    // released successor's not-yet-installed claim.
+    static bool route_busy_for(const Route& route, uint64_t serial) {
+        return (route.pending && route.pending->owner_serial != serial) ||
+               (route.cursor_claim_serial != 0 &&
+                route.cursor_claim_serial != serial);
+    }
 
     // step 5c: register `io` as parked on `route` until `target` becomes the
     // route's cursor. The caller's park loop must call forget_parked() with
@@ -2334,9 +2355,12 @@ struct P50ServerEndpoint::Impl {
     // connection that disconnects while parked never leaves a dangling entry
     // behind for a later release to iterate over.
     static std::shared_ptr<ParkedWaiter> park(
-        Route& route, RelSeq target, const std::shared_ptr<ServerIoState>& io) {
+        Route& route, RelSeq target, const std::shared_ptr<ServerIoState>& io,
+        uint64_t serial, bool begin_known) {
         auto waiter = std::make_shared<ParkedWaiter>();
         waiter->io = io;
+        waiter->serial = serial;
+        waiter->begin_known = begin_known;
         route.parked[target.value].push_back(waiter);
         return waiter;
     }
@@ -2370,8 +2394,11 @@ struct P50ServerEndpoint::Impl {
         const auto found = route.parked.find(target.value);
         if (found == route.parked.end())
             return;
-        for (const std::shared_ptr<ParkedWaiter>& waiter : found->second)
+        for (const std::shared_ptr<ParkedWaiter>& waiter : found->second) {
+            if (waiter->begin_known)
+                route.cursor_claim_serial = waiter->serial;
             release_one(waiter);
+        }
     }
 
     // step 5c: bulk-release every connection parked anywhere on `route`,
@@ -2389,6 +2416,9 @@ struct P50ServerEndpoint::Impl {
                 release_one(waiter);
         }
         route.parked.clear();
+        // The cursor moved discontinuously (or the route is going away): no
+        // released successor's claim on it survives.
+        route.cursor_claim_serial = 0;
     }
 
     struct Namespace {
@@ -3187,7 +3217,15 @@ struct P50ServerEndpoint::Impl {
         if (!session.c_guid || !session.profile)
             return;
         auto position = namespaces.find(*session.c_guid);
-        if (position == namespaces.end() || position->second.active_session != session.serial)
+        if (position == namespaces.end())
+            return;
+        // A released claimant that ends before installing (it never took
+        // the namespace's active_session) must drop its cursor claim, or
+        // later sessions would pre-park on it until their grace expires.
+        if (Route* const claimed = find_route(position->second, *session.profile);
+            claimed != nullptr && claimed->cursor_claim_serial == session.serial)
+            claimed->cursor_claim_serial = 0;
+        if (position->second.active_session != session.serial)
             return;
         Namespace& space = position->second;
         Route* const route = find_route(space, *session.profile);
@@ -3440,6 +3478,8 @@ struct P50ServerEndpoint::Impl {
         route.interrupted.reset();
         route.pending = std::move(prepared.pending);
         route.pending->owner_serial = session.serial;
+        // `pending` now speaks for the cursor itself.
+        route.cursor_claim_serial = 0;
         record(replay ? ActionType::ACTIVE_REPLAYED : ActionType::TX_BEGIN, session, &begin);
         return replay;
     }
@@ -5733,7 +5773,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                 }
                 if (!history_reset_precedes_begin && begin_seen) {
                     const std::shared_ptr<Impl::ParkedWaiter> waiter =
-                        Impl::park(*route, peeked_rel, io);
+                        Impl::park(*route, peeked_rel, io, session.serial,
+                                   /*begin_known=*/true);
                     FrameParser drain_parser(selection.limits.max_frame_payload);
                     std::size_t drained_bytes_total = 0;
                     bool drain_ceiling_exceeded = false;
@@ -5875,8 +5916,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     prepark_route = Impl::find_route(prepark_namespace->second,
                                                     prepark_profile);
                 }
-                if (prepark_route != nullptr && prepark_route->pending &&
-                    prepark_route->pending->owner_serial != session.serial) {
+                if (prepark_route != nullptr &&
+                    Impl::route_busy_for(*prepark_route, session.serial)) {
                     // Level-triggered key: one past the current cursor. The
                     // head's commit bumps next_rel and releases exactly this
                     // key; any other resolution bulk-releases. prepark_key
@@ -5886,7 +5927,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     // park() call even after a re-key.
                     RelSeq prepark_key{prepark_route->next_rel.value + 1};
                     std::shared_ptr<Impl::ParkedWaiter> prepark_waiter =
-                        Impl::park(*prepark_route, prepark_key, io);
+                        Impl::park(*prepark_route, prepark_key, io,
+                                   session.serial, /*begin_known=*/false);
                     FrameParser prepark_drain_parser(
                         selection.limits.max_frame_payload);
                     std::size_t prepark_drained_total = 0;
@@ -5936,8 +5978,34 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                             boost::system::error_code ignored;
                             io->socket.cancel(ignored);
                         });
+                    // A release while this connection's first frame is still
+                    // unknown only means "the TX this pre-park keyed on
+                    // resolved". If another session still holds the cursor
+                    // -- its pending TX, or a released successor's claim
+                    // that has not installed yet (the release-to-install
+                    // gap, or K>2 where this key collides with an earlier
+                    // successor's) -- re-arm one past the new cursor and
+                    // keep waiting; otherwise fall through. Once the first
+                    // frame is a known successor BEGIN, a release is the
+                    // ordinary cursor release.
+                    const auto prepark_should_exit = [&]() {
+                        if (!prepark_waiter->released)
+                            return false;
+                        if (prepark_first_frame_done ||
+                            !Impl::route_busy_for(*prepark_route,
+                                                  session.serial))
+                            return true;
+                        Impl::forget_parked(*prepark_route, prepark_key,
+                                            prepark_waiter);
+                        prepark_key =
+                            RelSeq{prepark_route->next_rel.value + 1};
+                        prepark_waiter =
+                            Impl::park(*prepark_route, prepark_key, io,
+                                       session.serial, /*begin_known=*/false);
+                        return false;
+                    };
                     for (;;) {
-                        if (prepark_waiter->released)
+                        if (prepark_should_exit())
                             break;
                         boost::system::error_code prepark_wait_error;
                         co_await socket.async_wait(
@@ -5945,8 +6013,15 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                             asio::redirect_error(asio::use_awaitable,
                                                  prepark_wait_error));
                         require_operation();
-                        if (prepark_waiter->released)
-                            break;
+                        if (prepark_waiter->released) {
+                            // The release's socket.cancel() is what woke
+                            // this wait (operation_aborted): never an error.
+                            // Exit, or -- re-armed on a still-busy route --
+                            // wait again under the new key.
+                            if (prepark_should_exit())
+                                break;
+                            continue;
+                        }
                         if (*prepark_grace_expired)
                             break;
                         if (prepark_wait_error) {
@@ -6035,7 +6110,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                                     prepark_key = prepark_begin.rel_seq;
                                     prepark_waiter =
                                         Impl::park(*prepark_route, prepark_key,
-                                                   io);
+                                                   io, session.serial,
+                                                   /*begin_known=*/true);
+                                } else {
+                                    prepark_waiter->begin_known = true;
                                 }
                             } else {
                                 // BEGIN at or behind the cursor,
