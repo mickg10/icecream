@@ -7018,11 +7018,11 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     const P5coStoreGuids guids = p5co_store_guids(245);
     EndpointCaps caps;
     caps.profile = ProfileId::P29V1;
-    caps.zstd.max_raw_bytes = 8U << 20;
-    caps.zstd.max_encoded_body_bytes = 8U << 20;
+    caps.zstd.max_raw_bytes = 32U << 20;
+    caps.zstd.max_encoded_body_bytes = 32U << 20;
     PreparationAuthorityLimits limits;
     limits.route_pipeline_depth = 2;
-    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    limits.max_interner_reserved_bytes = UINT64_C(4294967296);
     TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
     auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
     asio::io_context context;
@@ -7033,7 +7033,7 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     // (4096): the successor's NEED could outgrow a socket buffer, so the
     // dispatch must keep it on the head path.
     std::vector<uint8_t> huge;
-    for (uint32_t index = 0; index < 20000; ++index) {
+    for (uint32_t index = 0; index < 700000; ++index) {
         const std::string line =
             "unique-source-line-" + std::to_string(index) + "\n";
         huge.insert(huge.end(), line.begin(), line.end());
