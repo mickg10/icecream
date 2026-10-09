@@ -1139,10 +1139,14 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
     // exactly once and cannot change its reuse decision mid-relationship.
     Impl::RouteState& route = impl_->route_state(route_key);
 
+    // Profile-scoped depth (design doc §7(1)): only a P29V1 route may hold
+    // more than one uncommitted successor; ZSTD_ROUTE stays at one.
     if ((route.profile == ProfileId::ZSTD_ROUTE ||
          route.profile == ProfileId::P29V1) &&
         route.uncommitted_route_entries.size() >=
-            std::max<uint32_t>(1, impl_->authority_limits.route_pipeline_depth))
+            (route.profile == ProfileId::P29V1
+                 ? std::max<uint32_t>(1, impl_->authority_limits.route_pipeline_depth)
+                 : 1u))
         throw std::logic_error(
             "selected route profile already has its full pipeline of successors outstanding");
 
@@ -2173,7 +2177,10 @@ struct P50ClientEndpoint::Impl {
     // a wait into a different epoch must fail, not resume.
     uint64_t pipeline_epoch = 0;
     [[nodiscard]] uint32_t route_pipeline_depth() const {
-        return preparation ? preparation->route_pipeline_depth() : 1;
+        // Profile-scoped: only a P29V1 route can pipeline (design doc §7(1)).
+        return preparation && caps.profile == ProfileId::P29V1
+                   ? preparation->route_pipeline_depth()
+                   : 1;
     }
     [[nodiscard]] size_t window_size() const {
         return (active ? 1u : 0u) + (awaiting_head ? 1u : 0u) +

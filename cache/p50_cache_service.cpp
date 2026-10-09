@@ -2225,13 +2225,17 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
     // one-time route_lane_count() env-var read. Stays clamped to 1 (today's
     // behavior) until ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is set, per
     // RouteGate::route_pipeline_depth()'s own no-F-sequencer safety gate.
+    //
+    // The value is the depth for P29V1 routes, the only profile that can
+    // pipeline. It is NOT derived from endpoint_caps.profile: one authority
+    // serves routes of every profile (a route's profile comes from its
+    // request), and the client sidecar's endpoint_caps.profile is not P29V1,
+    // which used to clamp every route to 1 (farm K2-2 startup gate,
+    // reason=profile). The profile clamp is applied per route instead: the
+    // authority's admission bound, the client endpoint's window, and the
+    // early transfer-lock release below all treat non-P29V1 routes as K=1.
     route_config.authority_limits.route_pipeline_depth =
-        RouteGate::route_pipeline_depth(
-            config_.endpoint_caps.profile == ProfileId::P29V1
-                ? CACHE_PROFILE_P29V1
-                : config_.endpoint_caps.profile == ProfileId::ZSTD_ROUTE
-                      ? CACHE_PROFILE_ZSTD_ROUTE
-                      : CACHE_PROFILE_ZSTD_TU);
+        RouteGate::route_pipeline_depth(CACHE_PROFILE_P29V1);
     route_pipeline_depth_ = route_config.authority_limits.route_pipeline_depth;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
@@ -3147,7 +3151,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // into prepare_for_route while TX n is still uncommitted, where the
     // depth-1 admission bound refuses it as RouteReplacementRequired and
     // the client sidecar is replaced (farm K2-0, 2026-10-09).
-    if (route_pipeline_depth_ > 1) {
+    if (route_pipeline_depth_ > 1 && request.cache_profile == CACHE_PROFILE_P29V1) {
         if (write_done.wait_until(wait_limit) != std::future_status::ready)
             owner_stall_exit();
         icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
