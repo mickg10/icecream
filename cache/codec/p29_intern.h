@@ -280,15 +280,49 @@ inline void checked_add(std::size_t &total, std::size_t value) {
     return fold128(left ^ secret[0], right ^ seed ^ secret[2]);
 }
 
+// The region-boundary scan: the first '#' at or after position+1 whose
+// previous byte is '\n' and whose next byte is ' ' (the "\n# " linemarker),
+// or end when no such byte exists.  A candidate at `scan` needs both
+// neighbors in bounds, so candidates are exactly [position + 1, end - 2];
+// the scan starts at position + 1 (never at position itself) and stops
+// before scan + 1 == end.
+//
+// The scalar reference implementation this fast path replaces (and is
+// differentially tested against, kept as a test-local copy in
+// unittests/codec_intern_test.cpp):
+//
+//     const std::uint8_t *scan = position + 1;
+//     while (scan + 1 < end) {
+//         if (*scan == '#' && scan[-1] == '\n' && scan[1] == ' ')
+//             return scan;
+//         ++scan;
+//     }
+//     return end;
+//
+// This implementation produces the identical result for every input: the
+// memchr window is exactly the scalar loop's candidate range (empty iff
+// end - position < 3, which is also when the loop cannot run), a found
+// '#' must pass the scalar's own two neighbor tests to be returned, and a
+// failed candidate resumes at the next byte -- so the FIRST accepted '#'
+// is the same byte the scalar loop returns.
 [[nodiscard]] inline const std::uint8_t *next_region(
     const std::uint8_t *position, const std::uint8_t *end) {
-    const std::uint8_t *scan = position + 1;
-    while (scan + 1 < end) {
-        if (*scan == '#' && scan[-1] == '\n' && scan[1] == ' ')
+    const std::uint8_t *window_end = end - 2;  // inclusive last candidate
+    const std::uint8_t *window_begin = position + 1;
+    if (window_end < window_begin)
+        return end;
+    for (const std::uint8_t *scan = window_begin;;) {
+        const void *hit = std::memchr(
+            scan, '#', static_cast<std::size_t>(window_end - scan + 1));
+        if (hit == nullptr)
+            return end;
+        scan = static_cast<const std::uint8_t *>(hit);
+        if (scan[-1] == '\n' && scan[1] == ' ')
             return scan;
         ++scan;
+        if (scan > window_end)
+            return end;
     }
-    return end;
 }
 
 } // namespace p29_intern_detail

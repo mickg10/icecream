@@ -6084,6 +6084,13 @@ public:
             return {};
         std::string result;
         char buffer[4096];
+        // The write end is the still-open fd 2, so a plain read() would
+        // block once the pipe is empty; drain only what is already in
+        // flight (ioctl FIONREAD then non-blocking semantics via O_NONBLOCK
+        // on the reader).
+        const int previous = ::fcntl(reader_, F_GETFL);
+        if (previous >= 0)
+            (void)::fcntl(reader_, F_SETFL, previous | O_NONBLOCK);
         for (;;) {
             const ssize_t got = ::read(reader_, buffer, sizeof(buffer));
             if (got <= 0)
