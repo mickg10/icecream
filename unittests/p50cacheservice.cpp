@@ -4161,6 +4161,276 @@ void test_k4_stale_epoch_successors_retire_route_locally() {
     stale_epoch_storm_asserts(run_stale_epoch_successor_storm(4), 4);
 }
 
+// The k45 farm leg shape (2026-10-09): a transfer whose FIRST attempt fails
+// pre-BEGIN (the run dies on the wire before any transactional byte -- F
+// closed the session, or the connect/arm itself was refused) and whose
+// second attempt fails at the arm/connect level (F did not answer the arm).
+// The fd-level failure path never touches the endpoint -- no poison, no
+// chain abandonment -- so both attempts land in the sender's ordinary
+// branch order, and the attempt-2 retirement used to quarantine_transport
+// + latch route_replacement_required sticky: the whole route then refused
+// every later assignment with 0x5002 for the rest of the leg (471 refusals
+// in k45, all downstream of ONE such transfer). The route-local contract:
+// a transfer that never put a TX_BEGIN on the wire has no route state on F
+// to strand -- retire it route-locally (RetryExhausted,
+// route_local_failure), no sticky latch, and the route keeps serving. No
+// real hostnames here; see the fixture comment.
+struct Attempt2StormResult {
+    local::P50SourceTransferResult failed{};
+    local::P50SourceTransferResult after{};
+    bool after_ran = false;
+};
+
+Attempt2StormResult run_attempt2_arm_refusal_storm() {
+    for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
+                             "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
+                             "ICECC_P50_ROUTE_LANES", "ICECC_P50_ARMED_WINDOW",
+                             "ICECC_P50_PREP_AHEAD"})
+        CHECK(::unsetenv(name) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+    constexpr uint64_t kFStoreGeneration = 43;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x99;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xe5;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    // The raw arm front: the first arm gets a REAL session whose F-side
+    // dialogue is killed mid-run (the fd is closed right after adoption, so
+    // the C run dies pre-BEGIN on EOF); every later connect is refused at
+    // the socket level (the listener is gone -- the k45 f-connect/f-arm
+    // refusal face, where F never completes the arm round trip).
+    class RefusingFront {
+    public:
+        RefusingFront(service::SidecarRuntime& f_runtime,
+                      uint64_t f_store_generation)
+            : f_runtime_(f_runtime),
+              f_store_generation_(f_store_generation),
+              listener_(loopback_listener(port_)) {
+            CHECK(::listen(listener_, 8) == 0);
+            acceptor_ = std::thread([this] { accept_loop(); });
+        }
+        ~RefusingFront() { stop(); }
+        RefusingFront(const RefusingFront&) = delete;
+        RefusingFront& operator=(const RefusingFront&) = delete;
+
+        [[nodiscard]] uint16_t port() const noexcept { return port_; }
+        // The arm ordinal that will be refused outright (RST after accept):
+        // arm 1 is the doomed transfer's first attempt (armed, adopted, then
+        // killed mid-dialogue); arm 2 is its single permitted retry (the k45
+        // face: F never completes the arm round trip); every later arm
+        // serves normally so the fresh-assignment probe commits.
+        void refuse_arm_ordinal(size_t ordinal) noexcept {
+            std::lock_guard lock(mutex_);
+            refused_ordinal_ = ordinal;
+        }
+
+        void stop() noexcept {
+            stopping_.store(true, std::memory_order_release);
+            if (acceptor_.joinable())
+                acceptor_.join();
+            for (std::thread& worker : workers_)
+                if (worker.joinable())
+                    worker.join();
+            workers_.clear();
+            if (listener_ >= 0) {
+                (void)::close(listener_);
+                listener_ = -1;
+            }
+        }
+
+    private:
+        void accept_loop() noexcept {
+            while (!stopping_.load(std::memory_order_acquire)) {
+                pollfd descriptor{listener_, POLLIN, 0};
+                if (::poll(&descriptor, 1, 20) <= 0)
+                    continue;
+                sockaddr_in peer{};
+                socklen_t peer_size = sizeof(peer);
+                const int accepted = ::accept(
+                    listener_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+                if (accepted < 0)
+                    continue;
+                const size_t ordinal =
+                    arm_ordinal_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (ordinal == refused_ordinal_) {
+                    // Reset in-lieu: connect() succeeded, then the peer sees
+                    // RST on first read/write -- the arm-refusal face (F never
+                    // completes the arm round trip).
+                    linger reset{};
+                    reset.l_onoff = 1;
+                    reset.l_linger = 0;
+                    (void)::setsockopt(accepted, SOL_SOCKET, SO_LINGER,
+                                       &reset, sizeof(reset));
+                    (void)::close(accepted);
+                    continue;
+                }
+                try {
+                    workers_.emplace_back([this, accepted, peer, peer_size] {
+                        serve(accepted, peer, peer_size);
+                    });
+                } catch (...) {
+                    (void)::close(accepted);
+                }
+            }
+        }
+
+        void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
+            try {
+                std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                    accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+                if (!channel)
+                    return;
+                std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+                const auto* arm = arm_message != nullptr
+                                      ? dynamic_cast<P50SourceArmMsg*>(
+                                            arm_message.get())
+                                      : nullptr;
+                if (arm == nullptr || !arm->valid_payload())
+                    return;
+                ClaimAttemptCapability128 capability_1;
+                ClaimAttemptCapability128 capability_2;
+                capability_1.bytes.fill(0xf1);
+                capability_2.bytes.fill(0xf2);
+                const P50SourceArmedMsg acknowledgement(
+                    arm->arm, 111, 112, f_store_generation_,
+                    f_runtime_.f_store_guid().bytes,
+                    kStoreIdentityDerivationVersion, 113, 2500,
+                    capability_1, capability_2);
+                if (!channel->send_msg(acknowledgement))
+                    return;
+                std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+                if (cache_message == nullptr ||
+                    *cache_message != Msg::CACHE_SESSION)
+                    return;
+                const int raw_fd = channel->release_fd_if_input_empty();
+                if (raw_fd < 0)
+                    return;
+                const auto ready_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                if (!f_runtime_.try_reserve_session()) {
+                    (void)send_cache_session_busy(raw_fd, ready_deadline);
+                    (void)::close(raw_fd);
+                    return;
+                }
+                if (!send_cache_session_ready(raw_fd, ready_deadline)) {
+                    f_runtime_.release_session_reservation();
+                    (void)::close(raw_fd);
+                    return;
+                }
+                // Hand F the session. For the FIRST session only: kill the
+                // F-side dialogue at once -- shutdown() on a dup'ed descriptor
+                // hits the SHARED socket (an fd close alone would not, asio
+                // owns another copy), so F's adopted run reads EOF and dies
+                // mid-dialogue and the C side sees its own STATE read hit EOF
+                // pre-commit, with no TX_BEGIN of this transfer staged by F.
+                // Every LATER session stays alive so the retry -- and the
+                // fresh-assignment probe -- can arm and commit through this
+                // same front.
+                const bool kill_this_session =
+                    !killed_.exchange(true, std::memory_order_acq_rel);
+                const int kill_copy = kill_this_session ? ::dup(raw_fd) : -1;
+                f_runtime_.start_adopted_endpoint(raw_fd);
+                if (kill_copy >= 0) {
+                    (void)::shutdown(kill_copy, SHUT_RDWR);
+                    (void)::close(kill_copy);
+                }
+            } catch (...) {
+            }
+        }
+
+        service::SidecarRuntime& f_runtime_;
+        const uint64_t f_store_generation_;
+        uint16_t port_ = 0;
+        int listener_ = -1;
+        std::atomic<bool> stopping_{false};
+        std::atomic<size_t> arm_ordinal_{0};
+        size_t refused_ordinal_ = 0;
+        std::atomic<bool> killed_{false};
+        std::mutex mutex_;
+        std::vector<std::thread> workers_;
+        std::thread acceptor_;
+    };
+
+    RefusingFront front(f_runtime, kFStoreGeneration);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity,
+                               std::chrono::milliseconds budget) {
+        const std::string text = "attempt2-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto absolute =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                std::chrono::steady_clock::now() + budget,
+                clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity,
+                                    CACHE_PROFILE_P29V1),
+            absolute,
+            local::HandoffFd(source_file("p50-attempt2-arm-refusal", source)));
+    };
+
+    Attempt2StormResult storm;
+    // The doomed transfer: arm 1 serves it (adopted, then killed
+    // mid-dialogue pre-BEGIN); its single permitted retry takes arm 2,
+    // which the front refuses outright -- the k45 arm face. The 20 s
+    // budget keeps the retry inside the deadline, so the attempt-2
+    // branch -- not a deadline -- decides the retirement.
+    front.refuse_arm_ordinal(2);
+    std::thread doomed([&] {
+        storm.failed = transfer(710, std::chrono::seconds(20));
+    });
+    doomed.join();
+    // The latch probe: a fresh assignment on the SAME C sidecar (arm 3
+    // serves normally). Sticky pre-fix (the attempt-2 quarantine latches
+    // route_replacement_required and this transfer is refused Unavailable
+    // at attempts=0 without ever arming); route-local post-fix (commits).
+    storm.after = transfer(720, std::chrono::seconds(20));
+    storm.after_ran = true;
+    CHECK(storm.failed.valid());
+    CHECK(storm.after.valid());
+    std::fprintf(stderr,
+                 "p50cacheservice: attempt-2 arm-refusal failed=%u/%u/%u "
+                 "after=%u/%u/%u\n",
+                 static_cast<unsigned>(storm.failed.code),
+                 static_cast<unsigned>(storm.failed.error_code),
+                 static_cast<unsigned>(storm.failed.attempts),
+                 static_cast<unsigned>(storm.after.code),
+                 static_cast<unsigned>(storm.after.error_code),
+                 static_cast<unsigned>(storm.after.attempts));
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+    return storm;
+}
+
+void test_attempt2_fd_failure_retires_route_locally() {
+    const Attempt2StormResult storm = run_attempt2_arm_refusal_storm();
+    const auto replacement_code = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    // The doomed transfer failed -- that is the fixture -- but it must not
+    // carry the sticky replacement code itself, and the fresh assignment on
+    // the SAME sidecar must commit: nothing about the C store is broken, F
+    // merely refused one arm round trip. (Today: quarantine_transport
+    // latches route_replacement_required and the after transfer is refused
+    // Unavailable/0x5002 at attempts=0 -- the whole-leg route loss.)
+    CHECK(storm.failed.code != local::SourceTransferResultCode::Committed);
+    CHECK(storm.failed.error_code != replacement_code);
+    CHECK(storm.after_ran);
+    CHECK(storm.after.code == local::SourceTransferResultCode::Committed);
+    CHECK(storm.after.error_code != replacement_code);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -4800,6 +5070,7 @@ int main(int argc, char** argv) {
             test_k3_stale_epoch_successor_does_not_repoison_or_replace();
             test_k2_stale_epoch_head_retires_route_locally();
             test_k4_stale_epoch_successors_retire_route_locally();
+            test_attempt2_fd_failure_retires_route_locally();
             return 0;
         }
         CHECK(argc == 1);
