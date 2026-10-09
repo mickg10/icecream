@@ -464,7 +464,7 @@ PreprocessFirstOutcome prepare_p50_source_preprocess_first(CompileJob &job)
         {{"preprocess_first", 1}});
 
     if (!dcc_lock_host()) {
-        log_error() << "can't lock for local cpp" << endl;
+        log_error() << "can't lock for local cpp" << std::endl;
         outcome.failure_status = EXIT_DISTCC_FAILED;
         return outcome;
     }
