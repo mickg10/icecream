@@ -2232,6 +2232,7 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
                 : config_.endpoint_caps.profile == ProfileId::ZSTD_ROUTE
                       ? CACHE_PROFILE_ZSTD_ROUTE
                       : CACHE_PROFILE_ZSTD_TU);
+    route_pipeline_depth_ = route_config.authority_limits.route_pipeline_depth;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     route_config.before_prepare_for_route_for_test =
         std::move(config_.before_route_prepare_for_test);
@@ -2974,10 +2975,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // fires once this TX's last FILL byte is on the wire -- independent of,
     // and strictly no later than, the final result above -- so the per-route
     // transfer lock below can release there instead of after STATE/COMMIT.
-    // At K=1 (default route_pipeline_depth) nothing else is ever waiting on
-    // this lane's lock when write_done fires, so releasing it earlier is
-    // unobservable: this preserves the "K=1 is byte-identical to today"
-    // invariant (research/designs/P50_ROUTE_PIPELINING.md, invariant 12).
+    // The early release below happens only at K>1; at K=1 the lock is held
+    // to the final result exactly as before, which is what keeps "K=1 is
+    // byte-identical to today" (research/designs/P50_ROUTE_PIPELINING.md,
+    // invariant 12) true under concurrent same-route transfers.
     auto write_complete_promise = std::make_shared<std::promise<void>>();
     std::future<void> write_done = write_complete_promise->get_future();
     auto write_complete_fired = std::make_shared<std::atomic<bool>>(false);
@@ -3139,13 +3140,22 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // timeout trigger beyond the existing one on result below: it can only
     // ever fire in exactly the cases where that wait would also eventually
     // time out.
-    if (write_done.wait_until(wait_limit) != std::future_status::ready)
-        owner_stall_exit();
-    icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
-        (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
-        (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
-    source_transfer_lock.unlock();
-    lock_released_early = true;
+    //
+    // K>1 ONLY. At K=1 the lock must stay held until the final result, as
+    // before 4c: concurrent transfers for the same route DO queue on this
+    // lock in production, and releasing it at write-complete admits TX n+1
+    // into prepare_for_route while TX n is still uncommitted, where the
+    // depth-1 admission bound refuses it as RouteReplacementRequired and
+    // the client sidecar is replaced (farm K2-0, 2026-10-09).
+    if (route_pipeline_depth_ > 1) {
+        if (write_done.wait_until(wait_limit) != std::future_status::ready)
+            owner_stall_exit();
+        icecc::stagetrace::stage_trace("csidecar", "transfer_lock_released",
+            (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
+            (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
+        source_transfer_lock.unlock();
+        lock_released_early = true;
+    }
     if (result.wait_until(wait_limit) != std::future_status::ready)
         owner_stall_exit();
     return result.get();

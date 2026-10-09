@@ -271,6 +271,10 @@ private:
     boost::asio::io_context context_;
     std::unique_ptr<P50ServerEndpoint> endpoint_;
     std::unique_ptr<P50CRouteOwner> route_owner_;
+    // Process-lifetime K (ICECC_P50_ROUTE_PIPELINE_DEPTH, clamped), read once
+    // at construction. The per-route transfer lock is released early at
+    // write-complete only when this is above 1.
+    uint32_t route_pipeline_depth_ = 1;
     // route_owner_'s authority, fixed before the owner thread starts so
     // control workers can prepare sources on their own threads.
     std::shared_ptr<P50PreparationAuthority> source_authority_;
