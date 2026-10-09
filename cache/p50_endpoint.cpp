@@ -4405,6 +4405,9 @@ P50ClientEndpoint::run_connected_successor(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader),
             impl_->completions, verify);
+        if (control.stall_stage)
+            control.stall_stage->store(ClientStallStage::StateRead,
+                                       std::memory_order_relaxed);
         client_checked(impl_->caps.wire.max_frame_payload, [&] {
             if (state_frame.type == MessageType::ERROR)
                 throw ClientTerminalResult(decode_as<ErrorMessage>(state_frame),

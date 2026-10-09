@@ -6433,6 +6433,7 @@ struct K2PipelineRunResult {
     PreparedTuHandle successor_handle;
     std::function<void()> spawn_successor;
     std::shared_ptr<RawParkedRouteState> fake;
+    std::shared_ptr<std::atomic<ClientStallStage>> successor_stall;
 };
 
 void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
@@ -6465,6 +6466,8 @@ void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
 
     EndpointIoControl head_control;
     std::atomic<bool> head_write_complete_fired{false};
+    out.successor_stall = std::make_shared<std::atomic<ClientStallStage>>(
+        ClientStallStage::Connecting);
     head_control.write_complete = [&]() {
         // Production (client/p50_zstd_sender.cpp + p50_cache_service.cpp)
         // only RELEASES the route transfer lock here; TX n+1's transfer
@@ -6480,10 +6483,12 @@ void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
             // ordering.
             out.successor_handle = admit(*client, tu2);
             const PreparedTuHandle succ_handle = out.successor_handle;
+            EndpointIoControl successor_control;
+            successor_control.stall_stage = out.successor_stall.get();
             successor_result.emplace(asio::co_spawn(
                 context,
                 client->endpoint.run(
-                    remote, succ_handle, EndpointIoControl{},
+                    remote, succ_handle, successor_control,
                     scenario.has_successor_deadline
                         ? std::optional<std::chrono::steady_clock::time_point>(
                               scenario.successor_deadline)
@@ -6556,6 +6561,11 @@ void test_p29v1_k2_pipeline_straight_line() {
                 (run.successor.terminal_error.has_value()
                      ? run.successor.terminal_error->detail
                      : std::string("<none>")) +
+                " stall=" +
+                std::to_string(static_cast<uint8_t>(
+                    run.successor_stall
+                        ? run.successor_stall->load()
+                        : ClientStallStage::Connecting)) +
                 ")");
     require(run.successor_begin.rel_seq.value ==
                 run.head_begin.rel_seq.value + 1,
