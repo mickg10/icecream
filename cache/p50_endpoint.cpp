@@ -5837,20 +5837,36 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     // missing deadline keeps the 2000 ms bound.
                     auto prepark_grace =
                         std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(2000);
+                        std::chrono::duration_cast<
+                            std::chrono::steady_clock::duration>(
+                            std::chrono::milliseconds(
+                                impl_->config.prepark_grace_bound_ms));
                     if (deadline && deadline->valid()) {
                         const auto absolute =
                             deadline->as_steady_time_point();
                         if (absolute < prepark_grace)
                             prepark_grace = absolute;
                     }
+                    // Grace-expiry handshake (sorbet-main review): the
+                    // handler must ignore its own error_code (a cancelled
+                    // timer -- the release- and first-frame-driven exits
+                    // cancel it on their way out -- would otherwise cancel
+                    // the socket a second time, aborting the NEXT socket
+                    // operation: the stage() STATE write or the first
+                    // post-park read), and it must set a flag the loop
+                    // checks BEFORE its error check, so a grace expiry
+                    // FALLS THROUGH exactly as today instead of throwing
+                    // operation_aborted and killing the session.
+                    auto prepark_grace_expired =
+                        std::make_shared<bool>(false);
                     asio::steady_timer prepark_timer(
                         socket.get_executor(), prepark_grace);
                     prepark_timer.async_wait(
-                        [io](const boost::system::error_code&) {
-                            // Grace expiry cancels the socket wait; the
-                            // park loop below observes the wait completing
-                            // without a release and falls through.
+                        [io, prepark_grace_expired](
+                            const boost::system::error_code& error) {
+                            if (error)
+                                return;
+                            *prepark_grace_expired = true;
                             boost::system::error_code ignored;
                             io->socket.cancel(ignored);
                         });
@@ -5864,6 +5880,8 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                                                  prepark_wait_error));
                         require_operation();
                         if (prepark_waiter->released)
+                            break;
+                        if (*prepark_grace_expired)
                             break;
                         if (prepark_wait_error) {
                             Impl::forget_parked(*prepark_route, prepark_key,

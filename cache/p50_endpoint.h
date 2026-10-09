@@ -604,6 +604,15 @@ struct P50ServerEndpointConfig {
     std::function<void(InputRecordKey, bool)> on_input_committed;
     std::function<void(EndpointCancelPermit)> on_run_admitted;
     std::function<void(EndpointCancelPermit, EndpointTerminalResult)> on_run_terminal;
+    // Step 5c pre-park grace bound (2026-10-09 admission-race fixes), in
+    // milliseconds. Production keeps the 2000 ms default: a new session
+    // arriving while another session's TX is in flight on the route waits
+    // up to this bound for that TX to resolve (or for the new session's
+    // first frame) before falling through to today's stage()/activate()
+    // semantics. Test-only override so the grace path is reachable
+    // deterministically (a shorter bound does not change which frames are
+    // sent, only when the fall-through happens).
+    uint32_t prepark_grace_bound_ms = 2000;
 };
 
 // Outbound-admission law shared by the client's production send path and its
