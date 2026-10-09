@@ -862,6 +862,7 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
             f.pending = tx_identity(record);
             break;
         }
+        }  // switch (record.action)
 
         // Reconciliation witness, generalized from "F is exactly one
         // REL_SEQ ahead of C" to "ahead by at most K, never behind"
@@ -894,8 +895,9 @@ std::optional<std::string> check_action_trace(std::span<const ActionRecord> reco
                 !std::equal(live_unacked.begin(), live_unacked.end(),
                             c.queue.begin()))
                 return error("durable F commit is not C's queue head");
-            if (!f.last_commit || !f.unacked.empty() &&
-                    *f.last_commit != f.unacked.back())
+            if (!f.last_commit ||
+                (!f.unacked.empty() &&
+                 *f.last_commit != f.unacked.back()))
                 return error("durable F commit does not match C active");
             if (!c.cursor_known || !f.route)
                 return error("durable F commit lacks route cursors");
