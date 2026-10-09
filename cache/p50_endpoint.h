@@ -436,18 +436,6 @@ public:
     // Total: false for unknown or released handles, never throws.
     [[nodiscard]] bool prepared_chain_abandoned(PreparedTuHandle handle) const;
 
-    // True when releasing this handle cannot tear any SIBLING's chain:
-    // release() invalidates the whole outstanding deque uniformly, so a
-    // route-local retirement may only release a handle whose entry is
-    // already gone from its route's deque (a prior uniform abandonment
-    // removed it), or is the deque's sole remaining member. On a route with
-    // a live sibling -- e.g. a healthy in-flight head -- that collateral
-    // abandonment is exactly what a route-local retirement must avoid;
-    // the entry is then left for the sibling's own completion path.
-    // Total: false for unknown or released handles, never throws.
-    [[nodiscard]] bool prepared_route_release_isolated(
-        PreparedTuHandle handle) const;
-
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;

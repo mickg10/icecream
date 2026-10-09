@@ -1965,27 +1965,6 @@ bool P50PreparationAuthority::prepared_chain_abandoned(
     return position->second.chain_abandoned;
 }
 
-bool P50PreparationAuthority::prepared_route_release_isolated(
-    PreparedTuHandle handle) const {
-    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
-        return false;
-    const auto position = impl_->entries.find(handle.entry_id_);
-    if (position == impl_->entries.end() || position->second.committed)
-        return false;
-    const Impl::RouteState& route = impl_->route_state(position->second.route);
-    if (route.profile != ProfileId::P29V1 &&
-        route.profile != ProfileId::ZSTD_ROUTE)
-        return false;
-    const std::deque<uint64_t>& outstanding = route.uncommitted_route_entries;
-    const auto member = std::find(outstanding.begin(), outstanding.end(),
-                                  handle.entry_id_);
-    // Already removed by a uniform chain abandonment: nothing to tear.
-    if (member == outstanding.end())
-        return true;
-    // Exactly this handle outstanding: releasing it abandons nothing else.
-    return outstanding.size() == 1;
-}
-
 ProfileId P50PreparationAuthority::profile() const {
     impl_->owner.check();
     return impl_->profile;
@@ -4966,33 +4945,6 @@ P50ClientEndpoint::run_connected_successor(
             control.before_live_identity_check(expected, live);
         require_live_completion(expected, live);
     };
-    // True when not one CacheWire byte of THIS session ever reached the
-    // wire (no SUCCESSFUL WriteFragment completion carries this session's
-    // serial): a system_error caught in that state invalidated nothing on F
-    // -- no park, no staged transaction, no cursor movement -- so the
-    // route's outstanding window is untouched and the failure may stay
-    // LOCAL instead of poisoning it (see the system_error catch below). A
-    // FAILED write records its completion with an error value and zero
-    // bytes, which does not count; a HALF-written frame records partial
-    // transferred bytes on a successful completion, so it is conservatively
-    // NOT "nothing written".
-    const auto session_wrote_nothing = [&]() {
-        if (io->committed || !impl_->completions ||
-            !impl_->completions->valid())
-            return false;
-        for (const AsyncCompletion& completion :
-             impl_->completions->completions()) {
-            if (completion.stamp.actor != ActorSide::C)
-                continue;
-            if (completion.stamp.operation != AsyncOperationKind::WriteFragment)
-                continue;
-            if (completion.stamp.session_serial != serial)
-                continue;
-            if (completion.error_value == 0 && completion.transferred_bytes > 0)
-                return false;
-        }
-        return true;
-    };
     try {
         require_deadline();
         if (remote)
@@ -5239,33 +5191,7 @@ P50ClientEndpoint::run_connected_successor(
         result.observation = ClientRunObservation::Disconnected;
     } catch (const boost::system::system_error&) {
         close_now(socket);
-        // Connect-face de-poison (K4-4/K4-6 farm legs, 2026-10-09): a
-        // successor's transport death with ZERO wire writes, on a route
-        // this run OPENED (same pipeline epoch, not already poisoned) and
-        // whose predecessor has NOT committed past this entry, left F
-        // untouched -- no park, no staged transaction -- so poisoning the
-        // window would tear down healthy siblings for nothing AND foreclose
-        // the sender's own retry (the poison makes the sender abandon the
-        // chain instead of re-opening). Leave the epoch clean instead: the
-        // sender loops to its second attempt, re-opens a fresh session, and
-        // re-runs the SAME admitted encoding, which is still exactly valid
-        // (the CRoute entry's serializer is still pending; the predict-commit
-        // lands at the retry's FILL write). Every other system_error keeps
-        // today's exact poison: a stale-epoch successor (a previous reset
-        // already invalidated its encoding -- retrying it re-runs the
-        // 55509637 stale-encoding class), a predecessor that committed past
-        // this entry (its prepared BODY was built against the serializer
-        // state at its own begin -- re-sending it after the predecessor's
-        // serializer commit is data corruption at F's continuing decoder,
-        // observed as te=1 "P29 zstd continuing decode: Data corruption
-        // detected"), a partial write, an expiry mid-write, or a poisoned
-        // window.
-        const bool retry_encoding_still_valid =
-            session_wrote_nothing() && !impl_->poisoned &&
-            impl_->pipeline_epoch == epoch_at_open &&
-            impl_->next_rel.value <= predecessor_rel.value;
-        if (!retry_encoding_still_valid)
-            poison_current_epoch();
+        poison_current_epoch();
         result.status = io->expired || deadline_crossed()
                             ? ClientRunStatus::DeadlineExceeded
                             : ClientRunStatus::Disconnected;

@@ -923,22 +923,17 @@ P50ZstdSourceSender::transfer_bytes(
             // Nothing on the wire: drop the endpoint's retained retry
             // bookkeeping for this handle (a later attempt's dispatch would
             // otherwise identify against it and throw) and release the
-            // authority entry, freeing the route's admission slot -- but
-            // ONLY when this entry is the route's last uncommitted one:
-            // release() invalidates the WHOLE outstanding deque uniformly,
-            // and on a route whose head (or another sibling) is still live
-            // in flight that collateral abandonment would retire a healthy
-            // member for nothing. A shared route keeps the entry; its
-            // sibling's own completion or abandonment path releases it.
+            // authority entry, freeing the route's admission slot. Both are
+            // best-effort against typed throws: the handle's structures were
+            // marked abandoned uniformly by release()'s own non-tail path if
+            // any sibling was outstanding.
             try {
                 impl_->endpoint->discard_retained_route_work(prepared);
             } catch (...) {
             }
-            if (impl_->authority->prepared_route_release_isolated(prepared)) {
-                try {
-                    (void)impl_->authority->release(prepared);
-                } catch (...) {
-                }
+            try {
+                (void)impl_->authority->release(prepared);
+            } catch (...) {
             }
             result.route_local_failure = true;
             co_return result;
