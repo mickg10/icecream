@@ -676,12 +676,106 @@ CorpusResult intern_corpus(P29Interner<MmapProvider> &interner,
     return result;
 }
 
+// The test-local executable specification for the region-boundary scan:
+// the byte-at-a-time loop p29_intern.h's next_region() replaced with a
+// memchr-driven scan.  Every randomized and edge-case input below must
+// give the byte-identical result for both.
+[[nodiscard]] const std::uint8_t *next_region_reference(
+    const std::uint8_t *position, const std::uint8_t *end) {
+    const std::uint8_t *scan = position + 1;
+    while (scan + 1 < end) {
+        if (*scan == '#' && scan[-1] == '\n' && scan[1] == ' ')
+            return scan;
+        ++scan;
+    }
+    return end;
+}
+
+void check_next_region_differential() {
+    using icecc::codec::p29_intern_detail::next_region;
+    // Fixed edge cases: no boundary, boundary at every offset from the
+    // scan start, boundaries adjacent to both ends of the window (the
+    // scan+1 < end cutoff), '#' with wrong neighbours ('#' without the
+    // preceding newline, '#' followed by something else, "# " at the very
+    // start), input too short for any candidate at all, and position at
+    // the very end of the buffer.
+    const std::vector<std::string> edges = {
+        "",
+        "#",
+        "\n",
+        "# ",
+        "\n#",
+        "\n# ",
+        "x\n# ",
+        "\n# x",
+        "\n#\n",
+        "a\n# b",
+        "a\n# b\n# c",
+        "# # # # ",
+        "\n\n\n\n",
+        "abc\n# def\nghi\n# jkl\n",
+        "abc\n#def\nghi\n# jkl\n",
+        "\n# \n# \n# ",
+        "x\nx# y",
+        "x# y",
+    };
+    for (const std::string &text : edges) {
+        const std::uint8_t *data =
+            reinterpret_cast<const std::uint8_t *>(text.data());
+        const std::uint8_t *end = data + text.size();
+        for (std::size_t start = 0; start <= text.size(); ++start) {
+            const std::uint8_t *expect =
+                next_region_reference(data + start, end);
+            const std::uint8_t *got = next_region(data + start, end);
+            require(expect == got,
+                    "next_region edge case differs from the scalar reference: "
+                    "input=\"" + text + "\" start=" + std::to_string(start) +
+                    " expected=" + (expect == end ? std::string("end")
+                                                  : std::to_string(expect - data)) +
+                    " got=" + (got == end ? std::string("end")
+                                          : std::to_string(got - data)));
+        }
+    }
+
+    // Randomized inputs over a boundary-heavy alphabet, and every start
+    // offset inside each: boundaries land at every possible window offset
+    // including both edges.
+    std::mt19937 rng(0xC0FFEEu);
+    std::uniform_int_distribution<int> alphabet(0, 5);
+    std::uniform_int_distribution<std::size_t> length_dist(0, 300);
+    for (int trial = 0; trial != 20000; ++trial) {
+        const std::size_t length = length_dist(rng);
+        std::string text;
+        text.reserve(length);
+        for (std::size_t index = 0; index != length; ++index) {
+            static constexpr char tokens[6] = {'\n', '#', ' ', 'x', 'y', 'z'};
+            text.push_back(tokens[alphabet(rng)]);
+        }
+        const std::uint8_t *data =
+            reinterpret_cast<const std::uint8_t *>(text.data());
+        const std::uint8_t *end = data + text.size();
+        std::uniform_int_distribution<std::size_t> start_dist(0, text.size());
+        const std::size_t start = start_dist(rng);
+        const std::uint8_t *expect = next_region_reference(data + start, end);
+        const std::uint8_t *got = next_region(data + start, end);
+        require(expect == got,
+                "next_region random trial differs from the scalar reference: "
+                "trial=" + std::to_string(trial) + " length=" +
+                std::to_string(length) + " start=" + std::to_string(start));
+    }
+
+    std::cout << "codec_intern: next_region differential check PASS ("
+              << edges.size() << " edge inputs x all starts + 20000 random "
+              << "trials)\n";
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
     try {
         check_match_extend_simd();
         allocation_controls();
+        check_next_region_differential();
         const std::size_t committed_first = accounting_control_once();
         const std::size_t committed_second = accounting_control_once();
         require(committed_first == committed_second,
