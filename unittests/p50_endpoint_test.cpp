@@ -6642,32 +6642,48 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
     require(run.client->endpoint.next_rel_seq().value == 0,
             "K2 successor-deviation: reset did not rewind the rel_seq "
             "cursor");
-    // The next TX runs K=1-cold: a fresh full dance (STATE first, then
-    // HISTORY_RESET) on a new history nonce, exactly the K=1 cold path.
+    // The next TX runs K=1-cold against the SAME F (production keeps the
+    // f_guid across a poison reset; only the route history is fresh): a
+    // fresh full dance (STATE first, then HISTORY_RESET on a new nonce,
+    // then the TU), exactly the K=1 cold path.
     const std::vector<uint8_t> third =
         bytes("# 1 \"/tmp/k2-fixture.cc\"\ncold-tx\n");
     const PreparedTuHandle third_handle = admit(*run.client, third);
-    const P5coStoreGuids guids = p5co_store_guids(scenario.seed);
-    EndpointCaps third_caps;
-    third_caps.profile = ProfileId::P29V1;
-    third_caps.zstd.max_raw_bytes = 4U << 20;
-    third_caps.zstd.max_encoded_body_bytes = 4U << 20;
-    P50ServerEndpoint real_server(guids.f, third_caps);
-    const PairResult third_pair =
-        run_pair(*run.client, real_server, third_handle);
-    require(third_pair.client.status == ClientRunStatus::Committed,
+    asio::io_context third_context;
+    tcp::acceptor third_acceptor(third_context,
+                                 {asio::ip::address_v4::loopback(), 0});
+    TxBegin third_begin_wire;
+    std::vector<uint8_t> third_body_wire;
+    std::future<void> third_fake = asio::co_spawn(
+        third_context,
+        raw_parked_f_serve_connection(third_acceptor, run.fake.get(), false,
+                                      false, third_begin_wire,
+                                      third_body_wire),
+        asio::use_future);
+    std::future<ClientRunResult> third_result = asio::co_spawn(
+        third_context,
+        run.client->endpoint.run(third_acceptor.local_endpoint(),
+                                 third_handle, EndpointIoControl{}),
+        asio::use_future);
+    third_context.run();
+    const ClientRunResult third = third_result.get();
+    require(third.status == ClientRunStatus::Committed,
             std::string("K2 successor-deviation: the post-reset TX did not "
                         "run cold and commit (status=") +
-                std::to_string(
-                    static_cast<uint8_t>(third_pair.client.status)) +
+                std::to_string(static_cast<uint8_t>(third.status)) +
                 " reconnect=" +
-                std::to_string(
-                    static_cast<uint8_t>(third_pair.client.reconnect)) +
+                std::to_string(static_cast<uint8_t>(third.reconnect)) +
                 " terminal=" +
-                (third_pair.client.terminal_error.has_value()
-                     ? third_pair.client.terminal_error->detail
+                (third.terminal_error.has_value()
+                     ? third.terminal_error->detail
                      : std::string("<none>")) +
                 ")");
+    require(third_begin_wire.rel_seq.value == 0 &&
+                third_begin_wire.history_nonce.value !=
+                    run.head_begin.history_nonce.value,
+            "K2 successor-deviation: the cold TX did not run on a fresh "
+            "nonce at rel 0");
+    (void)third_fake;
 }
 
 // T4: head disconnect with a successor outstanding. Everything is torn down
