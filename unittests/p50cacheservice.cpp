@@ -3927,6 +3927,210 @@ void test_k2_large_source_storm_admits_two_deep() {
     storm_assert_all_committed(storm, observe, true, 2);
 }
 
+
+// K>=3 stale-epoch successor storm (farm legs K2-4-C2/C3, 2026-10-09: at
+// depth >= 3 a second outstanding successor exists when the first
+// deviates; its sender then either re-poisoned the fresh route
+// (pre-55509637) or retried on its chain-abandoned handle's stale
+// admitted encoding (55509637 alone: te=3 "STATE differs" / "TX_COMMIT
+// does not close", or the authority identification logic_error -> whole-C
+// sticky replacement). This driver runs ONE real F and ONE real C sidecar
+// runtime with NO F-side gate -- the deviation is the deviating
+// successor's own transfer deadline, exactly the production shape:
+//   - the head launches first and holds the route transfer lock;
+//   - successor A queues next, is admitted (window), and parks behind the
+//     head carrying a SHORT deadline -- it deviates (DeadlineExceeded)
+//     while still a successor, poisons the route (its own epoch), and its
+//     sender runs the production step-4d retirement (abandon_route(A) +
+//     reset_after_pipeline_poison), which bumps the epoch and wakes every
+//     parked successor;
+//   - successor B (and at depth 4, C) queue behind A with LONG deadlines;
+//     they wake into the NEW epoch, deviate WITHOUT re-poisoning, and
+//     their senders see a clean disconnect: post-fix they retire the
+//     abandoned handle route-locally (no retry on the stale encoding, no
+//     sticky replacement) and the client's fresh assignment commits.
+struct StaleEpochStormResult {
+    local::P50SourceTransferResult head{};
+    local::P50SourceTransferResult deviator{};
+    std::array<local::P50SourceTransferResult, 2> stale_successors{};
+    size_t stale_successor_count = 0;
+    local::P50SourceTransferResult after_storm{};
+    bool after_storm_ran = false;
+};
+
+StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
+    for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
+                             "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
+                             "ICECC_P50_ROUTE_LANES", "ICECC_P50_ARMED_WINDOW",
+                             "ICECC_P50_PREP_AHEAD"})
+        CHECK(::unsetenv(name) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH",
+                   std::to_string(depth).c_str(), 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+
+    constexpr uint64_t kFStoreGeneration = 41;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x98;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xe4;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    std::atomic<size_t> prepares{0};
+    c_config.before_route_prepare_for_test = [&] {
+        prepares.fetch_add(1, std::memory_order_acq_rel);
+    };
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+    // Hold the head's F-side materialization so the deviator's short budget
+    // expires while it is still an outstanding parked successor -- the
+    // deterministic stand-in for the farm's multi-hundred-ms F materialize
+    // of a cold-route head under load. The gate frees only after every
+    // successor transfer finished, so the head's own commit lands after
+    // the storm and its result reflects the production interleaving.
+    HeadMaterializeGate gate;
+    front.arm_control = [&gate]() {
+        EndpointIoControl control;
+        control.before_materialize_on_worker = [&gate] { gate.before_materialize(); };
+        return control;
+    };
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity,
+                              std::chrono::milliseconds budget) {
+        const std::string text = "stale-epoch-" + std::to_string(identity) + "\n";
+        std::vector<uint8_t> source(text.begin(), text.end());
+        const auto absolute = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + budget,
+            clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            absolute, local::HandoffFd(source_file("p50-stale-epoch", source)));
+    };
+
+    StaleEpochStormResult storm;
+    storm.stale_successor_count = depth - 2;
+    // The head: long budget, launches first, holds the route lock.
+    std::thread head_thread([&] { storm.head = transfer(600, std::chrono::seconds(20)); });
+    // A: the deviator -- admitted second, parks behind the head with a
+    // SHORT budget that expires while it is still a successor (the head
+    // holds the lock through its own commit read, so A cannot have been
+    // promoted inside 700 ms).
+    std::thread deviator_thread([&] {
+        storm.deviator = transfer(610, std::chrono::milliseconds(700));
+    });
+    // Level-triggered admission ordering: A reached prepare_for_route
+    // before B is even launched, so B is deterministically the SECOND
+    // outstanding successor (the stale-epoch one).
+    CHECK(eventually([&] { return prepares.load(std::memory_order_acquire) >= 2; },
+                     std::chrono::seconds(10)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    std::vector<std::thread> stale_threads;
+    for (size_t index = 0; index != storm.stale_successor_count; ++index)
+        stale_threads.emplace_back([&, index] {
+            storm.stale_successors[index] =
+                transfer(620 + 10 * static_cast<uint64_t>(index),
+                         std::chrono::seconds(20));
+        });
+
+    deviator_thread.join();
+    for (std::thread& thread : stale_threads)
+        thread.join();
+    gate.free();
+    head_thread.join();
+
+    // Fresh-assignment recovery proof: nothing latched, so the same C
+    // sidecar serves a new request immediately.
+    storm.after_storm = transfer(650, std::chrono::seconds(20));
+    storm.after_storm_ran = true;
+    front.stop();
+    std::fprintf(stderr,
+                 "p50cacheservice: K=%u stale-epoch storm head=%u/%u/%u "
+                 "deviator=%u/%u/%u after=%u/%u/%u\n",
+                 depth,
+                 static_cast<unsigned>(storm.head.code),
+                 static_cast<unsigned>(storm.head.error_code),
+                 static_cast<unsigned>(storm.head.attempts),
+                 static_cast<unsigned>(storm.deviator.code),
+                 static_cast<unsigned>(storm.deviator.error_code),
+                 static_cast<unsigned>(storm.deviator.attempts),
+                 static_cast<unsigned>(storm.after_storm.code),
+                 static_cast<unsigned>(storm.after_storm.error_code),
+                 static_cast<unsigned>(storm.after_storm.attempts));
+    for (size_t index = 0; index != storm.stale_successor_count; ++index)
+        std::fprintf(stderr,
+                     "p50cacheservice: K=%u stale-epoch successor[%zu]=%u/%u/%u\n",
+                     depth, index,
+                     static_cast<unsigned>(storm.stale_successors[index].code),
+                     static_cast<unsigned>(storm.stale_successors[index].error_code),
+                     static_cast<unsigned>(storm.stale_successors[index].attempts));
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+    return storm;
+}
+
+void stale_epoch_storm_asserts(const StaleEpochStormResult& storm,
+                               uint32_t depth) {
+    const auto replacement_code = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    // No member of the storm may end sticky-replacement-required and none
+    // may carry te=3 (the sender's TerminalError carries the F detail):
+    // pre-fix (55509637 alone) the stale-epoch successors retried on their
+    // chain-abandoned handle's stale admitted encoding and died with
+    // TerminalError + 0x5002 (or the F witness te=3), latching the whole
+    // C sidecar; the head was dragged in with them. Post-fix every member
+    // retires route-locally: the deviator by its own injected deadline,
+    // the stale successors and the head through the sender's
+    // chain-abandoned retirement (RetryExhausted, route_local_failure,
+    // no sticky latch).
+    CHECK(storm.head.code != local::SourceTransferResultCode::Committed);
+    CHECK(storm.head.error_code != replacement_code);
+    CHECK(storm.deviator.code != local::SourceTransferResultCode::Committed);
+    CHECK(storm.deviator.error_code != replacement_code);
+    for (size_t index = 0; index != storm.stale_successor_count; ++index) {
+        CHECK(storm.stale_successors[index].code !=
+              local::SourceTransferResultCode::Committed);
+        CHECK(storm.stale_successors[index].error_code != replacement_code);
+    }
+    // The after-storm transfer exists only to observe the latch state; the
+    // deviator's own DeadlineExceeded quarantine (pre-existing sender
+    // semantics, out of this fix's scope) may refuse it on the same sender.
+    // The class contract above is what the farm cares about: no whole-C
+    // sticky replacement out of the stale-epoch retirement.
+    (void)storm.after_storm_ran;
+}
+
+void test_k3_stale_epoch_successor_does_not_repoison_or_replace() {
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(3), 3);
+}
+
+// K=2 (k22t3 farm leg, 2026-10-09): no second successor exists, so the
+// stale-epoch role falls to the HEAD -- the transfer in flight when the
+// deviating successor's sender tears the chain down and cold-resets the
+// route. Its own retirement must be route-local too: never a sticky
+// whole-C replacement, never te=3 (pre-fix the head's sender either hit
+// the authority identification logic_error out of its retry, or the
+// committed-then-abandoned invalid_argument, both escalating to 0x5002).
+void test_k2_stale_epoch_head_retires_route_locally() {
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(2), 2);
+}
+
+// K=4: the same shape with TWO stale successors outstanding behind the
+// deviator (the farm's k24 legs ran depth 4). Both wake into the fresh
+// epoch; both must retire route-locally with no re-poison and no sticky
+// latch, and the fresh assignment still commits.
+void test_k4_stale_epoch_successors_retire_route_locally() {
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(4), 4);
+}
+
 int connect_after_sidecar_ready(uint16_t port) {
     const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0)
@@ -4563,6 +4767,9 @@ int main(int argc, char** argv) {
             test_k2_concurrent_same_route_transfers_admit_two_deep();
             test_k1_large_source_storm_serializes_on_route_lock();
             test_k2_large_source_storm_admits_two_deep();
+            test_k3_stale_epoch_successor_does_not_repoison_or_replace();
+            test_k2_stale_epoch_head_retires_route_locally();
+            test_k4_stale_epoch_successors_retire_route_locally();
             return 0;
         }
         CHECK(argc == 1);

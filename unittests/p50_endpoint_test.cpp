@@ -8719,6 +8719,164 @@ void test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap() {
     run_prepark_triple(plan);
 }
 
+// Committed-then-poisoned sender regression (55509637's committed-entry
+// branch; the farm's 1x "prepared-TU handle is not active P29V1"): a TX
+// whose run returned COMMITTED while ANOTHER TX's deviation had already
+// set the endpoint's pipeline poison. Its sender then runs the production
+// step-4d retirement -- has_pipeline_poison() -> abandon_route(its own
+// committed handle) -> reset_after_pipeline_poison() -- exactly as
+// transfer_bytes does, in that order. Pre-fix abandon_route rejected a
+// committed handle outright (std::invalid_argument), which the sender's
+// catch-all escalated to TerminalError + replacement_required -> sticky
+// whole-C sidecar replacement. Post-fix the committed entry's own
+// nothing-to-abandon case instead tears the remaining outstanding chain
+// down uniformly (the poison has already invalidated it), the cold reset
+// lands, and the next TX commits through the ordinary dance.
+//
+// Deterministic shape: a depth-2 P29V1 client against a real F. The head
+// is gated at F's materialize (its FILL on the wire); a successor is
+// admitted on the head's write-complete and its successor run is pointed
+// at a DEAD port -- the connect refusal deviates it on the successor path
+// (same epoch, so it poisons: the poison flag is set and NOBODY resets it
+// yet, because the test IS the sender and delays both senders' step-4d
+// until both runs returned). The gate then frees; the head commits. Now
+// the head's handle is committed and the endpoint is poisoned -- the
+// exact committed-then-poisoned sender state.
+void test_p29v1_committed_sender_abandons_chain_under_foreign_poison() {
+    const P5coStoreGuids guids = p5co_store_guids(253);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    P50ServerEndpoint server(guids.f, caps);
+
+    std::promise<void> release_materialize;
+    std::future<void> materialize_gate = release_materialize.get_future();
+    EndpointIoControl head_server_control;
+    head_server_control.before_materialize_on_worker = [&materialize_gate]() {
+        materialize_gate.wait();
+    };
+
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> head_server = asio::co_spawn(
+        context, server.accept_one(acceptor, head_server_control),
+        asio::use_future);
+    // No second server session: the successor run below connects to a
+    // dead port on purpose (its connect refusal is the deviation), so a
+    // second accept_one would never complete and hang the leg.
+
+    // A dead loopback port for the successor's connect refusal.
+    tcp::acceptor dead_listener(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint dead = dead_listener.local_endpoint();
+    dead_listener.close();
+
+    const std::vector<uint8_t> head_input =
+        bytes("# 1 \"/tmp/committed-poison.cc\"\nshared-head\nhead-line\n");
+    const std::vector<uint8_t> successor_input =
+        bytes("# 1 \"/tmp/committed-poison.cc\"\nshared-head\nsuccessor-line\n");
+    const PreparedTuHandle head_handle = admit(client, head_input);
+    const PreparedTuHandle head_handle_sender_copy = head_handle;
+
+    std::atomic<bool> dispatched{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    std::optional<PreparedTuHandle> successor_handle;
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        if (dispatched.exchange(true))
+            return;
+        asio::post(context, [&]() {
+            successor_handle = admit(client, successor_input);
+            // The successor run's own socket is the dead port: its connect
+            // refusal deviates it on the successor path (same epoch) and
+            // poisons the pipeline. Nothing resets the flag until the
+            // test's sender-mirror below.
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(
+                    dead, *successor_handle, EndpointIoControl{},
+                    std::chrono::steady_clock::now() +
+                        std::chrono::seconds(10)),
+                asio::use_future));
+        });
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, head_control),
+        asio::use_future);
+
+    // Wait for the successor's deviation (poison set), then free the head's
+    // materialize so the head commits UNDER that poison: both sender-mirror
+    // steps below then observe exactly the committed-then-poisoned state.
+    while (!successor_result.has_value() ||
+           successor_result->wait_for(std::chrono::seconds(0)) !=
+               std::future_status::ready) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!context.stopped())
+            context.poll();
+    }
+    release_materialize.set_value();
+    while (head_result.wait_for(std::chrono::seconds(0)) !=
+           std::future_status::ready) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!context.stopped())
+            context.poll();
+    }
+    // Poll the head's server session to completion as well; context.run()
+    // would hang (the acceptor stays armed and the successor's dead-port
+    // run never contributes a connection to it).
+    while (head_server.wait_for(std::chrono::seconds(0)) !=
+           std::future_status::ready) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!context.stopped())
+            context.poll();
+    }
+    const ClientRunResult head = head_result.get();
+    const ClientRunResult successor = successor_result->get();
+    require(head.status == ClientRunStatus::Committed,
+            "committed-then-poisoned: the healthy gated head did not commit");
+    require(successor.status != ClientRunStatus::Committed,
+            "committed-then-poisoned: the dead-port successor committed");
+    require(client.endpoint.has_pipeline_poison(),
+            "committed-then-poisoned: the successor deviation did not "
+            "poison the pipeline");
+
+    // The head's sender step-4d, exactly the transfer_bytes order.
+    try {
+        client.authority->abandon_route(head_handle_sender_copy);
+    } catch (const std::exception& error) {
+        require(false,
+                std::string("committed-then-poisoned: a committed TX's "
+                            "sender could not retire its route under "
+                            "another TX's poison (pre-fix this threw: ") +
+                    error.what() + ")");
+    }
+    client.endpoint.reset_after_pipeline_poison();
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.pipeline_epoch_for_test() >= 1 &&
+                client.endpoint.next_rel_seq().value == 0,
+            "committed-then-poisoned: the cold reset did not land");
+    // The successor's sender mirror runs AFTER the head's: the flag is
+    // already cleared, so its own step-4d sees no poison and abandons
+    // nothing (its entry was torn down with the chain).
+    require(!client.endpoint.has_pipeline_poison(),
+            "committed-then-poisoned: poison re-armed after the reset");
+
+    // The next TX after the cold reset commits through the ordinary dance.
+    const std::vector<uint8_t> next_input =
+        bytes("# 1 \"/tmp/committed-poison.cc\"\nshared-head\npost-reset-line\n");
+    const PairResult next_pair = run_pair(client, server, admit(client, next_input));
+    require(next_pair.client.status == ClientRunStatus::Committed &&
+                next_pair.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) == next_input,
+            "committed-then-poisoned: the next TX after the route reset did "
+            "not commit");
+}
+
 // Large-TU regression (farm bug fixed in 54158e17): the pre-park drain
 // ceiling used to be checked BEFORE the first-frame decision. A single
 // drain carrying the successor's TX_BEGIN plus several MB of its BODY (one
@@ -10507,6 +10665,7 @@ int main(int argc, char** argv) {
         test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
         test_route_pipeline_prepark_k3_storm_two_begin_unknown_release();
         test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap();
+        test_p29v1_committed_sender_abandons_chain_under_foreign_poison();
         test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
         std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
@@ -10585,6 +10744,7 @@ int main(int argc, char** argv) {
     test_route_pipeline_prepark_k3_collision_re_arms_on_busy_release();
     test_route_pipeline_prepark_k3_storm_two_begin_unknown_release();
     test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap();
+    test_p29v1_committed_sender_abandons_chain_under_foreign_poison();
     test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
