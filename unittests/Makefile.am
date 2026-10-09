@@ -21,6 +21,7 @@ TESTS += p50sidecarlifecycle p50sidecarlifecycle-source.sh p50sidecarlifecycle-m
 TESTS += p50connectionprovenance
 TESTS += p50platformcompat
 TESTS += p50lifecycletimeoutoverride
+TESTS += p50sidecarlifecycleapplyoverride
 TESTS += p50syscallshim-source.sh
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
@@ -237,6 +238,7 @@ check_PROGRAMS += p50compilerquiescence
 check_PROGRAMS += p50connectionprovenance
 check_PROGRAMS += p50platformcompat
 check_PROGRAMS += p50lifecycletimeoutoverride
+check_PROGRAMS += p50sidecarlifecycleapplyoverride
 check_PROGRAMS += p50profile
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
@@ -518,6 +520,10 @@ p50lifecycletimeoutoverride_SOURCES = p50_lifecycle_timeout_override_test.cpp \
 	../daemon/p50_lifecycle_timeout_override.cpp
 p50lifecycletimeoutoverride_CPPFLAGS = $(AM_CPPFLAGS)
 p50lifecycletimeoutoverride_LDADD = ../services/libicecc.la
+p50sidecarlifecycleapplyoverride_SOURCES = p50_sidecar_lifecycle_apply_override_test.cpp \
+	../cache/p50_sidecar_lifecycle_apply_override.cpp
+p50sidecarlifecycleapplyoverride_CPPFLAGS = $(AM_CPPFLAGS)
+p50sidecarlifecycleapplyoverride_LDADD = ../services/libicecc.la
 p50sourcearm_SOURCES = p50_source_arm_wait_test.cpp \
 	../cache/p50_source_identity.cpp ../cache/p50_input_wait.cpp
 p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache
@@ -557,6 +563,7 @@ p50s2restartreplay_LDADD = libp50reference.a ../cache/libp50sidecar.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la
 p50cacheservice_SOURCES = p50cacheservice.cpp ../cache/p50_cache_service.cpp \
+	../cache/p50_sidecar_lifecycle_apply_override.cpp \
 	../client/p50_route_owner.cpp ../client/p50_zstd_sender.cpp
 p50cacheservice_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS) \
 	-DICECC_P50_CACHE_SERVICE_NO_MAIN -DICECC_P50_ENDPOINT_TEST_HOOKS

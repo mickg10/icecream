@@ -1,6 +1,7 @@
 #include "p50_cache_service.h"
 #include "p50_control_operation.h"
 #include "p50_input_fd_attachment.h"
+#include "p50_sidecar_lifecycle_apply_override.h"
 #include "services/comm.h"
 
 #include <algorithm>
@@ -1551,6 +1552,13 @@ bool handle_connection(local::Connection connection, const Options& options,
             return true;
         }
 
+        // Marks the moment the request envelope finished decoding. Used
+        // below (non-retirement InputLifecycle actions only) as the start
+        // point for the sidecar-local apply/response/ack budget -- distinct
+        // from, and later than, the pre-decode kHandshakeMilliseconds
+        // envelope-receive deadline captured in `deadline` above.
+        const auto decode_time = std::chrono::steady_clock::now();
+
         if (operation.kind == local::ControlOperationKind::CacheSession) {
             /*
              * Complete the authenticated one-shot public-descriptor handoff,
@@ -1783,8 +1791,20 @@ bool handle_connection(local::Connection connection, const Options& options,
         if (operation.kind != local::ControlOperationKind::InputLifecycle)
             return true;
         if (operation.lifecycle_result.has_value() ||
-            queued_control_data(connection.native_handle()))
+            queued_control_data(connection.native_handle())) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=duplicate-or-queued "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=0 "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(operation.lifecycle_action),
+                         static_cast<unsigned long long>(operation.request_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - decode_time).count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return true;
+        }
         InputLifecycleRequest request;
         request.identity = options.identity;
         request.key = *operation.input;
@@ -1810,45 +1830,147 @@ bool handle_connection(local::Connection connection, const Options& options,
                 !operation.absolute_deadline.matches_clock(clock_identity) ||
                 operation.absolute_deadline.expired(
                     now_ns, clock_identity.clock_domain_id,
-                    clock_identity.time_namespace_id))
+                    clock_identity.time_namespace_id)) {
+                std::fprintf(stderr,
+                             "P50_INPUT_LIFECYCLE_REFUSED stage=retirement-deadline "
+                             "action=%u operation=%llu elapsed_ns=%lld budget_ms=0 "
+                             "wall_clock_ns=%llu\n",
+                             static_cast<unsigned>(request.action),
+                             static_cast<unsigned long long>(request.operation_id),
+                             static_cast<long long>(std::chrono::duration_cast<
+                                 std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - decode_time).count()),
+                             static_cast<unsigned long long>(wall_clock_ns_now()));
+                std::fflush(stderr);
                 return true;
+            }
             // Preserve the exact wire value.  This conversion is only a
             // local representation of the same CLOCK_MONOTONIC nanoseconds;
             // no receive-time-plus-duration deadline is reconstructed.
             request.absolute_deadline = operation.absolute_deadline;
             request.deadline = operation.absolute_deadline.as_steady_time_point();
         } else {
-            request.deadline = deadline;
+            // Non-retirement lifecycle actions (e.g. CloseAcceptedJob) carry
+            // no daemon-supplied absolute_deadline on the wire -- that is
+            // only ever sent for the three retirement actions above. The
+            // daemon's own budget for these ops is
+            // config_.input_lifecycle_timeout (default 5000ms; see
+            // daemon/main.cpp / daemon/p50_lifecycle_timeout_override.h),
+            // but it is never sent down for anything but retirement. Before
+            // this fix, these ops inherited `deadline` -- the pre-decode
+            // kHandshakeMilliseconds=500ms handshake budget for receiving
+            // the still-undecoded envelope -- which is correct for that
+            // receive but far too tight once decode has already happened
+            // and the owner still has to run apply_input_lifecycle_on_owner,
+            // encode the reply, send it, and read back the ACK. Under load
+            // an owner apply landing a few ms past the 500ms mark caused
+            // handle_connection to return true with no reply at all; the
+            // daemon reads that as EOF (status=Disconnected), which is
+            // relationship-fatal with no retry (see
+            // p50_daemon_sidecar_adapter.cpp), retiring the whole F sidecar
+            // for one slow non-retirement reply.
+            //
+            // Fix: measure a separate, sidecar-local budget from
+            // decode_time, sized by
+            // options.sidecar_lifecycle_apply_budget (resolved once at
+            // process startup in run() from
+            // ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS, default 5000ms to match
+            // the daemon's own default for these ops). Purely sidecar-local:
+            // nothing on the wire changes, and retirement actions above are
+            // untouched.
+            request.deadline = decode_time + options.sidecar_lifecycle_apply_budget;
         }
         // Once the operation envelope has been decoded, every retirement
         // phase uses that same absolute deadline for apply, response, and
         // final ACK.  The pre-decode handshake budget above is only the
         // bounded envelope receive; it cannot renew the retirement budget.
+        // Non-retirement phases use the sidecar-local budget computed above
+        // (request.deadline), not the handshake deadline.
         const auto operation_deadline = retirement
             ? operation.absolute_deadline.as_steady_time_point()
-            : deadline;
+            : request.deadline;
         const std::optional<InputLifecycleApplyStatus> result =
             runtime.apply_input_lifecycle_on_owner(request, operation_deadline);
-        if (!result.has_value())
+        if (!result.has_value()) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=owner-apply-refused "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(request.action),
+                         static_cast<unsigned long long>(request.operation_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - decode_time).count()),
+                         static_cast<long long>(retirement
+                             ? 0
+                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return true;
+        }
         const std::vector<uint8_t> response_payload =
             local::encode_control_operation(
                 local::make_input_lifecycle_reply_operation(request, *result));
-        if (response_payload.empty())
+        if (response_payload.empty()) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=encode "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(request.action),
+                         static_cast<unsigned long long>(request.operation_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - decode_time).count()),
+                         static_cast<long long>(retirement
+                             ? 0
+                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return true;
+        }
         const local::Frame response{local::kProtocolVersion,
                                     local::MessageType::Data,
                                     options.identity, response_payload};
-        if (connection.send_until(response, operation_deadline) != local::Status::Ok)
+        if (connection.send_until(response, operation_deadline) != local::Status::Ok) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=send "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(request.action),
+                         static_cast<unsigned long long>(request.operation_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - decode_time).count()),
+                         static_cast<long long>(retirement
+                             ? 0
+                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return true;
+        }
         local::Frame acknowledgement;
         if (connection.receive_until(acknowledgement, operation_deadline) !=
                 local::Status::Ok ||
             acknowledgement.type != local::MessageType::Goodbye ||
             !acknowledgement.payload.empty() ||
             local::validate_identity(acknowledgement, options.identity) !=
-                local::Status::Ok)
+                local::Status::Ok) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=ack "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(request.action),
+                         static_cast<unsigned long long>(request.operation_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - decode_time).count()),
+                         static_cast<long long>(retirement
+                             ? 0
+                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return true;
+        }
         return true;
     } catch (...) {
         return true;
@@ -3421,8 +3543,28 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
     InputLifecycleRequest request,
     std::chrono::steady_clock::time_point deadline) noexcept {
     if (stop_requested_.load(std::memory_order_acquire) ||
-        std::chrono::steady_clock::now() >= deadline)
+        std::chrono::steady_clock::now() >= deadline) {
+        // This is the boundary the sidecar input-lifecycle retirement
+        // investigation traced the daemon-visible EOF/Disconnected cascade
+        // back to: a nullopt here makes handle_connection's call site
+        // return true with no reply sent at all. The deliberately specific
+        // stage name (owner-apply-deadline) distinguishes "the deadline
+        // already elapsed before we even tried to post to the owner" from
+        // the two other nullopt causes below (post() throwing, and the
+        // owner simply taking longer than the deadline to finish).
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr,
+                     "P50_INPUT_LIFECYCLE_REFUSED stage=owner-apply-deadline "
+                     "action=%u operation=%llu elapsed_ns=%lld budget_ms=0 "
+                     "wall_clock_ns=%llu\n",
+                     static_cast<unsigned>(request.action),
+                     static_cast<unsigned long long>(request.operation_id),
+                     static_cast<long long>(std::chrono::duration_cast<
+                         std::chrono::nanoseconds>(now - deadline).count()),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
+        std::fflush(stderr);
         return std::nullopt;
+    }
     auto completion =
         std::make_shared<std::promise<InputLifecycleApplyStatus>>();
     std::future<InputLifecycleApplyStatus> result = completion->get_future();
@@ -3430,6 +3572,17 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
     try {
         asio::post(context_, [this, request, completion, post_time] {
             const auto owner_start = std::chrono::steady_clock::now();
+#ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
+            // Test-only seam: lets a test exercise the sidecar-local
+            // apply/response/ack budget (Options::sidecar_lifecycle_apply_budget)
+            // against a deliberately slow owner, without needing a real
+            // contended F. Zero (the production default) sleeps for zero
+            // time, i.e. this is a no-op in production.
+            if (config_.input_lifecycle_owner_apply_stall_for_test >
+                std::chrono::milliseconds::zero())
+                std::this_thread::sleep_for(
+                    config_.input_lifecycle_owner_apply_stall_for_test);
+#endif
             const auto emit_op_trace = [this, &request, owner_start, post_time](
                                             InputLifecycleApplyStatus status) {
                 if (!owner_lag_trace_enabled_)
@@ -3519,13 +3672,40 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
             completion->set_value(status);
         });
     } catch (...) {
+        std::fprintf(stderr,
+                     "P50_INPUT_LIFECYCLE_REFUSED stage=owner-post-exception "
+                     "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                     "wall_clock_ns=%llu\n",
+                     static_cast<unsigned>(request.action),
+                     static_cast<unsigned long long>(request.operation_id),
+                     static_cast<long long>(std::chrono::duration_cast<
+                         std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - post_time).count()),
+                     static_cast<long long>(std::chrono::duration_cast<
+                         std::chrono::milliseconds>(deadline - post_time).count()),
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
+        std::fflush(stderr);
         return std::nullopt;
     }
     while (result.wait_for(std::chrono::milliseconds(2)) !=
            std::future_status::ready) {
         if (stop_requested_.load(std::memory_order_acquire) ||
-            std::chrono::steady_clock::now() >= deadline)
+            std::chrono::steady_clock::now() >= deadline) {
+            std::fprintf(stderr,
+                         "P50_INPUT_LIFECYCLE_REFUSED stage=owner-apply-wait "
+                         "action=%u operation=%llu elapsed_ns=%lld budget_ms=%lld "
+                         "wall_clock_ns=%llu\n",
+                         static_cast<unsigned>(request.action),
+                         static_cast<unsigned long long>(request.operation_id),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - post_time).count()),
+                         static_cast<long long>(std::chrono::duration_cast<
+                             std::chrono::milliseconds>(deadline - post_time).count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
             return std::nullopt;
+        }
     }
     return result.get();
 }
@@ -4004,6 +4184,34 @@ int run(const Options& options) noexcept {
                  static_cast<long long>(::getpid()),
                  static_cast<unsigned long long>(wall_clock_ns_now()));
     std::fflush(stderr);
+
+    // Resolved exactly once at process startup, never re-read per-connection
+    // or per-request. See p50_sidecar_lifecycle_apply_override.h and the
+    // Options::sidecar_lifecycle_apply_budget comment for why this exists
+    // and why it is distinct from kHandshakeMilliseconds.
+    {
+        const auto resolved =
+            icecc::p50::service_diag::resolve_sidecar_lifecycle_apply_override(
+                ::getenv("ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS"),
+                effective_options.sidecar_lifecycle_apply_budget);
+        effective_options.sidecar_lifecycle_apply_budget = resolved.effective_value;
+        if (resolved.override_rejected) {
+            std::fprintf(stderr, "P50_SIDECAR_LIFECYCLE_APPLY_BUDGET_REJECTED reason=%s "
+                         "effective_ms=%lld wall_clock_ns=%llu\n",
+                         resolved.rejection_reason.c_str(),
+                         static_cast<long long>(
+                             effective_options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<unsigned long long>(wall_clock_ns_now()));
+            std::fflush(stderr);
+        }
+        std::fprintf(stderr, "P50_SIDECAR_LIFECYCLE_APPLY_BUDGET effective_ms=%lld "
+                     "override_applied=%d wall_clock_ns=%llu\n",
+                     static_cast<long long>(
+                         effective_options.sidecar_lifecycle_apply_budget.count()),
+                     resolved.override_applied ? 1 : 0,
+                     static_cast<unsigned long long>(wall_clock_ns_now()));
+        std::fflush(stderr);
+    }
 
     local::Status listen_status = local::Status::Ok;
     OwnedFd listener_owner;
