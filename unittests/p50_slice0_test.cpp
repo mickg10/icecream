@@ -611,8 +611,8 @@ void test_action_trace_jsonl_fields_additive() {
     require(fielded_json.find("\"queue_position\":1") != std::string::npos &&
                 fielded_json.find("\"queue_depth\":2") != std::string::npos,
             "K>1 action record omitted its queue fields");
-    require(fielded_json.find(",\"queue_position\":1,\"queue_depth\":2}") ==
-                std::string::npos,
+    require(fielded_json.ends_with(
+                ",\"stage_bytes\":0,\"queue_position\":1,\"queue_depth\":2}"),
             "queue fields did not append at the end of the object");
 }
 
