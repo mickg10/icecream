@@ -7018,26 +7018,30 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     const P5coStoreGuids guids = p5co_store_guids(245);
     EndpointCaps caps;
     caps.profile = ProfileId::P29V1;
-    caps.zstd.max_raw_bytes = 32U << 20;
-    caps.zstd.max_encoded_body_bytes = 32U << 20;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
     PreparationAuthorityLimits limits;
     limits.route_pipeline_depth = 2;
-    limits.max_interner_reserved_bytes = UINT64_C(4294967296);
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
     TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
     auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
     const tcp::endpoint remote = acceptor.local_endpoint();
 
-    // A source with more distinct regions than the early-FILL bound
-    // (4096): the successor's NEED could outgrow a socket buffer, so the
-    // dispatch must keep it on the head path.
-    std::vector<uint8_t> huge;
-    for (uint32_t index = 0; index < 700000; ++index) {
-        const std::string line =
-            "unique-source-line-" + std::to_string(index) + "\n";
-        huge.insert(huge.end(), line.begin(), line.end());
-    }
+    // Force the early-FILL admission bound to zero for this test only:
+    // the fallback under test is "NEED could outgrow the bound -> stay on
+    // the head path", and the bound is a plain admission number, so driving
+    // it to 0 exercises the path deterministically instead of depending on
+    // interner region shapes (a real production TU is bounded by the same
+    // number on both the dispatch probe and the eager FILL itself).
+    require(::setenv("ICECC_P50_EARLY_NEED_REGION_BOUND", "0", 1) == 0,
+            "T7: could not lower the early-FILL bound");
+    const struct BoundRestore {
+        ~BoundRestore() { ::unsetenv("ICECC_P50_EARLY_NEED_REGION_BOUND"); }
+    } bound_restore;
+    const std::vector<uint8_t> huge = bytes(
+        "# 1 \"/tmp/k2-t7-big.cc\"\nunique-fallback-source\n");
     const std::vector<uint8_t> small = bytes("# 1 \"/tmp/k2-t7.cc\"\nsmall\n");
     const PreparedTuHandle head_handle = admit(client, small);
 

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <deque>
 #include <fcntl.h>
 #include <limits>
@@ -38,6 +39,23 @@
 
 namespace icecc::p50 {
 namespace {
+
+// Early-FILL admission bound (P50_ROUTE_PIPELINING.md section 1.1 errata
+// item 4): a would-be successor whose NEED could list more than this many
+// missing regions must not open a successor dialogue (the NEED could
+// outgrow a socket buffer); it waits for the window to empty and runs the
+// unchanged head path instead. 4096 is the production value (~20 KiB NEED);
+// ICECC_P50_EARLY_NEED_REGION_BOUND exists only so the unit test for that
+// fallback (T7) can force the boundary deterministically instead of
+// depending on interner region shapes. Read once per process.
+size_t early_need_region_bound() noexcept {
+    // Read per call (never cached): the unit test flips it between suites.
+    const char* raw = ::getenv("ICECC_P50_EARLY_NEED_REGION_BOUND");
+    if (raw == nullptr || *raw == '\0')
+        return size_t{4096};
+    const long parsed = ::atol(raw);
+    return parsed < 0 ? size_t{4096} : static_cast<size_t>(parsed);
+}
 
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
@@ -1318,15 +1336,14 @@ P50PreparationAuthority::fill_p29v1_before_need(PreparedTuHandle handle) {
     // C reads nothing until FILL is written, so F's STATE and NEED must fit
     // in C's receive buffer: a NEED inner stream is at most 20 + 5 bytes per
     // missing Region, i.e. about 20 KiB here.
-    constexpr size_t kMaxEarlyNeedRegions = 4096;
-    return p29v1_successor(handle).fill_v1_before_need(kMaxEarlyNeedRegions);
+    return p29v1_successor(handle).fill_v1_before_need(
+        early_need_region_bound());
 }
 
 bool P50PreparationAuthority::p29v1_fill_before_need_possible(
     PreparedTuHandle handle) {
-    constexpr size_t kMaxEarlyNeedRegions = 4096;
     return p29v1_successor(handle).fill_before_need_possible(
-        kMaxEarlyNeedRegions);
+        early_need_region_bound());
 }
 
 void P50PreparationAuthority::confirm_p29v1_need(
