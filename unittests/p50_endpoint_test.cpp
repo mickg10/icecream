@@ -6466,23 +6466,31 @@ void k2_drive(const K2PipelineScenario& scenario, K2PipelineRunResult& out) {
     EndpointIoControl head_control;
     std::atomic<bool> head_write_complete_fired{false};
     head_control.write_complete = [&]() {
+        // Production (client/p50_zstd_sender.cpp + p50_cache_service.cpp)
+        // only RELEASES the route transfer lock here; TX n+1's transfer
+        // then prepares and runs in its OWN coroutine on the owner. The
+        // test models exactly that: never admit (prepare) inline from
+        // inside the head's dialogue -- post the successor transfer.
         if (head_write_complete_fired.exchange(true))
             return;
-        // The head predict-committed (Site B) immediately before this fired:
-        // the successor's prepare_for_route now sees the head's
-        // predicted_post_digest, exactly the production lock ordering.
-        out.successor_handle = admit(*client, tu2);
-        const PreparedTuHandle succ_handle = out.successor_handle;
-        successor_result.emplace(asio::co_spawn(
-            context,
-            client->endpoint.run(
-                remote, succ_handle, EndpointIoControl{},
-                scenario.has_successor_deadline
-                    ? std::optional<std::chrono::steady_clock::time_point>(
-                          scenario.successor_deadline)
-                    : std::nullopt),
-            asio::use_future));
-        successor_spawned.set_value();
+        asio::post(context, [&]() {
+            // The head predict-committed (Site B) immediately before this
+            // post landed: the successor's prepare_for_route sees the
+            // head's predicted_post_digest, exactly the production lock
+            // ordering.
+            out.successor_handle = admit(*client, tu2);
+            const PreparedTuHandle succ_handle = out.successor_handle;
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client->endpoint.run(
+                    remote, succ_handle, EndpointIoControl{},
+                    scenario.has_successor_deadline
+                        ? std::optional<std::chrono::steady_clock::time_point>(
+                              scenario.successor_deadline)
+                        : std::nullopt),
+                asio::use_future));
+            successor_spawned.set_value();
+        });
     };
 
     TxBegin head_begin_capture;
@@ -6799,14 +6807,17 @@ void test_p29v1_k2_pipeline_successor_io_death_poisons_route() {
     PreparedTuHandle successor_handle;
     EndpointIoControl head_control;
     head_control.write_complete = [&]() {
+        // Post, never prepare inline: same rule as the k2 driver.
         if (head_write_complete_fired.exchange(true))
             return;
-        successor_handle = admit(client, tu2);
-        successor_result.emplace(asio::co_spawn(
-            context,
-            client.endpoint.run(remote, successor_handle, EndpointIoControl{},
-                                std::nullopt),
-            asio::use_future));
+        asio::post(context, [&]() {
+            successor_handle = admit(client, tu2);
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(remote, successor_handle,
+                                    EndpointIoControl{}, std::nullopt),
+                asio::use_future));
+        });
     };
     std::future<ClientRunResult> head_result = asio::co_spawn(
         context, client.endpoint.run(remote, head_handle, head_control),
@@ -6951,16 +6962,19 @@ void test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head() {
     std::atomic<bool> eager_fill_possible{true};
     EndpointIoControl head_control;
     head_control.write_complete = [&]() {
+        // Post, never prepare inline: same rule as the k2 driver.
         if (head_write_complete_fired.exchange(true))
             return;
-        const PreparedTuHandle succ_handle = admit(client, huge);
-        eager_fill_possible.store(
-            client.authority->p29v1_fill_before_need_possible(succ_handle));
-        successor_result.emplace(asio::co_spawn(
-            context,
-            client.endpoint.run(remote, succ_handle, EndpointIoControl{},
-                                std::nullopt),
-            asio::use_future));
+        asio::post(context, [&]() {
+            const PreparedTuHandle succ_handle = admit(client, huge);
+            eager_fill_possible.store(
+                client.authority->p29v1_fill_before_need_possible(succ_handle));
+            successor_result.emplace(asio::co_spawn(
+                context,
+                client.endpoint.run(remote, succ_handle, EndpointIoControl{},
+                                    std::nullopt),
+                asio::use_future));
+        });
     };
     std::future<ClientRunResult> head_result = asio::co_spawn(
         context, client.endpoint.run(remote, head_handle, head_control),

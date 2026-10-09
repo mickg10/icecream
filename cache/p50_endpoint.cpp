@@ -4247,10 +4247,13 @@ P50ClientEndpoint::run_connected_successor(
     const RelSeq own_rel = begin.rel_seq;
     const RelSeq predecessor_rel{own_rel.value - 1};
     const uint64_t epoch_at_open = impl_->pipeline_epoch;
-    if (begin.pre_state_digest != impl_->state)
-        throw std::logic_error(
-            "successor TX_BEGIN pre-state differs from the confirmed route "
-            "state at dispatch");
+    // NOTE: deliberately no dispatch-time comparison of begin.pre_state_digest
+    // against impl_->state -- while the head is outstanding, impl_->state is
+    // the head's PRE-state and this TX's pre_state_digest is the PREDICTED
+    // post-state of the head; they differ by construction. The witness is
+    // validated later, against this TX's own STATE frame, after the head
+    // retires (and the promotion-path fallback keeps its own
+    // pre_state_digest == impl_->state check, which does hold there).
     const auto clear_slot = [this, own_rel]() {
         const auto position = std::find_if(
             impl_->successors.begin(), impl_->successors.end(),

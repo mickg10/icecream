@@ -216,6 +216,12 @@ struct EndpointIoControl {
     // to the wire and before this endpoint starts waiting on a peer reply it
     // can no longer influence by writing more. Null by default: every
     // existing caller is unaffected.
+    // Step 4d contract: this fires from INSIDE the endpoint's own coroutine
+    // on the owner executor. A callback must never block, suspend, or run
+    // another endpoint operation inline (a prepare, a run, a future wait):
+    // production only RELEASES the route transfer lock here (the next
+    // transfer then runs in its own coroutine), and anything heavier can
+    // self-deadlock the single-threaded owner.
     std::function<void()> write_complete;
 };
 
