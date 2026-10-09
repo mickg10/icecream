@@ -25,6 +25,16 @@ expect_reject() {
     fi
 }
 
+expect_pass() {
+    file=$1
+    label=$2
+    if ! "$PYTHON" "$checker" "$file" >/dev/null 2>&1; then
+        echo "p50_trace_check: $label unexpectedly failed" >&2
+        "$PYTHON" "$checker" "$file" >&2 || true
+        exit 1
+    fi
+}
+
 ICECC_P50_ACTION_TRACE="$trace_file" \
 ICECC_P50_P29_DIALOGUE_FOCUS=1 \
     ./p50endpoint >/dev/null
@@ -176,7 +186,185 @@ write("second-reset.jsonl", [
     record("HISTORY_RESET", serial=1, nonce=1, state="s1"),
     record("HISTORY_RESET", serial=1, nonce=2, state="s2"),
 ])
+
+# ------------------------------------------------------------------
+# Route pipelining (P50_ROUTE_PIPELINING.md step 7): synthetic K=2
+# fixtures.  These are fully hand-synthesized (no binary needed) and
+# exercise the generalized checker rules: C's ACTIVE_TX queue
+# admission/retire order, F's unacknowledged-commit FIFO, the
+# "ahead by at most K" reconciliation witness, and the
+# universal-invalidation (poison -> cold reset) shape.  The
+# queue_position/queue_depth fields are the additive C-side-only
+# fields emitted by CRoute::record at K>1; their absence everywhere
+# is what makes the canonical trace above (and every mutation of it)
+# a K=1 trace that must keep passing byte-identically.
+def pipelined_record(action, actor="F", serial=1, nonce=10, rel=0, tu=7,
+                     tx="", raw="", state="", position=None, depth=None,
+                     **extra):
+    row = record(action, actor=actor, serial=serial, nonce=nonce, rel=rel,
+                tu=tu, tx=tx, raw=raw, state=state, **extra)
+    if position is not None or depth is not None:
+        row["queue_position"] = position
+        row["queue_depth"] = depth
+    return row
+
+def f_dialogue(rows, serial, rel, tu, tx, raw, state, key):
+    rows.append(record("TX_BEGIN", serial=serial, nonce=10, rel=rel, tu=tu,
+                       tx=tx, raw=raw, state=state))
+    rows.append(record("BODY_COMPLETE", serial=serial, nonce=10, rel=rel, tu=tu,
+                       tx=tx, raw=raw, state=state))
+    rows.append(record("NEED_RECORDED", serial=serial, nonce=10, rel=rel,
+                       tu=tu, tx=tx, raw=raw, state=state,
+                       need_keys=[key], remaining_need=1))
+    rows.append(record("OBJECT_APPLIED", serial=serial, nonce=10, rel=rel,
+                       tu=tu, tx=tx, raw=raw, state=state, key64=key,
+                       content_digest="c%d" % key, remaining_need=0))
+    rows.append(record("INPUT_MATERIALIZED", serial=serial, nonce=10,
+                       rel=rel, tu=tu, tx=tx, raw=raw, state=state))
+
+# K=2 accepted-overlap chain: the successor is admitted (and released by
+# F, running its whole dialogue) while the predecessor's commit is still
+# durable-but-unaccepted by C; C then accepts both commits strictly
+# head-first.  This is the valid pipelined shape.
+k2_overlap = [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=10, state="s0"),
+    pipelined_record("TX_BEGIN", actor="C", serial=0, rel=0, tu=7,
+                     tx="tx0", raw="r0", state="s0", position=0, depth=2),
+]
+f_dialogue(k2_overlap, 1, 0, 7, "tx0", "r0", "s0", 9)
+k2_overlap.append(record("INPUT_COMMITTED", serial=1, nonce=10, rel=0, tu=7,
+                         tx="tx0", raw="r0", state="s1"))
+k2_overlap.append(pipelined_record("TX_BEGIN", actor="C", serial=0, rel=1,
+                                   tu=8, tx="tx1", raw="r1", state="s1",
+                                   position=1, depth=2))
+k2_overlap.append(record("SESSION_REPLACED", serial=2, nonce=10, rel=1,
+                        state="s1"))
+f_dialogue(k2_overlap, 2, 1, 8, "tx1", "r1", "s1", 11)
+k2_overlap.append(record("INPUT_COMMITTED", serial=2, nonce=10, rel=1, tu=8,
+                         tx="tx1", raw="r1", state="s2"))
+k2_overlap.append(pipelined_record("COMMIT_ACCEPTED", actor="C", serial=0,
+                                   rel=0, tu=7, tx="tx0", raw="r0",
+                                   state="s1", position=0, depth=2))
+k2_overlap.append(pipelined_record("COMMIT_ACCEPTED", actor="C", serial=0,
+                                   rel=1, tu=8, tx="tx1", raw="r1",
+                                   state="s2", position=0, depth=2))
+k2_overlap.append(record("SESSION_DISCONNECTED", serial=2, nonce=10, rel=1,
+                         tu=8, tx="tx1", raw="r1", state="s2"))
+write("pipeline-k2-overlap.jsonl", k2_overlap)
+
+# K=2 poison + cold reset: C aborts the whole chain (drain batch 0,1)
+# after F made T0 durable, then a fresh-session HISTORY_RESET discards
+# the abandoned-but-durable commit.
+k2_poison = [
+    record("SESSION_OPENED", serial=1),
+    record("HISTORY_RESET", serial=1, nonce=10, state="s0"),
+    pipelined_record("TX_BEGIN", actor="C", serial=0, rel=0, tu=7,
+                     tx="tx0", raw="r0", state="s0", position=0, depth=2),
+]
+f_dialogue(k2_poison, 1, 0, 7, "tx0", "r0", "s0", 9)
+k2_poison.append(record("INPUT_COMMITTED", serial=1, nonce=10, rel=0, tu=7,
+                        tx="tx0", raw="r0", state="s1"))
+k2_poison.append(pipelined_record("TX_BEGIN", actor="C", serial=0, rel=1,
+                                  tu=8, tx="tx1", raw="r1", state="s1",
+                                  position=1, depth=2))
+k2_poison.append(pipelined_record("TX_ABORTED", actor="C", serial=0, rel=0,
+                                  tu=7, tx="tx0", raw="r0", state="s0",
+                                  position=0, depth=2))
+k2_poison.append(pipelined_record("TX_ABORTED", actor="C", serial=0, rel=1,
+                                  tu=8, tx="tx1", raw="r1", state="s1",
+                                  position=1, depth=2))
+k2_poison.append(record("SESSION_DISCONNECTED", serial=1, nonce=11,
+                        state="s0x"))
+k2_poison.append(record("SESSION_OPENED", serial=2, nonce=11, state="s0x"))
+k2_poison.append(record("HISTORY_RESET", serial=2, nonce=11, state="s0x"))
+write("pipeline-k2-poison-reset.jsonl", k2_poison)
+
+# Negative: successor retiring before its head (accept T1 first).
+k2_retire_bad = [dict(row) for row in k2_overlap]
+accepts = [i for i, row in enumerate(k2_retire_bad)
+           if row["action"] == "COMMIT_ACCEPTED"]
+first, second = accepts[0], accepts[1]
+k2_retire_bad[first], k2_retire_bad[second] = (
+    k2_retire_bad[second], k2_retire_bad[first])
+write("pipeline-k2-retire-before-head.jsonl", k2_retire_bad)
+
+# Negative: C ahead of F by more than K -- a third admission (position 2)
+# while the route's depth is 2.
+k2_depth_bad = [dict(row) for row in k2_overlap]
+begin_t1 = next(i for i, row in enumerate(k2_depth_bad)
+                if row["action"] == "TX_BEGIN" and row["actor"] == "C"
+                and row["rel_seq"] == 1)
+third = dict(k2_depth_bad[begin_t1])
+third["rel_seq"] = 2
+third["tu_seq"] = 9
+third["transaction_digest"] = "tx2"
+third["raw_digest"] = "r2"
+third["queue_position"] = 2
+k2_depth_bad.insert(begin_t1 + 1, third)
+write("pipeline-k2-ahead-more-than-k.jsonl", k2_depth_bad)
+
+# Negative: acceptance names a non-head queue slot.
+k2_nonhead = [dict(row) for row in k2_overlap]
+first_accept = next(i for i, row in enumerate(k2_nonhead)
+                    if row["action"] == "COMMIT_ACCEPTED")
+k2_nonhead[first_accept]["queue_position"] = 1
+write("pipeline-k2-accept-non-head.jsonl", k2_nonhead)
+
+# Negative: admission skips a queue slot (position 0 while slot 0 is
+# occupied).
+k2_hole = [dict(row) for row in k2_overlap]
+begin_t1 = next(i for i, row in enumerate(k2_hole)
+                if row["action"] == "TX_BEGIN" and row["actor"] == "C"
+                and row["rel_seq"] == 1)
+k2_hole[begin_t1]["queue_position"] = 0
+write("pipeline-k2-position-hole.jsonl", k2_hole)
+
+# Negative: abort drain out of order (second record claims position 0).
+k2_abort_bad = [dict(row) for row in k2_poison]
+abort_t1 = next(i for i, row in enumerate(k2_abort_bad)
+                if row["action"] == "TX_ABORTED" and row["rel_seq"] == 1)
+k2_abort_bad[abort_t1]["queue_position"] = 0
+write("pipeline-k2-abort-batch-order.jsonl", k2_abort_bad)
+
+# Negative: F TX_BEGIN names a TX C never admitted (foreign queue member).
+k2_foreign = [dict(row) for row in k2_overlap]
+f_begin_t1 = next(i for i, row in enumerate(k2_foreign)
+                  if row["action"] == "TX_BEGIN" and row["actor"] == "F"
+                  and row["rel_seq"] == 1)
+k2_foreign[f_begin_t1]["tu_seq"] = 99
+write("pipeline-k2-f-begin-foreign.jsonl", k2_foreign)
+
+# Negative: a K=1-scalar record (depth 1) carrying position 1 -- the
+# additive fields must not smuggle a second slot past the scalar rule.
+k1_scalar_bad = [dict(row) for row in k2_overlap]
+begin_t1 = next(i for i, row in enumerate(k1_scalar_bad)
+                if row["action"] == "TX_BEGIN" and row["actor"] == "C"
+                and row["rel_seq"] == 1)
+k1_scalar_bad[begin_t1]["queue_position"] = 1
+k1_scalar_bad[begin_t1]["queue_depth"] = 1
+write("pipeline-k1-scalar-position.jsonl", k1_scalar_bad)
 PY
+
+expect_pass "$workdir/pipeline-k2-overlap.jsonl" 'K=2 pipelined overlap chain'
+expect_pass "$workdir/pipeline-k2-poison-reset.jsonl" \
+    'K=2 poison -> cold reset (universal invalidation)'
+expect_reject "$workdir/pipeline-k2-retire-before-head.jsonl" \
+    'C acceptance lacks matching F commit' 'successor retired before its head'
+expect_reject "$workdir/pipeline-k2-ahead-more-than-k.jsonl" \
+    'C TX_BEGIN missed its queue slot' 'C ahead of F by more than K'
+expect_reject "$workdir/pipeline-k2-accept-non-head.jsonl" \
+    'C acceptance does not name the retiring queue head' \
+    'acceptance named a non-head queue slot'
+expect_reject "$workdir/pipeline-k2-position-hole.jsonl" \
+    'C TX_BEGIN missed its queue slot' 'admission skipped a queue slot'
+expect_reject "$workdir/pipeline-k2-abort-batch-order.jsonl" \
+    'pipelined abort does not match its queue slot' \
+    'abort drain out of batch order'
+expect_reject "$workdir/pipeline-k2-f-begin-foreign.jsonl" \
+    'F TX_BEGIN does not match C active' 'F began a foreign transaction'
+expect_reject "$workdir/pipeline-k1-scalar-position.jsonl" \
+    'C TX_BEGIN missed its queue slot' 'K=1 record claims a second slot'
 
 expect_reject "$workdir/bad-need.jsonl" \
     'Need precedes exact BODY' 'inexact Need mutation'
