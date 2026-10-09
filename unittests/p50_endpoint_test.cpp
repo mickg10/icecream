@@ -6573,10 +6573,17 @@ void test_p29v1_k2_pipeline_straight_line() {
     require(run.head.committed_commit.has_value() &&
                 run.successor.committed_commit.has_value(),
             "K2 straight line: commit witnesses missing");
-    require(run.successor.committed_commit->post_state_digest ==
-                run.successor_begin.pre_state_digest,
-            "K2 straight line: confirmed state is not the successor's "
-            "predicted pre-state");
+    require(run.successor_begin.pre_state_digest ==
+                run.head.committed_commit->post_state_digest,
+            "K2 straight line: the successor's pre-state is not the head's "
+            "predicted post-state (digest chain broken)");
+    require(run.client->endpoint.state_digest() ==
+                run.successor.committed_commit->post_state_digest,
+            "K2 straight line: confirmed state did not advance to the "
+            "successor's commit in rel_seq order");
+    require(run.client->endpoint.next_rel_seq().value == 2,
+            "K2 straight line: confirmed rel_seq did not advance past both "
+            "TXs");
 }
 
 // T2: the successor's COMMIT is forced onto the wire before the head's; C
@@ -6591,9 +6598,13 @@ void test_p29v1_k2_pipeline_successor_commit_dispatched_first() {
     require(run.head.status == ClientRunStatus::Committed &&
                 run.successor.status == ClientRunStatus::Committed,
             "K2 commit-order: both TXs did not commit");
-    require(run.successor.committed_commit->post_state_digest ==
-                run.successor_begin.pre_state_digest,
-            "K2 commit-order: confirmed state did not follow rel_seq order");
+    require(run.successor_begin.pre_state_digest ==
+                run.head.committed_commit->post_state_digest,
+            "K2 commit-order: digest chain broken");
+    require(run.client->endpoint.state_digest() ==
+                run.successor.committed_commit->post_state_digest,
+            "K2 commit-order: confirmed state did not retire in rel_seq "
+            "order despite the successor's COMMIT arriving first");
 }
 
 // T3: a successor deviation (STATE digest mismatch). The successor fails,
