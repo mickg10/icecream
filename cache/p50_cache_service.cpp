@@ -201,6 +201,18 @@ void append_source_result_trace(
         terminal_error_code == static_cast<uint16_t>(ErrorCode::WIRE_REVISION_MISMATCH)
             ? "\"WIRE_REVISION_MISMATCH\""
             : "null";
+    // The bounded ERROR detail (F's exception text, or C's own client
+    // validation text), sanitized to printable JSON-safe ASCII and capped:
+    // without it a farm TerminalError is unattributable. Diagnostic only.
+    std::string terminal_error_detail;
+    if (transfer.terminal_error.has_value()) {
+        for (const char ch : transfer.terminal_error->detail) {
+            if (terminal_error_detail.size() >= 240)
+                break;
+            const bool safe = ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\';
+            terminal_error_detail.push_back(safe ? ch : '_');
+        }
+    }
     const std::string c_guid = bytes_hex(std::span<const uint8_t>(
         c_store_guid.bytes.data(), c_store_guid.bytes.size()));
     const std::string raw_digest = icecc::digest128_hex(transfer.raw_digest);
@@ -216,7 +228,7 @@ void append_source_result_trace(
             wall_clock_ns = static_cast<uint64_t>(wall_ts.tv_sec) * 1000000000ULL +
                             static_cast<uint64_t>(wall_ts.tv_nsec);
     }
-    char line[1536];
+    char line[2048];
     const int length = std::snprintf(
         line, sizeof(line),
         "{\"schema\":\"icecream-p50-source-result-v5\","
@@ -232,6 +244,7 @@ void append_source_result_trace(
         "\"source_mutex_service_ns\":%llu,"
         "\"terminal_error_code\":%u,"
         "\"terminal_error_name\":%s,"
+        "\"terminal_error_detail\":\"%s\","
         "\"system_source_reuse\":%s,"
         "\"c_prepare_route_ns\":%llu,"
         "\"c_fill_ns\":%llu,"
@@ -262,7 +275,8 @@ void append_source_result_trace(
         static_cast<unsigned long long>(transfer.f_to_c_bytes),
         static_cast<unsigned long long>(source_mutex_wait_ns),
         static_cast<unsigned long long>(source_mutex_service_ns),
-        static_cast<unsigned>(terminal_error_code), terminal_error_name, reuse,
+        static_cast<unsigned>(terminal_error_code), terminal_error_name,
+        terminal_error_detail.c_str(), reuse,
         static_cast<unsigned long long>(transfer.c_prepare_route_ns),
         static_cast<unsigned long long>(transfer.c_fill_ns),
         static_cast<unsigned long long>(transfer.c_write_ns),
@@ -314,13 +328,27 @@ void append_f_result_trace(const ServerRunResult& run) noexcept {
             : run.completed_input.has_value()
                   ? run.completed_input->tu_seq.value
                   : 0;
-    char line[1024];
+    // Same sanitized, capped ERROR detail as the C trace: F's own exception
+    // text for a TerminalError run. Diagnostic only.
+    std::string terminal_error_detail;
+    if (run.terminal_error.has_value()) {
+        for (const char ch : run.terminal_error->detail) {
+            if (terminal_error_detail.size() >= 240)
+                break;
+            const bool safe = ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\';
+            terminal_error_detail.push_back(safe ? ch : '_');
+        }
+    }
+    char line[1536];
     const int length = std::snprintf(
         line, sizeof(line),
         "{\"schema\":\"icecream-p50-f-result-v1\","
         "\"c_store_guid\":\"%s\","
         "\"tu_seq\":%llu,\"rel_seq\":%llu,\"raw_bytes\":%llu,"
         "\"status\":%u,"
+        "\"terminal_error_code\":%u,"
+        "\"terminal_error_detail\":\"%s\","
+        "\"peeked_begin_rel_seq\":%lld,"
         "\"f_hello_ns\":%llu,"
         "\"f_hello_to_begin_ns\":%llu,"
         "\"f_begin_to_body_complete_ns\":%llu,"
@@ -337,6 +365,12 @@ void append_f_result_trace(const ServerRunResult& run) noexcept {
         static_cast<unsigned long long>(run.f_rel_seq.value),
         static_cast<unsigned long long>(run.f_raw_bytes),
         static_cast<unsigned>(run.status),
+        static_cast<unsigned>(
+            run.terminal_error.has_value() ? run.terminal_error->code : 0),
+        terminal_error_detail.c_str(),
+        run.f_hello_time_peeked_begin_rel_seq.has_value()
+            ? static_cast<long long>(run.f_hello_time_peeked_begin_rel_seq->value)
+            : -1LL,
         static_cast<unsigned long long>(run.f_hello_ns),
         static_cast<unsigned long long>(run.f_hello_to_begin_ns),
         static_cast<unsigned long long>(run.f_begin_to_body_complete_ns),
