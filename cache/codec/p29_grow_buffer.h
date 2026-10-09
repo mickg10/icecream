@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -242,14 +243,28 @@ private:
         return (bytes + page - 1) / page * page;
     }
 
-    // Best-effort huge-page hint, matching the P29MmapInternProvider
-    // precedent: the kernel may back the stream with transparent huge pages
-    // so the matcher's linear scans fault one 2 MiB page per 512 KiB of
-    // stream.  A pure hint: it cannot change bytes, indices, or exceptions,
-    // and is ignored by kernels with THP disabled.
+    // Opt-in huge-page hint (ICECC_P29_HISTORY_THP=1).  Off by default: the
+    // std::vector this replaces only got THP backing when glibc's malloc was
+    // told to (GLIBC_TUNABLES=glibc.malloc.hugetlb=1, set on the farm client,
+    // not on workers), and an unconditional MADV_HUGEPAGE on a worker under
+    // memory pressure brings back the direct-compaction storms measured on
+    // H2 (DIAG-9b).  A pure hint either way: it cannot change bytes,
+    // indices, or exceptions.
+    static bool hugepage_hint_enabled() noexcept {
+        static const bool enabled = [] {
+            const char *value = std::getenv("ICECC_P29_HISTORY_THP");
+            return value != nullptr && value[0] == '1' && value[1] == '\0';
+        }();
+        return enabled;
+    }
+
     static void advise_hugepage(void *mapping, std::size_t bytes) noexcept {
 #if defined(MADV_HUGEPAGE)
-        (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
+        if (hugepage_hint_enabled())
+            (void)::madvise(mapping, bytes, MADV_HUGEPAGE);
+#else
+        (void)mapping;
+        (void)bytes;
 #endif
     }
 
