@@ -793,7 +793,11 @@ void check_process_planned_differential() {
             independent_reservation(layout) + (1 << 20));
         auto interner = std::make_unique<P29Interner<MmapProvider>>(
             *provider, layout);
-        return std::pair{std::move(interner), std::move(provider)};
+        // The provider must outlive the interner (the interner holds a
+        // Provider& into it and deallocates in its own destructor), so it
+        // is pair::first: pair members destroy in reverse declaration
+        // order, so first is destroyed LAST.
+        return std::pair{std::move(provider), std::move(interner)};
     };
 
     // Synthetic linemarker-heavy corpus: shared regions across TUs, TUs
@@ -812,8 +816,8 @@ void check_process_planned_differential() {
         "no newline before # here\n# 8 \"h\"\ntheta\n",
     };
 
-    auto [plain_interner, plain_provider] = make_interner();
-    auto [planned_interner, planned_provider] = make_interner();
+    auto [plain_provider, plain_interner] = make_interner();
+    auto [planned_provider, planned_interner] = make_interner();
 
     auto interned_state = [](P29Interner<MmapProvider> &interner) {
         std::string state;
@@ -850,7 +854,7 @@ void check_process_planned_differential() {
     // a region TU1 added meanwhile (the re-find under the writer lock
     // must then hit), and TU3's plan may say "hit" for a region that was
     // already published (still valid: records never move).
-    auto [stale_interner, stale_provider] = make_interner();
+    auto [stale_provider2, stale_interner] = make_interner();
     std::vector<std::uint32_t> stale_regions1;
     stale_interner->process(bytes(tus[0]), stale_regions1);
     // Snapshot plans for TU1(again) and TU2 against this state.
@@ -859,7 +863,7 @@ void check_process_planned_differential() {
     const std::vector<icecc::codec::P29RegionPlanEntry> stale_plan_tu2 =
         stale_interner->plan_regions(bytes(tus[1]));
     // A DIFFERENT interner interns TU0..TU2 the plain way for reference.
-    auto [ref_interner, ref_provider] = make_interner();
+    auto [ref_provider2, ref_interner] = make_interner();
     std::vector<std::uint32_t> ref1, ref2;
     ref_interner->process(bytes(tus[0]), ref1);
     ref_interner->process(bytes(tus[1]), ref2);
