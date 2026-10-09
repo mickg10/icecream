@@ -1,6 +1,6 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecar.a libp50daemonsidecaradapter.a libp50input.a \
-	libp50adoptedoutcomewriter.a
+	libp50adoptedoutcomewriter.a libp50ownerwatchdog.a
 check_LIBRARIES = libp50endpointtesthooks.a
 
 sbin_PROGRAMS = icecc-cache-service
@@ -13,6 +13,7 @@ icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h \
 icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
 	libp50input.a \
 	libprotocol50.a \
+	libp50ownerwatchdog.a \
 	libp50localtransport.a ../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 icecc_cache_service_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
@@ -59,6 +60,16 @@ libprotocol50_a_SOURCES = \
 	p50_fsession_payloads.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
+
+# Diagnostic-only owner-stall watchdog (ICECC_P50_OWNER_WATCHDOG_MS). Kept
+# out of libprotocol50.a deliberately: that library is linked into ~30
+# unit-test binaries that do not otherwise need -pthread, and this module
+# uses std::thread/pthread_setname_np. Isolating it here means only its own
+# consumers (icecc-cache-service, which already links -pthread, and its own
+# unit test) need to add -pthread.
+libp50ownerwatchdog_a_SOURCES = p50_owner_watchdog.cpp p50_owner_watchdog.h
+libp50ownerwatchdog_a_CPPFLAGS = $(AM_CPPFLAGS)
+
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
 	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)

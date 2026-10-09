@@ -22,6 +22,7 @@ TESTS += p50connectionprovenance
 TESTS += p50platformcompat
 TESTS += p50lifecycletimeoutoverride
 TESTS += p50sidecarlifecycleapplyoverride
+TESTS += p50ownerwatchdog
 TESTS += p50syscallshim-source.sh
 TESTS += p50daemonsidecaradapter
 TESTS += p50daemonsidecaradapter-source.sh
@@ -239,6 +240,7 @@ check_PROGRAMS += p50connectionprovenance
 check_PROGRAMS += p50platformcompat
 check_PROGRAMS += p50lifecycletimeoutoverride
 check_PROGRAMS += p50sidecarlifecycleapplyoverride
+check_PROGRAMS += p50ownerwatchdog
 check_PROGRAMS += p50profile
 testargs_SOURCES = args.cpp
 check_PROGRAMS += p50sourcearm p50phaseopen
@@ -524,6 +526,17 @@ p50sidecarlifecycleapplyoverride_SOURCES = p50_sidecar_lifecycle_apply_override_
 	../cache/p50_sidecar_lifecycle_apply_override.cpp
 p50sidecarlifecycleapplyoverride_CPPFLAGS = $(AM_CPPFLAGS)
 p50sidecarlifecycleapplyoverride_LDADD = ../services/libicecc.la
+# Diagnostic-only owner-stall watchdog (ICECC_P50_OWNER_WATCHDOG_MS). Compiles
+# the module's .cpp directly (mirrors p50daemoncachedispatch above) rather
+# than linking libp50ownerwatchdog.a, since this binary is the module's only
+# consumer besides icecc-cache-service itself. -pthread is required: the
+# integration test below spawns a real fake-owner thread and a real
+# OwnerWatchdog background thread.
+p50ownerwatchdog_SOURCES = p50_owner_watchdog_test.cpp ../cache/p50_owner_watchdog.cpp
+p50ownerwatchdog_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache
+p50ownerwatchdog_CXXFLAGS = -pthread
+p50ownerwatchdog_LDFLAGS = -pthread
+p50ownerwatchdog_LDADD = ../services/libicecc.la
 p50sourcearm_SOURCES = p50_source_arm_wait_test.cpp \
 	../cache/p50_source_identity.cpp ../cache/p50_input_wait.cpp
 p50sourcearm_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/cache
@@ -572,11 +585,13 @@ p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
 	../cache/libp50adoptedoutcomewriter.a ../cache/libp50input.a \
+	../cache/libp50ownerwatchdog.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50cacheservice_DEPENDENCIES = ../cache/icecc-cache-service \
 	../cache/libp50endpointtesthooks.a \
-	../cache/libp50input.a  readyclose_shim.so
+	../cache/libp50input.a ../cache/libp50ownerwatchdog.a \
+	readyclose_shim.so
 p50fdhandoff_SOURCES = p50fdhandoff.cpp ../cache/p50_fd_handoff.cpp \
 	../cache/p50_local_transport.cpp
 check_PROGRAMS += p50frameasync

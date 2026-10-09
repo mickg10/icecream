@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <pthread.h>
 #include <utility>
 
 namespace icecc::p50 {
@@ -42,6 +43,7 @@ size_t InputBackingReaper::queued_batches() const {
 }
 
 void InputBackingReaper::run() {
+    ::pthread_setname_np(::pthread_self(), "p50-reaper");
     for (;;) {
         InputBackingBatch batch;
         {
