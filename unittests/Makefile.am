@@ -67,6 +67,10 @@ TESTS += p50cacheservice-fcapacity-run.sh
 # and the K=2 storm (the 2026-10-09 admission-race fixes: F pre-park + C
 # dispatch gap).
 TESTS += p50cacheservice-routepipe-run.sh
+# ICECC_P50_PREPROCESS_FIRST client gate: preprocessed-byte identity
+# (capture seam, flag OFF vs ON), legacy end-to-end with the pre-captured
+# source, cpp-failure parity, and the scheduler-local selection row.
+TESTS += p50ppfirst-run.sh
 TESTS += assignment_identity_test
 TESTS += p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \
@@ -689,6 +693,7 @@ EXTRA_DIST += p50daemoncontrol-source.sh p50daemoncontrol-mutants.sh \
 	p50_daemon_control_sanitize.sh
 EXTRA_DIST += p50cacheservice-fcapacity-run.sh
 EXTRA_DIST += p50cacheservice-routepipe-run.sh
+EXTRA_DIST += p50ppfirst-run.sh
 EXTRA_DIST += p50endpointcancel-run.sh \
 	p50_adopted_outcome_writer-run.sh \
 	p50_adopted_outcome_writer-source.sh \

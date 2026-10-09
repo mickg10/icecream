@@ -373,6 +373,187 @@ icecc::p50::OwnedSourceFd prepare_complete_p50_source(
     return icecc::p50::OwnedSourceFd(read_fd);
 }
 
+/* ICECC_P50_PREPROCESS_FIRST: the torepeat==1 client runs the local
+   preprocessor BEFORE the GetCS assignment request, so a remote slot is
+   only taken once the source is ready (a slot held from UseCS to the
+   end of the local cpp would otherwise sit idle for the whole cpp).
+   The capture is the exact build_remote_int() input: the same
+   call_cpp(job, fd) invocation, the same dcc_lock_host()/dcc_unlock()
+   extent around it, and the same failure classes.  It is handed to
+   build_remote_int() as its existing preproc_file argument, which both
+   the P50 path (prepare_complete_p50_source opens it) and the legacy
+   path (input_sink.send_fd) already accept.
+
+   A memfd is used exactly when prepare_complete_p50_source would use one
+   (ICECC_P50_PREPROCESSED_CAPTURE unset), exposed as /proc/self/fd/N:
+   open() of that path is a fresh description at offset 0, the memfd is
+   MFD_CLOEXEC so no child inherits it, and the capture below closes it
+   on every exit path.  With the S7 capture seam configured a real temp
+   file is used instead, because retain_p50_preprocessed_capture()
+   O_NOFOLLOW-opens the configured path and /proc/self/fd is a symlink;
+   the later prepare_complete_p50_source() call then retains the
+   pre-captured file exactly once, from this same stable path. */
+class PreprocessFirstCapture
+{
+public:
+    PreprocessFirstCapture() = default;
+    ~PreprocessFirstCapture()
+    {
+        if (fd_ >= 0)
+            (void)::close(fd_);
+    }
+    PreprocessFirstCapture(const PreprocessFirstCapture &) = delete;
+    PreprocessFirstCapture &operator=(const PreprocessFirstCapture &) = delete;
+
+    PreprocessFirstCapture(PreprocessFirstCapture &&other) noexcept
+        : path_(std::move(other.path_)), temporary_(std::move(other.temporary_)),
+          fd_(other.fd_)
+    {
+        other.fd_ = -1;
+    }
+    PreprocessFirstCapture &operator=(PreprocessFirstCapture &&other) noexcept
+    {
+        if (this != &other) {
+            path_ = std::move(other.path_);
+            temporary_ = std::move(other.temporary_);
+            if (fd_ >= 0)
+                (void)::close(fd_);
+            fd_ = other.fd_;
+            other.fd_ = -1;
+        }
+        return *this;
+    }
+
+    const std::string &path() const noexcept { return path_; }
+
+    PreprocessFirstCapture(std::string path,
+                           std::unique_ptr<TempSourceFile> temporary,
+                           int fd) noexcept
+        : path_(std::move(path)), temporary_(std::move(temporary)), fd_(fd)
+    {
+    }
+
+private:
+
+    std::string path_;
+    std::unique_ptr<TempSourceFile> temporary_;
+    int fd_ = -1; // memfd read side; -1 in temp-file mode
+};
+
+struct PreprocessFirstOutcome
+{
+    /* Present only when the local preprocessor completed: the caller
+       passes capture->path() as build_remote_int()'s preproc_file. */
+    std::optional<PreprocessFirstCapture> capture;
+    /* Exit status the caller must return verbatim when capture is absent,
+       mirroring build_remote_int()'s own lock-failure return and its
+       P50 branch's plain cpp-status return. */
+    int failure_status = 0;
+};
+
+PreprocessFirstOutcome prepare_p50_source_preprocess_first(CompileJob &job)
+{
+    PreprocessFirstOutcome outcome;
+    /* No assignment identity exists yet by design: the whole point is to
+       run cpp before the slot is taken.  wire_id carries the client pid so
+       concurrent preprocess-first records stay separable in the merged
+       stagetrace analysis, and preprocess_first=1 marks the order. */
+    icecc::stagetrace::stage_trace(
+        "iceccclient", "source_prepare_first_start", 0, (int64_t)::getpid(),
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"preprocess_first", 1}});
+
+    if (!dcc_lock_host()) {
+        log_error() << "can't lock for local cpp" << endl;
+        outcome.failure_status = EXIT_DISTCC_FAILED;
+        return outcome;
+    }
+    HostUnlock unlock; // automatic dcc_unlock()
+
+    int memfd = -1;
+#ifdef MFD_CLOEXEC
+    if (::getenv("ICECC_P50_PREPROCESSED_CAPTURE") == nullptr)
+        memfd = ::memfd_create("icecc-p50", MFD_CLOEXEC);
+#endif
+    const bool use_memfd = memfd >= 0;
+    int write_fd = -1;
+    std::unique_ptr<TempSourceFile> temporary;
+    if (use_memfd) {
+        // call_cpp closes write_fd in the parent after fork; memfd is the read side.
+        write_fd = ::fcntl(memfd, F_DUPFD_CLOEXEC, 0);
+        if (write_fd < 0) {
+            (void)::close(memfd);
+            throw client_error(10, "Error 10 - unable to open preprocessor output");
+        }
+    } else {
+        char *temporary_path = nullptr;
+        if (dcc_make_tmpnam("icecc-p50", ".ix", &temporary_path, 0) != 0 ||
+            temporary_path == nullptr)
+            throw client_error(10, "Error 10 - unable to create preprocessor output");
+        temporary = std::make_unique<TempSourceFile>(temporary_path);
+        write_fd = ::open(temporary->path(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+        if (write_fd < 0)
+            throw client_error(10, "Error 10 - unable to open preprocessor output");
+    }
+
+    const pid_t cpp_pid = call_cpp(job, write_fd);
+    if (cpp_pid == -1) {
+        (void)::close(write_fd); // call_cpp closes it only after a successful fork.
+        if (use_memfd)
+            (void)::close(memfd);
+        throw client_error(18, "Error 18 - (fork error?)");
+    }
+
+    int wait_status = 255;
+    pid_t waited;
+    do {
+        waited = ::waitpid(cpp_pid, &wait_status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != cpp_pid) {
+        if (use_memfd)
+            (void)::close(memfd);
+        throw client_error(18, "Error 18 - unable to wait for local cpp");
+    }
+
+    const int cpp_status = shell_exit_status(wait_status);
+    if (cpp_status != 0) {
+        log_warning() << "call_cpp process failed with exit status "
+                      << cpp_status << std::endl;
+        if (use_memfd)
+            (void)::close(memfd);
+        /* The clang-only gate excludes the gcc -fdirectives-only broken
+           class, so unlike prepare_complete_p50_source no remote_error(103)
+           can fire here: build_remote_int()'s clang P50 branch turns a cpp
+           failure into the plain cpp exit status, and this pre-GetCS site
+           returns the same status to the wrapper. */
+        icecc::stagetrace::stage_trace(
+            "iceccclient", "source_prepare_first_failed", 0, (int64_t)::getpid(),
+            icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+            {{"preprocess_first", 1}, {"cpp_status", (int64_t)cpp_status}});
+        outcome.failure_status = cpp_status;
+        return outcome;
+    }
+
+    if (use_memfd) {
+        // The child's writes moved the shared offset; readers start at 0.
+        if (::lseek(memfd, 0, SEEK_SET) != 0) {
+            (void)::close(memfd);
+            throw client_error(11, "Error 11 - unable to rewind preprocessed output");
+        }
+        outcome.capture = PreprocessFirstCapture(
+            std::string("/proc/self/fd/") + std::to_string(memfd), nullptr, memfd);
+    } else {
+        outcome.capture = PreprocessFirstCapture(
+            std::string(temporary->path()), std::move(temporary), -1);
+    }
+
+    icecc::stagetrace::stage_trace(
+        "iceccclient", "source_prepare_first_done", 0, (int64_t)::getpid(),
+        icecc::stagetrace::kUnknown, icecc::stagetrace::kUnknown,
+        {{"preprocess_first", 1}});
+    return outcome;
+}
+
 std::optional<uint32_t> p50_profile_wire(
     icecc::p50::ProfileId profile) noexcept
 {
@@ -1775,7 +1956,40 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
 
     const char *preferred_host = getenv("ICECC_PREFERRED_HOST");
 
+    /* ICECC_P50_PREPROCESS_FIRST (default off): the ordinary torepeat==1
+       client prepares the exact preprocessed source before the GetCS
+       assignment request, so the remote slot the scheduler will hand out
+       is only taken once the local cpp has finished.  Byte-identical
+       behaviour when off.  clang-only on purpose: the farm's
+       -frewrite-includes toolchain is the one whose slot-holding idle
+       cpp wait this mode removes, and the gcc torepeat>1 verification
+       path below must stay untouched. */
+    const char *const preprocess_first_env = getenv("ICECC_P50_PREPROCESS_FIRST");
+    const bool preprocess_first =
+        preprocess_first_env != nullptr && *preprocess_first_env != '\0' &&
+        *preprocess_first_env != '0' && compiler_is_clang(job) && torepeat == 1;
+
     if (torepeat == 1) {
+        /* Lives until the end of this assignment attempt: the capture is
+           handed to build_remote_int() as preproc_file below, and is
+           released (memfd closed / temp file unlinked) after that call
+           has opened or sent it.  The bounded Error-106 retry re-enters
+           build_remote(), so a successor attempt re-captures its own
+           source; the preprocessor is deterministic, so the bytes are
+           identical. */
+        std::optional<PreprocessFirstCapture> preprocess_first_capture;
+        const char *preprocess_first_file = nullptr;
+        if (preprocess_first) {
+            PreprocessFirstOutcome prepared = prepare_p50_source_preprocess_first(job);
+            if (!prepared.capture)
+                return prepared.failure_status;
+            preprocess_first_capture = std::move(prepared.capture);
+            preprocess_first_file = preprocess_first_capture->path().c_str();
+            trace() << "preprocess-first: preprocessed source ready before "
+                       "assignment request ("
+                    << preprocess_first_capture->path() << ")" << endl;
+        }
+
         string fake_filename;
         list<string> args = job.remoteFlags();
 
@@ -1882,10 +2096,18 @@ int build_remote(CompileJob &job, MsgChannel *local_daemon,
 
         try {
             if (!maybe_build_local(local_daemon, usecs, job, ret)) {
+                /* The pre-captured source, when preprocess-first is armed,
+                   was produced by the same call_cpp(job, fd) invocation
+                   build_remote_int() would run; passing it as preproc_file
+                   makes the P50 path open it instead of running cpp again
+                   and the legacy path send it instead of running cpp again.
+                   A scheduler-local assignment above ignores it and compiles
+                   locally from the original source. */
                 ret = build_remote_int(job, usecs, local_daemon,
                                        version_map[usecs->host_platform],
                                        versionfile_map[usecs->host_platform],
-                                       nullptr, true, &p50_observation);
+                                       preprocess_first_file, true,
+                                       &p50_observation);
             }
         } catch (const remote_error &error) {
             const bool p50_assignment = usecs->hasCacheAdvertisement();
