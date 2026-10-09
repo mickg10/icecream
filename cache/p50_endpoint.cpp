@@ -4339,6 +4339,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                                          impl_->route_limits.max_frame_payload,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                          impl_->completions, control, verify);
+            // The BEGIN frame is fully on the wire: F stages a transaction
+            // from this point on, so any later ambiguity is reconciliation
+            // work -- the sender's retry branches may not retire route-
+            // locally. (Set AFTER the write completes: a begin write that
+            // itself failed sent at most partial frame bytes, which F's
+            // frame parser cannot stage.)
+            result.wrote_begin = true;
             if (control.stall_stage)
                 control.stall_stage->store(ClientStallStage::BeginWritten,
                                            std::memory_order_relaxed);
@@ -4653,6 +4660,10 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             co_await async_write_message(socket, begin, frame_cap,
                                          impl_->stamp(session, AsyncOperationKind::WriteFragment),
                                          impl_->completions, control, verify);
+            // Same semantics as the pipelined branch above: the BEGIN frame
+            // is fully on the wire, so a later ambiguity is reconciliation
+            // work, never a route-local retirement.
+            result.wrote_begin = true;
             co_await async_write_component<BodyMessage>(
                 socket, impl_->active->prepared->body, frame_cap,
                 impl_->stamp(session, AsyncOperationKind::WriteFragment),
@@ -4961,6 +4972,10 @@ P50ClientEndpoint::run_connected_successor(
             socket, begin, frame_cap,
             impl_->stamp_bound(session, AsyncOperationKind::WriteFragment, begin),
             impl_->completions, control, verify);
+        // Same semantics as the head paths: the BEGIN frame is fully on the
+        // wire -- F stages this transaction, so a later ambiguity is
+        // reconciliation work, never a route-local retirement.
+        result.wrote_begin = true;
         if (control.stall_stage)
             control.stall_stage->store(ClientStallStage::BeginWritten,
                                        std::memory_order_relaxed);
@@ -5315,6 +5330,34 @@ void P50ClientEndpoint::reset_after_pipeline_poison() {
     impl_->wake_retire_waiters();
     impl_->wake_window_slot_waiters();
     impl_->poisoned = false;
+}
+
+void P50ClientEndpoint::discard_retained_route_work(PreparedTuHandle handle) {
+    impl_->owner.require();
+    // Handle identity IS the validation: a handle from another authority
+    // (or a null one) simply matches neither retained reference and throws.
+    if (!handle)
+        throw std::invalid_argument(
+            "retained route work cannot be discarded for a null handle");
+    // A poisoned route (or one with outstanding successors) is NOT this
+    // path's to decide: the whole window is invalid and the existing
+    // abandon_route + reset_after_pipeline_poison flow owns its teardown.
+    if (impl_->poisoned || !impl_->successors.empty())
+        throw std::logic_error(
+            "retained route work belongs to a poisoned pipeline window");
+    const bool active_match =
+        impl_->active.has_value() && impl_->active->handle == handle;
+    const bool queued_match =
+        !impl_->active.has_value() && impl_->queued_handle == handle;
+    if (!active_match && !queued_match)
+        throw std::logic_error(
+            "endpoint retains no route work for this prepared handle");
+    // Nothing reached F for this transaction (the caller retires a transfer
+    // whose attempts never wrote a TX_BEGIN), so the cold route fields stay
+    // exactly as F holds them; only the retained admission reference goes.
+    impl_->active.reset();
+    impl_->queued.reset();
+    impl_->queued_handle = {};
 }
 
 boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_window_slot(

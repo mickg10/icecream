@@ -499,6 +499,16 @@ struct ClientRunResult {
     std::optional<TxCommit> committed_commit;
     std::optional<InputRecordKey> committed_input;
     std::optional<ErrorMessage> terminal_error;
+    // True the moment this run's TX_BEGIN write phase started (HELLO and any
+    // later frame of the dialogue were excluded): at least one transactional
+    // byte of THIS transaction was heading to F, so any subsequent ambiguity
+    // must reconcile route state.  False for a run that died before that
+    // point -- a refused connect/arm, a HELLO that never got a reply -- where
+    // nothing about the route's F-side state can have changed and the
+    // sender's retry branches may retire the transfer ROUTE-LOCALLY instead
+    // of quarantining the relationship (the k45 farm leg's whole-route
+    // 0x5002 latch: one f-arm refusal cost 471 refusals).
+    bool wrote_begin = false;
     // Diagnostic-only per-run timing (steady_clock durations, ns). Populated
     // only along the paths named in each field's comment at the call site;
     // zero otherwise. These never gate behavior and exist solely for
@@ -736,6 +746,20 @@ public:
     // Throws std::logic_error if called without an outstanding pipeline
     // poison.
     void reset_after_pipeline_poison();
+
+    // Discards this endpoint's retained retry bookkeeping (the active
+    // transaction or the queued successor) when it references exactly this
+    // prepared handle -- the sender's route-local retirement of a transfer
+    // whose attempts never wrote a TX_BEGIN (refused connect/arm), so no
+    // route reconciliation can resolve it later and the retained reference
+    // would strand the route's admission slot (the next distinct request's
+    // dispatch would throw "already has different queued work" and latch a
+    // sticky whole-C replacement). Cold route fields (history_nonce,
+    // next_rel, state) are NOT touched: nothing reached F, so the retained
+    // cursor is still exactly what F holds. Throws std::invalid_argument if
+    // the handle belongs to another authority and std::logic_error if this
+    // endpoint retains no bookkeeping for it.
+    void discard_retained_route_work(PreparedTuHandle handle);
 
     // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
     // 2026-10-08 errata): suspend this coroutine until the endpoint's

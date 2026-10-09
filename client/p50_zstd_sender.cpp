@@ -691,6 +691,12 @@ P50ZstdSourceSender::transfer_bytes(
             co_return result;
         }
         ClientRunResult run;
+        // Across BOTH attempts: whether any transactional byte of this
+        // transfer (its TX_BEGIN write phase) ever reached the wire. A run
+        // that never wrote BEGIN changed nothing about the route's F-side
+        // state, so its exhaustion is route-local -- see the attempt==2
+        // branch below.
+        bool wrote_begin = false;
         try {
             EndpointIoControl io_control;
             io_control.stall_stage = stall_stage.get();
@@ -699,6 +705,7 @@ P50ZstdSourceSender::transfer_bytes(
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared,
                     io_control, deadline);
+                wrote_begin = run.wrote_begin;
                 if (impl_->endpoint->has_pipeline_poison()) {
                     // Step 4d: retire this handle's own uncommitted P29V1
                     // route state before anything below treats this attempt
@@ -743,9 +750,13 @@ P50ZstdSourceSender::transfer_bytes(
                     run.status = Clock::now() >= deadline
                                      ? ClientRunStatus::DeadlineExceeded
                                      : ClientRunStatus::Disconnected;
+                    // The connect/arm round trip itself failed: no endpoint
+                    // code ran, so nothing of this attempt reached the wire.
+                    wrote_begin = false;
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
                         connected_fd, prepared, io_control, deadline);
+                    wrote_begin = run.wrote_begin;
                     if (impl_->endpoint->has_pipeline_poison()) {
                         // Step 4d: same retirement as the other branch above.
                         impl_->authority->abandon_route(prepared);
@@ -886,7 +897,45 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->invalid(ZstdSourceTransferStatus::RetryExhausted);
             result.attempts = attempt;
             impl_->bind_wire_evidence(result);
-            impl_->quarantine_transport(result, explicit_route);
+            // Exhaustion of the single permitted retry is transport-local --
+            // EXCEPT when a transactional byte of this transfer reached F:
+            // then the route's F-side state may be mid-transaction and the
+            // relationship must be quarantined exactly as before (the retry
+            // could not reconcile it). Neither attempt having written a
+            // BEGIN means F never saw this transfer at all -- a refused
+            // connect/arm on both rounds (the k45 farm leg: one f-arm
+            // refusal exhausted the retry and latched
+            // route_replacement_required, after which every later
+            // assignment to that route was refused 0x5002 -- 471 refusals,
+            // the rest of the leg) -- so the failure is route-local: no
+            // quarantine, no sticky latch. The prepared entry must still be
+            // RELEASED: its uncommitted successor slot stays occupied
+            // otherwise, and the route's next prepare_for_route hits the
+            // depth admission throw, which escalates to exactly the sticky
+            // replacement the retirement just avoided (the same 0x5002
+            // storm, one step later). release() on a non-tail entry
+            // invalidates the whole outstanding chain uniformly, so any
+            // live sibling retires through the chain-abandoned branch.
+            if (wrote_begin) {
+                impl_->quarantine_transport(result, explicit_route);
+                co_return result;
+            }
+            // Nothing on the wire: drop the endpoint's retained retry
+            // bookkeeping for this handle (a later attempt's dispatch would
+            // otherwise identify against it and throw) and release the
+            // authority entry, freeing the route's admission slot. Both are
+            // best-effort against typed throws: the handle's structures were
+            // marked abandoned uniformly by release()'s own non-tail path if
+            // any sibling was outstanding.
+            try {
+                impl_->endpoint->discard_retained_route_work(prepared);
+            } catch (...) {
+            }
+            try {
+                (void)impl_->authority->release(prepared);
+            } catch (...) {
+            }
+            result.route_local_failure = true;
             co_return result;
         }
     }
