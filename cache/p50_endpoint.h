@@ -414,6 +414,17 @@ public:
     // std::logic_error if `handle` is not the route's identified successor.
     void abandon_route(PreparedTuHandle handle);
 
+    // True when a uniform chain invalidation (abandon_route, release's
+    // non-tail path) removed this entry from its route's outstanding
+    // successor deque while the entry itself is still alive -- i.e. the
+    // route encoding this handle was prepared under no longer exists.
+    // The C sender must not retry a transfer on such a handle: the fresh
+    // route re-encodes from its own cursor, and a retry dispatched on the
+    // stale admitted rel/pre-state fails the F witness (K>2 farm legs,
+    // 2026-10-09: te=3 "STATE differs" / "TX_COMMIT does not close").
+    // Total: false for unknown or released handles, never throws.
+    [[nodiscard]] bool prepared_chain_abandoned(PreparedTuHandle handle) const;
+
 private:
     PreparedInputPtr resolve(PreparedTuHandle handle) const;
     void validate_begin(const TxBegin& begin) const;

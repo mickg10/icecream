@@ -1889,6 +1889,16 @@ void P50PreparationAuthority::abandon_route(PreparedTuHandle handle) {
     impl_->abandon_chain(route, true);
 }
 
+bool P50PreparationAuthority::prepared_chain_abandoned(
+    PreparedTuHandle handle) const {
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        return false;
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        return false;
+    return position->second.chain_abandoned;
+}
+
 ProfileId P50PreparationAuthority::profile() const {
     impl_->owner.check();
     return impl_->profile;
