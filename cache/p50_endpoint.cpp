@@ -1919,6 +1919,41 @@ struct P50ClientEndpoint::Impl {
         return result;
     }
 
+    // Step 4d core: dialogue-scoped completion identity for a successor.
+    // The shared stamp()/live_identity() bind `active` -- the HEAD -- and
+    // re-read it AFTER the wire operation's suspension, so a successor's
+    // verify races the head's retirement (its accept resets `active`
+    // mid-window) and fails with StaleCompletion. A successor binds its
+    // OWN frozen begin instead, which is also the identity it keeps after
+    // promotion. The head path is untouched (byte-identical at depth 1).
+    CompletionStamp stamp_bound(const Session& session,
+                                AsyncOperationKind operation,
+                                const TxBegin& bound) const {
+        CompletionStamp result;
+        result.actor = ActorSide::C;
+        result.operation = operation;
+        result.c_store_guid = session.c_guid;
+        result.f_store_guid = session.f_guid.value_or(FStoreGuid{});
+        result.session_serial = session.serial;
+        result.history_nonce = bound.history_nonce;
+        result.rel_seq = bound.rel_seq;
+        result.tu_seq = bound.tu_seq;
+        result.transaction_digest = bound.transaction_digest;
+        result.raw_digest = bound.raw_digest;
+        result.transaction_bound = true;
+        return result;
+    }
+    CompletionLiveIdentity live_identity_bound(
+        const Session& session, const TxBegin& bound) const {
+        CompletionLiveIdentity result;
+        result.actor = ActorSide::C;
+        result.c_store_guid = c_guid;
+        result.f_store_guid = session.f_guid.value_or(FStoreGuid{});
+        result.session_serial = session.serial;
+        bind_live_identity(result, bound);
+        return result;
+    }
+
     void record(ActionType action, const TxBegin& begin, uint64_t serial,
                 Digest128 state_digest) {
         if (!actions || !f_guid)
@@ -4322,7 +4357,7 @@ P50ClientEndpoint::run_connected_successor(
             control.before_completion_check(observed);
         observed = completion_for_test(observed, control);
         require_observed_completion(expected, observed);
-        CompletionLiveIdentity live = impl_->live_identity(session);
+        CompletionLiveIdentity live = impl_->live_identity_bound(session, begin);
         if (control.before_live_identity_check)
             control.before_live_identity_check(expected, live);
         require_live_completion(expected, live);
@@ -4331,7 +4366,7 @@ P50ClientEndpoint::run_connected_successor(
         require_deadline();
         if (remote)
             co_await async_connect(socket, *remote,
-                                   impl_->stamp(session, AsyncOperationKind::Connect),
+                                   impl_->stamp_bound(session, AsyncOperationKind::Connect, begin),
                                    impl_->completions, verify);
         SessionHello hello;
         hello.c_store_guid = impl_->c_guid;
@@ -4342,7 +4377,7 @@ P50ClientEndpoint::run_connected_successor(
                 impl_->preparation->p29v1_system_source_fingerprint(prepared);
         co_await async_write_message(
             socket, hello, impl_->caps.wire.max_frame_payload,
-            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->stamp_bound(session, AsyncOperationKind::WriteFragment, begin),
             impl_->completions, control, verify);
         // The pipelined-begin fast path, exactly as the head's: write
         // BEGIN/BODY/FILL before reading STATE, against the route's
@@ -4352,14 +4387,14 @@ P50ClientEndpoint::run_connected_successor(
             prepared, *impl_->route_f_fingerprint);
         co_await async_write_message(
             socket, begin, frame_cap,
-            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->stamp_bound(session, AsyncOperationKind::WriteFragment, begin),
             impl_->completions, control, verify);
         if (control.stall_stage)
             control.stall_stage->store(ClientStallStage::BeginWritten,
                                        std::memory_order_relaxed);
         co_await async_write_component<BodyMessage>(
             socket, admitted->body, frame_cap,
-            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->stamp_bound(session, AsyncOperationKind::WriteFragment, begin),
             impl_->completions, control, verify);
         codec::P29WireLimits wire_limits;
         wire_limits.max_tu_bytes =
@@ -4386,7 +4421,7 @@ P50ClientEndpoint::run_connected_successor(
                  codec::p29v1_fill_inner_bound(wire_limits)))
             co_await async_write_message(
                 socket, fill, frame_cap,
-                impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                impl_->stamp_bound(session, AsyncOperationKind::WriteFragment, begin),
                 impl_->completions, control, verify);
         fill_sent = true;
         // Predict-commit this TX's serializer locally, symmetric with the
@@ -4403,7 +4438,7 @@ P50ClientEndpoint::run_connected_successor(
         // predicted pre-state.
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
-            impl_->stamp(session, AsyncOperationKind::ReadHeader),
+            impl_->stamp_bound(session, AsyncOperationKind::ReadHeader, begin),
             impl_->completions, verify);
         if (control.stall_stage)
             control.stall_stage->store(ClientStallStage::StateRead,
@@ -4439,7 +4474,7 @@ P50ClientEndpoint::run_connected_successor(
             for (;;) {
                 Frame need_frame = co_await async_read_frame(
                     socket, frame_cap,
-                    impl_->stamp(session, AsyncOperationKind::ReadHeader),
+                    impl_->stamp_bound(session, AsyncOperationKind::ReadHeader, begin),
                     impl_->completions, verify);
                 if (need_frame.type == MessageType::ERROR)
                     throw ClientTerminalResult(
@@ -4534,7 +4569,7 @@ P50ClientEndpoint::run_connected_successor(
                       begin.pre_state_digest);
         Frame commit_frame = co_await async_read_frame(
             socket, frame_cap,
-            impl_->stamp(session, AsyncOperationKind::ReadHeader),
+            impl_->stamp_bound(session, AsyncOperationKind::ReadHeader, begin),
             impl_->completions, verify);
         if (control.stall_stage)
             control.stall_stage->store(ClientStallStage::CommitRead,
