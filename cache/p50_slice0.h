@@ -263,6 +263,11 @@ struct PreparedTU {
 private:
     friend class CAuthority;
     friend class CRoute;
+    // prepare_source()'s split path: the interning runs under the C-wide
+    // source mutex and the materialization verify outside it, so the
+    // endpoint needs to read the produced dense-region ids between the
+    // two halves (read-only, after process() returned).
+    friend class P50PreparationAuthority;
     std::vector<uint32_t> dense_regions;
 };
 
@@ -308,6 +313,29 @@ private:
     PreparedTUPtr prepare_p29v1_at_seq(std::span<const uint8_t> exact_input,
                                        TuSeq tu_seq,
                                        Digest128 exact_digest);
+    // The locked half of prepare_p29v1_at_seq: TU_SEQ allocation stays with
+    // the caller, the interner runs here, and the caller-held preparation
+    // mutex is expected to already be taken (the interner is single-writer
+    // across the whole C side).  The returned PreparedTU has NOT been
+    // materialize-verified yet; verify_p29v1_materialization() does that
+    // outside the mutex.  Every other field of the returned object is
+    // already final.  Sets tu_seq/raw_bytes/raw_digest and bumps the
+    // prepares/raw_bytes stats exactly as prepare_p29v1_at_seq does, so the
+    // two halves together are behavior-identical to it.
+    PreparedTUPtr intern_p29v1_locked(std::span<const uint8_t> exact_input,
+                                      TuSeq tu_seq,
+                                      Digest128 exact_digest);
+    // The unlocked half of prepare_p29v1_at_seq: a pure read over the
+    // interner's published regions (region_bytes() is concurrent-read
+    // safe).  Throws exactly the same logic_error strings the combined
+    // function throws on a mismatch.  Does NOT touch the interner, the
+    // provider, or any counter, and never marks the interner non-runnable.
+    void verify_p29v1_materialization(std::span<const uint32_t> dense_regions,
+                                      std::span<const uint8_t> exact_input) const;
+    // The shared failure tail of both paths: marks the interner permanently
+    // non-runnable and reports the same "nonrunnable" line.
+    void mark_p29v1_nonrunnable(const std::exception& error);
+    void mark_p29v1_nonrunnable_untyped();
 
     struct P29V1State;
 

@@ -1304,13 +1304,58 @@ P50PreparationAuthority::prepare_source(
     shared->raw_bytes = exact_input->size();
     shared->raw_digest = raw_digest;
     shared->raw = std::move(exact_input);
-    std::lock_guard lock(impl_->source_mutex);
-    impl_->ensure_p29v1_locked();
-    const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
-    shared->tu_seq = tu_seq;
-    shared->p29_source = impl_->p29_authority->prepare_p29v1_at_seq(
-        *shared->raw, tu_seq, raw_digest);
-    impl_->p29_authority->commit_tu_seq(tu_seq);
+    // Only the interner itself is serialized C-wide (single writer): the
+    // reserve/intern/commit triple runs under source_mutex, and the
+    // materialization-verify loop runs OUTSIDE it.  The verify is a pure
+    // read over already-published regions (region_bytes() is
+    // concurrent-read safe) and is the largest single term of the mutex
+    // hold, so holding the C-wide lock across it serialized the whole
+    // client.
+    {
+        std::lock_guard lock(impl_->source_mutex);
+        impl_->ensure_p29v1_locked();
+        const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
+        shared->tu_seq = tu_seq;
+        try {
+            // Locked half of prepare_p29v1_at_seq: reserve, intern, stats.
+            // No verify loop here.
+            shared->p29_source = impl_->p29_authority->intern_p29v1_locked(
+                *shared->raw, tu_seq, raw_digest);
+            impl_->p29_authority->commit_tu_seq(tu_seq);
+        } catch (...) {
+            // Exactly today's combined-path failure shape: the interner
+            // marks itself permanently non-runnable for any failure after
+            // processing begins, and this TU's reserved TU_SEQ is never
+            // committed.  That leaves a permanent TU_SEQ gap; that is legal
+            // (a reservation is committed only on success) and unobservable
+            // (the interner is non-runnable afterwards anyway, so no later
+            // TU can ever use the hole).
+            bool marked = false;
+            try {
+                throw;
+            } catch (const std::exception& error) {
+                impl_->p29_authority->mark_p29v1_nonrunnable(error);
+                marked = true;
+            } catch (...) {
+                impl_->p29_authority->mark_p29v1_nonrunnable_untyped();
+                marked = true;
+            }
+            (void)marked;
+            throw;
+        }
+    }
+    // Verify OUTSIDE the C-wide mutex.  On failure, re-take the mutex and
+    // reproduce exactly today's combined-path behaviour: mark non-runnable
+    // + report, then rethrow the same exception (the logic_error string
+    // comes from verify_p29v1_materialization and is unchanged).
+    try {
+        impl_->p29_authority->verify_p29v1_materialization(
+            shared->p29_source->dense_regions, *shared->raw);
+    } catch (const std::exception& error) {
+        std::lock_guard lock(impl_->source_mutex);
+        impl_->p29_authority->mark_p29v1_nonrunnable(error);
+        throw;
+    }
     auto prepared = std::make_shared<PreparedSource>();
     prepared->shared = std::move(shared);
     return prepared;
