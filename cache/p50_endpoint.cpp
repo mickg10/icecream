@@ -2186,15 +2186,28 @@ struct P50ClientEndpoint::Impl {
         return (active ? 1u : 0u) + (awaiting_head ? 1u : 0u) +
                successors.size();
     }
-    // C1 (2026-10-09 admission-race fix): anything outstanding on this route
-    // -- a live head dialogue, any admitted-but-not-yet-promoted successor,
-    // or a head session still winding down (active_session is cleared only
-    // at the very end of the head's run coroutine, AFTER accept() already
-    // reset `active`, so the commit-to-promotion window is observable as
-    // active_session != 0 with nothing else set). The entry dispatch takes
-    // the pipelined branch on this, not on active_session alone.
+    // C1 (2026-10-09 admission-race fix): any OUTSTANDING DIALOGUE on this
+    // route -- a live head session (active_session is cleared only at the
+    // very end of the head's run coroutine, AFTER accept() already reset
+    // `active`, so the commit-to-promotion window is observable as
+    // active_session != 0 with nothing else set), any
+    // admitted-but-not-yet-promoted successor, or a PROMOTED successor
+    // sitting in `active` (its Successor deque entry was erased at
+    // promotion, so successors alone cannot see it). The entry dispatch
+    // takes the pipelined branch on this, not on active_session alone.
+    //
+    // Carve-out (found against test_p29v1_k2_pipeline_head_drop_after_
+    // fill_stays_recoverable): `active` holding RETAINED RETRY WORK -- a
+    // head run that failed P29V1-style and left its TX for the unchanged
+    // head path's reconciliation -- is NOT an outstanding dialogue: its
+    // marker is p29v1_transport_retry (set exactly by the failed head
+    // tail, never by run_connected_successor's promotion), and a new run
+    // for that TX must take the head path (the retry resolves no
+    // successor input and would throw in the pipelined branch). A
+    // promoted successor never sets that marker.
     [[nodiscard]] bool outstanding() const {
-        return active.has_value() || !successors.empty() || active_session != 0;
+        return active_session != 0 || !successors.empty() ||
+               (active.has_value() && !active->p29v1_transport_retry);
     }
     // Deviation (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata):
     // stop opening successors, tear down every outstanding successor socket
@@ -3858,9 +3871,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     // "promoted over a live head"), or active_session != 0 with no
     // `active` and a queued successor (the old full-window throw). Both
     // poison the route through the sender's catch(std::logic_error).
-    // Taking `active || !successors.empty() || active_session != 0`
-    // closes it: a not-yet-promoted successor is as outstanding as a live
-    // head. Depth 1 keeps today's exact checks and throws.
+    // Taking outstanding() (active_session, the successors deque, or a
+    // non-retry `active` -- see Impl::outstanding) closes it: a
+    // not-yet-promoted successor is as outstanding as a live head, while
+    // retained retry work still takes the unchanged head path. Depth 1
+    // keeps today's exact checks and throws.
     if (impl_->route_pipeline_depth() > 1 && impl_->outstanding()) {
         // A poisoned route line never opens new successors: the cold reset
         // (transfer_bytes's abandon_route + reset_after_pipeline_poison)
@@ -4334,8 +4349,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             cancel_quietly(io->timer);
             if (impl_->active_session == serial) {
                 impl_->active_session = 0;
-            if (impl_->route_pipeline_depth() > 1)
-                impl_->wake_window_slot_waiters();
+                if (impl_->route_pipeline_depth() > 1)
+                    impl_->wake_window_slot_waiters();
             }
             co_return result;
         } else {
@@ -4560,8 +4575,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         close_now(socket);
         if (impl_->active_session == serial) {
             impl_->active_session = 0;
-        if (impl_->route_pipeline_depth() > 1)
-            impl_->wake_window_slot_waiters();
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
         }
         cancel_quietly(io->timer);
         throw;
@@ -4572,8 +4587,8 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         close_now(socket);
         if (impl_->active_session == serial) {
             impl_->active_session = 0;
-        if (impl_->route_pipeline_depth() > 1)
-            impl_->wake_window_slot_waiters();
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->wake_window_slot_waiters();
         }
         cancel_quietly(io->timer);
         throw;
@@ -5830,11 +5845,13 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
                     bool prepark_ceiling_exceeded = false;
                     bool prepark_first_frame_done = false;
                     // Bounded grace: cap at the earlier of this run's own
-                    // absolute operation deadline (if any) and 2000 ms. The
+                    // absolute operation deadline (if any) and the
+                    // configured pre-park bound (2000 ms in production; the
+                    // endpoint config carries the test override). The
                     // absolute deadline is sampled on this process's
                     // CLOCK_MONOTONIC -- the same clock asio::steady_timer
                     // arms from -- so the conversion is exact; an invalid or
-                    // missing deadline keeps the 2000 ms bound.
+                    // missing deadline keeps the configured bound.
                     auto prepark_grace =
                         std::chrono::steady_clock::now() +
                         std::chrono::duration_cast<
