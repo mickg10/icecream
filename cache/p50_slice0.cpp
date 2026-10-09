@@ -2185,7 +2185,14 @@ void CRoute::restart_v1_for_transport_retry() {
 
 void CRoute::reset_v1_route(FStoreGuid f_store_guid,
                             HistoryNonce history_nonce) {
-    if (active_queue_.empty() ||
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): after a pipeline poison the bridge's abandon_route() has
+    // already cleared the whole queue, and the cold HISTORY_RESET dance must
+    // still be able to rebuild the route from an empty one -- refusing here
+    // would strand the route (sticky). abandon_active() inside
+    // reset_history() is already a no-op on an empty queue, so only the
+    // profile of a live back() is checked.
+    if (!active_queue_.empty() &&
         active_queue_.back().begin.profile != ProfileId::P29V1)
         throw std::logic_error(
             "C route has no active P29V1 transaction to reset");
