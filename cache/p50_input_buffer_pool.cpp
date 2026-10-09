@@ -12,6 +12,20 @@ namespace {
 constexpr uint64_t kDefaultCapBytes = 2ULL * 1024 * 1024 * 1024;  // 2 GiB
 constexpr int64_t kReportIntervalNs = 10LL * 1000 * 1000 * 1000;  // 10s
 
+// Pre-sized so a put() -- including the common "discard a duplicate
+// publish's backing" path reached from InputRecordStore::commit_prepared(),
+// which InputRecordStore's own test suite asserts is allocation-free (see
+// test_prepared_publish_is_exact_one_shot_and_allocation_free) -- does not
+// have to grow free_list_'s own storage on the common case. This bounds the
+// *bookkeeping* vector-of-vectors, not the buffers it holds (those stay
+// governed solely by cap_bytes); 64 free-list slots is already far more
+// concurrent held buffers than one F sidecar's in-flight TU count realistically
+// reaches before cap_bytes starts rejecting puts via puts_dropped_. If actual
+// concurrency ever exceeds this, free_list_ still grows correctly -- just
+// loses the allocation-free property for that one put(), same as any other
+// vector headroom choice.
+constexpr std::size_t kFreeListReserve = 64;
+
 int64_t monotonic_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -46,7 +60,13 @@ uint64_t resolve_cap_bytes() noexcept {
 }  // namespace
 
 InputBufferPool::InputBufferPool(uint64_t cap_bytes) noexcept
-    : cap_bytes_(cap_bytes) {}
+    : cap_bytes_(cap_bytes) {
+    // Only pay for the reserve when pooling is actually enabled -- a
+    // disabled pool (cap_bytes == 0) must stay a pure no-op on both get()
+    // and put(), per the class comment and
+    // test_zero_cap_disables_pooling().
+    if (cap_bytes_ != 0) free_list_.reserve(kFreeListReserve);
+}
 
 std::shared_ptr<InputBufferPool> InputBufferPool::instance() {
     static const std::shared_ptr<InputBufferPool> singleton =
