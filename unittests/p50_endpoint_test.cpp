@@ -6656,8 +6656,18 @@ void test_p29v1_k2_pipeline_successor_state_mismatch_poisons() {
     const PairResult third_pair =
         run_pair(*run.client, real_server, third_handle);
     require(third_pair.client.status == ClientRunStatus::Committed,
-            "K2 successor-deviation: the post-reset TX did not run cold "
-            "and commit");
+            std::string("K2 successor-deviation: the post-reset TX did not "
+                        "run cold and commit (status=") +
+                std::to_string(
+                    static_cast<uint8_t>(third_pair.client.status)) +
+                " reconnect=" +
+                std::to_string(
+                    static_cast<uint8_t>(third_pair.client.reconnect)) +
+                " terminal=" +
+                (third_pair.client.terminal_error.has_value()
+                     ? third_pair.client.terminal_error->detail
+                     : std::string("<none>")) +
+                ")");
 }
 
 // T4: head disconnect with a successor outstanding. Everything is torn down
