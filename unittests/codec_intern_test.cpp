@@ -878,6 +878,42 @@ void check_process_planned_differential() {
     require(warm1 == warm2 && !warm1.empty(),
             "warm re-plan of the same TU differs");
 
+    // The same differential over the REAL corpus inputs (when the source
+    // tree is known): a fresh interner pair per arm, each TU processed by
+    // process() on one and plan+process_planned on the other, both
+    // interning the same sequence so the second TU onward exercises
+    // cross-TU shared regions.  Only the differential is asserted here;
+    // the frozen corpus counts are gated in main() as before.
+    if (std::getenv("ICECC_TEST_TOP_SRCDIR") != nullptr) {
+        const P29InternLayout real_layout = P29InternLayout::probe();
+        for (const fs::path &input : phase0_inputs()) {
+            if (!fs::exists(input))
+                continue;
+            auto real_plain_provider = std::make_unique<MmapProvider>(
+                independent_reservation(real_layout));
+            auto real_plain_interner =
+                std::make_unique<P29Interner<MmapProvider>>(
+                    *real_plain_provider, real_layout);
+            auto real_planned_provider = std::make_unique<MmapProvider>(
+                independent_reservation(real_layout));
+            auto real_planned_interner =
+                std::make_unique<P29Interner<MmapProvider>>(
+                    *real_planned_provider, real_layout);
+            const std::vector<std::uint8_t> corpus_input = read_file(input);
+            std::vector<std::uint32_t> real_plain;
+            real_plain_interner->process(corpus_input, real_plain);
+            const std::vector<icecc::codec::P29RegionPlanEntry> real_plan =
+                real_planned_interner->plan_regions(corpus_input);
+            std::vector<std::uint32_t> real_planned;
+            real_planned_interner->process_planned(corpus_input, real_plan,
+                                                   real_planned);
+            require(real_plain == real_planned,
+                    "process_planned differs from process() on corpus input "
+                    "with " + std::to_string(corpus_input.size()) +
+                    " bytes");
+        }
+    }
+
     std::cout << "codec_intern: process_planned differential check PASS\n";
 }
 
