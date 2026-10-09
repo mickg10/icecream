@@ -4210,6 +4210,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         (result.status == ClientRunStatus::Disconnected ||
          result.status == ClientRunStatus::DeadlineExceeded))
         impl_->active->p29v1_transport_retry = true;
+    // Step 4d core (brief point 5): a head that failed with successors still
+    // outstanding deviated -- the successors' predictions are rooted at this
+    // chain, so the whole window is torn down (never a reconcile branch),
+    // exactly as a successor-side deviation would. No-op at depth 1 and on
+    // every success path.
+    if (result.status != ClientRunStatus::Committed && !impl_->successors.empty())
+        impl_->poison_pipeline();
     if (result.status == ClientRunStatus::Committed && trace_commit_read_done)
         result.c_post_commit_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -4589,6 +4596,26 @@ void P50ClientEndpoint::request_cancel_for_test() noexcept {
     impl_->active_cancel_requested = true;
     impl_->active_cancellation = ClientCancellationDisposition::ReconcileRequired;
     close_now(*impl_->socket_for_test_cancel);
+}
+
+size_t P50ClientEndpoint::pipeline_window_size_for_test() const {
+    impl_->owner.check();
+    return impl_->window_size();
+}
+
+size_t P50ClientEndpoint::pipeline_retire_waiter_count_for_test() const {
+    impl_->owner.check();
+    return impl_->retire_waiters.size();
+}
+
+size_t P50ClientEndpoint::pipeline_window_slot_waiter_count_for_test() const {
+    impl_->owner.check();
+    return impl_->window_slot_waiters.size();
+}
+
+uint64_t P50ClientEndpoint::pipeline_epoch_for_test() const {
+    impl_->owner.check();
+    return impl_->pipeline_epoch;
 }
 #endif
 

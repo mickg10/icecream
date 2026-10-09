@@ -2015,7 +2015,8 @@ bool CRoute::fill_before_need_possible(size_t max_need_regions) const {
 }
 
 std::optional<std::span<const uint8_t>> CRoute::fill_v1_before_need(
-    size_t max_need_regions) {    if (active_queue_.empty() ||
+    size_t max_need_regions) {
+    if (active_queue_.empty() ||
         active_queue_.back().begin.profile != ProfileId::P29V1 || !p29v1_ ||
         p29v1_->terminal || p29v1_->fill_answered)
         throw std::logic_error("C route has no fresh P29V1 ACTIVE_TX");
@@ -2246,12 +2247,19 @@ void CRoute::retire_locked_commits() {
                 p29v1_->terminal = true;
                 throw;
             }
-        } else if (!head.need_confirmed) {
+        } else if (!head.need_confirmed &&
+                   head_action == ActionType::COMMIT_ACCEPTED) {
             // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1,
-            // 2026-10-08 errata): F always sends NEED before TX_COMMIT.  A
-            // predict-committed head retiring with an unconfirmed NEED means
-            // the NEED frame never arrived (or was never confirmed) -- the
-            // head deviated, so the whole chain is invalid, not retired.
+            // 2026-10-08 errata): F always sends NEED before TX_COMMIT, so
+            // a predict-committed head retiring through the ordinary
+            // COMMIT_ACCEPTED path with an unconfirmed NEED means the NEED
+            // frame never arrived -- the head deviated and the whole chain
+            // is invalid, not retired.  LOST_COMMIT_ACCEPTED is exempt: its
+            // connection is definitionally gone (drop between FILL and
+            // NEED, F committed anyway) and the recovered commit itself is
+            // the proof, so the route must stay usable -- poisoning here
+            // would be a sticky silent P29V1 loss, exactly the class this
+            // codebase spent weeks killing.
             p29v1_->terminal = true;
             throw std::logic_error(
                 "P29V1 predict-committed head retired without its NEED");

@@ -645,6 +645,14 @@ public:
     size_t cancel_all_for_incarnation(const SidecarLaunchIdentity& incarnation) noexcept;
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
     void request_cancel_for_test() noexcept;
+    // Step 4d core test hooks (P50_ROUTE_PIPELINING.md section 5.1): the
+    // outstanding-successor window and both waiter structures must stay
+    // empty at depth 1 (T6b's K=1 no-op assertion) and be observable from
+    // the endpoint tests while a K>1 window is open.
+    [[nodiscard]] size_t pipeline_window_size_for_test() const;
+    [[nodiscard]] size_t pipeline_retire_waiter_count_for_test() const;
+    [[nodiscard]] size_t pipeline_window_slot_waiter_count_for_test() const;
+    [[nodiscard]] uint64_t pipeline_epoch_for_test() const;
 #endif
 
     [[nodiscard]] CStoreGuid c_store_guid() const;
