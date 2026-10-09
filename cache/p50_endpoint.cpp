@@ -1322,9 +1322,45 @@ P50PreparationAuthority::fill_p29v1_before_need(PreparedTuHandle handle) {
     return p29v1_successor(handle).fill_v1_before_need(kMaxEarlyNeedRegions);
 }
 
+bool P50PreparationAuthority::p29v1_fill_before_need_possible(
+    PreparedTuHandle handle) {
+    constexpr size_t kMaxEarlyNeedRegions = 4096;
+    return p29v1_successor(handle).fill_before_need_possible(
+        kMaxEarlyNeedRegions);
+}
+
 void P50PreparationAuthority::confirm_p29v1_need(
     PreparedTuHandle handle, std::span<const uint8_t> inner_need) {
-    p29v1_successor(handle).confirm_need_v1(inner_need);
+    // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata): route the confirm through the per-entry path so a
+    // predict-committed entry (serializer pending already gone) validates
+    // against its recorded snapshot; the newest not-yet-predict-committed
+    // entry keeps the exact legacy behavior.  p29v1_successor() re-checks
+    // the handle/entry/route membership exactly as every other NEED-side
+    // accessor.
+    p29v1_successor(handle).confirm_need_v1(
+        resolve(handle)->begin.rel_seq, inner_need);
+}
+
+void P50PreparationAuthority::commit_predicted_p29v1(PreparedTuHandle handle) {
+    impl_->owner.require();
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        throw std::invalid_argument(
+            "prepared-TU handle does not belong to this C authority");
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        throw std::invalid_argument("prepared-TU handle has been released");
+    Impl::Entry& entry = position->second;
+    if (entry.route.profile != ProfileId::P29V1 || entry.committed)
+        throw std::invalid_argument("prepared-TU handle is not active P29V1");
+    Impl::RouteState& route = impl_->route_state(entry.route);
+    if (!route.p29_route ||
+        std::find(route.uncommitted_route_entries.begin(),
+                  route.uncommitted_route_entries.end(),
+                  handle.entry_id_) == route.uncommitted_route_entries.end())
+        throw std::logic_error(
+            "P29V1 predict-commit does not identify the route successor");
+    route.p29_route->commit_predicted_v1();
 }
 
 Digest128 P50PreparationAuthority::p29v1_system_source_fingerprint(
@@ -1699,6 +1735,11 @@ ProfileId P50PreparationAuthority::profile() const {
     return impl_->profile;
 }
 
+uint32_t P50PreparationAuthority::route_pipeline_depth() const {
+    impl_->owner.check();
+    return std::max<uint32_t>(1, impl_->authority_limits.route_pipeline_depth);
+}
+
 PreparedInputPtr
 P50PreparationAuthority::resolve(PreparedTuHandle handle) const {
     impl_->owner.require();
@@ -1931,6 +1972,13 @@ struct P50ClientEndpoint::Impl {
         active.reset();
         queued.reset();
         queued_handle = {};
+        // Step 4d core (brief point 4): retiring the head frees both the
+        // successor parked on it and a window slot. Both waits are
+        // level-triggered, so every waiter is woken and each re-checks its
+        // own predicate. At depth 1 both structures are empty and this is
+        // a no-op.
+        wake_retire_waiters();
+        wake_window_slot_waiters();
     }
 
     CStoreGuid c_guid{};
@@ -1948,12 +1996,75 @@ struct P50ClientEndpoint::Impl {
     RelSeq next_rel{};
     Digest128 state{};
     bool pipelined_begin = false;
-    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): set by the
-    // not-yet-implemented predicted-cursor bookkeeping when a pipelined
-    // successor observes its predecessor deviate from the predicted
-    // witness; cleared by reset_after_pipeline_poison(). Always false until
-    // that bookkeeping lands (Step 4d/5).
+    // Step 4d (research/designs/P50_ROUTE_PIPELINING.md): set when any
+    // outstanding dialogue deviates while the window holds a successor;
+    // cleared LAST by reset_after_pipeline_poison(), which also bumps
+    // pipeline_epoch. While set, no successor dialogue is opened and every
+    // waiter wakes to fail.
     bool poisoned = false;
+    // Step 4d core: the outstanding-dialogue window. `active` above stays
+    // the HEAD (the oldest outstanding dialogue, exactly today's single
+    // slot at depth 1); successors below are ordered by rel_seq and never
+    // touch the confirmed cursor fields until promoted into `active`.
+    struct Successor {
+        RelSeq rel_seq{};
+        PreparedTuHandle handle;
+        PreparedInputPtr prepared;
+        std::shared_ptr<ClientIoState> io;  // nullopt-equivalent: null until
+                                           // its socket is opened/registered
+    };
+    std::deque<Successor> successors;
+    // A prepared TX waiting for an empty window before taking the head
+    // path (fill_p29v1_before_need returned nullopt, so it must not open a
+    // successor dialogue). At most one per endpoint: it holds the route
+    // transfer lock while waiting, and one endpoint serves one route. It
+    // counts toward the window so the endpoint's bound never diverges from
+    // the authority's uncommitted-successor bound.
+    bool awaiting_head = false;
+    // Level-triggered retire waiters: a successor parked on
+    // wait_for_predecessor_retired(predecessor) registers its timer under
+    // that predecessor rel_seq; accept() commits the head, then cancels the
+    // waiter for the just-committed rel_seq. Empty at depth 1.
+    std::map<uint64_t, std::shared_ptr<asio::steady_timer>> retire_waiters;
+    // Level-triggered window-slot waiters (transfer_bytes before
+    // prepare_for_route). accept(), poison, and epoch changes cancel them
+    // all; each re-checks its own predicate. Empty at depth 1.
+    std::vector<std::shared_ptr<asio::steady_timer>> window_slot_waiters;
+    // Bumped by reset_after_pipeline_poison(); a successor that wakes from
+    // a wait into a different epoch must fail, not resume.
+    uint64_t pipeline_epoch = 0;
+    [[nodiscard]] uint32_t route_pipeline_depth() const {
+        return preparation ? preparation->route_pipeline_depth() : 1;
+    }
+    [[nodiscard]] size_t window_size() const {
+        return (active ? 1u : 0u) + (awaiting_head ? 1u : 0u) +
+               successors.size();
+    }
+    // Deviation (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata):
+    // stop opening successors, tear down every outstanding successor socket
+    // (F bulk-releases its parked BEGINs through its own mismatch path),
+    // and wake every waiter so each fails through its existing status path.
+    void poison_pipeline() {
+        if (poisoned)
+            return;
+        poisoned = true;
+        for (Successor& successor : successors) {
+            if (successor.io)
+                close_now(successor.io->socket);
+        }
+        for (const auto& [ignored, timer] : retire_waiters)
+            cancel_quietly(*timer);
+        for (const auto& timer : window_slot_waiters)
+            cancel_quietly(*timer);
+    }
+    void wake_retire_waiters() {
+        for (const auto& [ignored, timer] : retire_waiters)
+            cancel_quietly(*timer);
+    }
+    void wake_window_slot_waiters() {
+        for (const auto& timer : window_slot_waiters)
+            cancel_quietly(*timer);
+    }
     // F's fingerprint and limits from the STATE that last admitted a TX_BEGIN.
     std::optional<Digest128> route_f_fingerprint;
     SessionLimits route_limits{};
@@ -3392,6 +3503,73 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
             co_return ClientRunResult{};
         }
     }
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata) -- entry dispatch. The single-dialogue guard below
+    // stays exactly today's behavior at depth 1; above depth 1 an active
+    // head admits a successor dialogue instead. `prepared` has already been
+    // admitted by the authority (the sender waits for a window slot BEFORE
+    // prepare_for_route), so reaching here with a live head means this TX
+    // is the route's next successor in rel_seq order.
+    if (impl_->active_session != 0) {
+        if (impl_->route_pipeline_depth() <= 1)
+            throw std::logic_error("C endpoint already has one active dialogue");
+        // A poisoned route line never opens new successors: the cold reset
+        // (transfer_bytes's abandon_route + reset_after_pipeline_poison)
+        // must land before this endpoint admits more route work.
+        if (impl_->poisoned)
+            throw std::logic_error("C endpoint route is pipeline-poisoned");
+        PreparedInputPtr successor_input;
+        if (prepared)
+            successor_input = impl_->preparation->resolve(prepared);
+        if (!successor_input)
+            throw std::invalid_argument(
+                "C endpoint successor run has no prepared transaction");
+        // T7 fallback (section 1.1 errata item 4): a would-be successor that
+        // cannot confirm its NEED through an eager FILL must not open a
+        // successor dialogue. Keep the route lock, wait level-triggered for
+        // the window to empty, then run the UNCHANGED head path (fresh-head
+        // dance, Site B).
+        const bool eager_fill =
+            impl_->caps.profile != ProfileId::P29V1 ||
+            impl_->preparation->p29v1_fill_before_need_possible(prepared);
+        if (!eager_fill)
+            impl_->awaiting_head = true;
+        const bool slot = co_await wait_for_window_slot(deadline);
+        if (!eager_fill)
+            impl_->awaiting_head = false;
+        if (!slot) {
+            ClientRunResult result;
+            result.status = ClientRunStatus::DeadlineExceeded;
+            result.observation = ClientRunObservation::DeadlineExpired;
+            co_return result;
+        }
+        if (!impl_->active && impl_->successors.empty()) {
+            // The window emptied while waiting: this TX is the head now
+            // (T7 fallback, section 1.1 errata item 4). Its begun
+            // pre_state_digest equals the confirmed route state once the
+            // old head retired as predicted; anything else is a
+            // deviation of the predicted chain, not a reconcile case.
+            if (impl_->route_known &&
+                successor_input->begin.pre_state_digest != impl_->state) {
+                impl_->poison_pipeline();
+                ClientRunResult result;
+                result.status = ClientRunStatus::Disconnected;
+                result.observation = ClientRunObservation::Disconnected;
+                result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
+                co_return result;
+            }
+            co_return co_await run_connected(
+                remote, std::move(adopted), std::move(prepared),
+                std::move(control), deadline);
+        }
+        if (!impl_->active ||
+            impl_->successors.size() >= impl_->route_pipeline_depth() - 1)
+            throw std::logic_error(
+                "C endpoint already has one active dialogue");
+        co_return co_await run_connected_successor(
+            remote, std::move(adopted), std::move(prepared),
+            std::move(successor_input), std::move(control), deadline);
+    }
     if (impl_->active_session != 0)
         throw std::logic_error("C endpoint already has one active dialogue");
     PreparedInputPtr admitted;
@@ -3617,8 +3795,19 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         // Step 4 sub-step 4c: fill_sent here means the pipelined fast path
         // above already wrote BEGIN+BODY+FILL before this (the first) STATE
         // read, so this TX's last write has already happened.
-        if (fill_sent && control.write_complete)
-            control.write_complete();
+        // Step 4d core (section 1.1, 2026-10-08 errata): at depth > 1 the
+        // head predict-commits locally here -- after its eager FILL write,
+        // BEFORE the lock releases at write-complete -- so its NEED is
+        // confirmed later through its recorded snapshot and the next
+        // successor's begin_tu is admitted. At depth 1 none of this runs
+        // and write_complete fires exactly where 4c landed it.
+        if (fill_sent) {
+            if (impl_->route_pipeline_depth() > 1)
+                impl_->preparation->commit_predicted_p29v1(
+                    impl_->active->handle);
+            if (control.write_complete)
+                control.write_complete();
+        }
         Frame state_frame = co_await async_read_frame(
             socket, impl_->caps.wire.max_frame_payload,
             impl_->stamp(session, AsyncOperationKind::ReadHeader), impl_->completions, verify);
@@ -3665,6 +3854,11 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
         if (pipelined && same_f && !exact) {
             // This F refused a begin for a route it no longer holds.  Abort
             // it; the retry reads STATE first and resets the route.
+            // Step 4d core: with successors outstanding this is a head
+            // deviation -- poison the window before returning, exactly as
+            // the reconcile guard below.
+            if (!impl_->successors.empty())
+                impl_->poison_pipeline();
             impl_->record(ActionType::TX_ABORTED, impl_->active->begin, serial,
                           impl_->active->begin.pre_state_digest);
             impl_->queued = impl_->active->prepared;
@@ -3738,6 +3932,26 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
 
         if (exact) {
             result.reconnect = EndpointReconnectOutcome::ExactMatch;
+        } else if (!impl_->successors.empty()) {
+            // Step 4d core (brief point 5 / section 1.1 errata): the head
+            // deviated while successors are outstanding. No reconcile
+            // branch runs -- the successors' predictions are rooted at this
+            // deviating chain, so the whole window is invalid. Tear down
+            // the successor sockets (F bulk-releases their parked BEGINs
+            // through its own mismatch path), wake every waiter, and return
+            // this TX's own failure; the bridge's
+            // abandon_route/reset_after_pipeline_poison does the cold reset
+            // once this run returns.
+            impl_->poison_pipeline();
+            result.status = ClientRunStatus::Disconnected;
+            result.observation = ClientRunObservation::Disconnected;
+            result.reconnect = same_f ? EndpointReconnectOutcome::RouteHistoryReset
+                                      : EndpointReconnectOutcome::ColdFStore;
+            close_now(socket);
+            cancel_quietly(io->timer);
+            if (impl_->active_session == serial)
+                impl_->active_session = 0;
+            co_return result;
         } else {
             result.reconnect = same_f ? EndpointReconnectOutcome::RouteHistoryReset
                                       : EndpointReconnectOutcome::ColdFStore;
@@ -3898,6 +4112,13 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
                         impl_->completions, control, verify);
                 // Step 4 sub-step 4c: this is this TX's last write -- Site A
                 // above did not fire (fill_sent was still false on entry).
+                // Step 4d core: at depth > 1 the fresh head predict-commits
+                // here, after its NEED was consumed by the answer above
+                // (commit_predicted_v1 records need_confirmed) and before
+                // the lock releases at write-complete. Depth 1: unchanged.
+                if (impl_->route_pipeline_depth() > 1)
+                    impl_->preparation->commit_predicted_p29v1(
+                        impl_->active->handle);
                 if (control.write_complete)
                     control.write_complete();
             }
@@ -4000,6 +4221,349 @@ boost::asio::awaitable<ClientRunResult> P50ClientEndpoint::run_connected(
     co_return result;
 }
 
+boost::asio::awaitable<ClientRunResult>
+P50ClientEndpoint::run_connected_successor(
+    std::optional<tcp::endpoint> remote, std::optional<tcp::socket> adopted,
+    PreparedTuHandle prepared, PreparedInputPtr admitted,
+    EndpointIoControl control,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata). Everything here is unreachable at depth 1: the
+    // entry dispatch only routes a caller here while a head dialogue is
+    // outstanding and the window is not full.
+    impl_->owner.require();
+    ClientRunResult result;
+    if (!admitted)
+        throw std::invalid_argument(
+            "C endpoint successor run has no prepared transaction");
+    const TxBegin begin = admitted->begin;
+    const RelSeq own_rel = begin.rel_seq;
+    const RelSeq predecessor_rel{own_rel.value - 1};
+    const uint64_t epoch_at_open = impl_->pipeline_epoch;
+    if (begin.pre_state_digest != impl_->state)
+        throw std::logic_error(
+            "successor TX_BEGIN pre-state differs from the confirmed route "
+            "state at dispatch");
+    const auto clear_slot = [this, own_rel]() {
+        const auto position = std::find_if(
+            impl_->successors.begin(), impl_->successors.end(),
+            [&](const Impl::Successor& entry) {
+                return entry.rel_seq == own_rel;
+            });
+        if (position != impl_->successors.end())
+            impl_->successors.erase(position);
+    };
+
+    const auto deadline_crossed = [&]() {
+        return deadline.has_value() &&
+               std::chrono::steady_clock::now() >= *deadline;
+    };
+    const auto require_deadline = [&]() {
+        if (deadline_crossed())
+            throw boost::system::system_error(asio::error::timed_out);
+    };
+    // Deviation (brief point 5): stop opening successors, close every
+    // successor socket, wake every waiter, and return this transfer's own
+    // failure status. Never a reconcile branch for a successor.
+    const auto deviate = [&](ClientRunStatus status,
+                             ClientRunObservation observation,
+                             EndpointReconnectOutcome reconnect) {
+        impl_->poison_pipeline();
+        result.status = status;
+        result.observation = observation;
+        result.reconnect = reconnect;
+    };
+
+    Impl::Successor& entry = [&]() -> Impl::Successor& {
+        impl_->successors.push_back(
+            Impl::Successor{own_rel, prepared, admitted, nullptr});
+        return impl_->successors.back();
+    }();
+    const auto executor = co_await asio::this_coro::executor;
+    auto io = std::make_shared<ClientIoState>(executor);
+    entry.io = io;
+    if (adopted)
+        io->socket = std::move(*adopted);
+    tcp::socket& socket = io->socket;
+    Impl::Session session{impl_->c_guid, impl_->f_guid,
+                           impl_->allocate_session(), std::nullopt, RelSeq{}};
+    const uint64_t serial = session.serial;
+    if (deadline) {
+        io->timer.expires_at(*deadline);
+        io->timer.async_wait([io](const boost::system::error_code& error) {
+            if (error)
+                return;
+            io->expired = true;
+            if (!io->committed)
+                close_now(io->socket);
+        });
+    }
+    const auto verify = [&](const CompletionStamp& expected) {
+        impl_->owner.require();
+        CompletionStamp observed = expected;
+        if (control.before_completion_check)
+            control.before_completion_check(observed);
+        observed = completion_for_test(observed, control);
+        require_observed_completion(expected, observed);
+        CompletionLiveIdentity live = impl_->live_identity(session);
+        if (control.before_live_identity_check)
+            control.before_live_identity_check(expected, live);
+        require_live_completion(expected, live);
+    };
+    try {
+        require_deadline();
+        if (remote)
+            co_await async_connect(socket, *remote,
+                                   impl_->stamp(session, AsyncOperationKind::Connect),
+                                   impl_->completions, verify);
+        SessionHello hello;
+        hello.c_store_guid = impl_->c_guid;
+        hello.supported_profiles = profile_bit(impl_->caps.profile);
+        hello.limits = impl_->caps.wire;
+        if (impl_->caps.profile == ProfileId::P29V1)
+            hello.system_source_fingerprint =
+                impl_->preparation->p29v1_system_source_fingerprint(prepared);
+        co_await async_write_message(
+            socket, hello, impl_->caps.wire.max_frame_payload,
+            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->completions, control, verify);
+        // The pipelined-begin fast path, exactly as the head's: write
+        // BEGIN/BODY/FILL before reading STATE, against the route's
+        // retained negotiated limits.
+        const uint32_t frame_cap = impl_->route_limits.max_frame_payload;
+        impl_->preparation->pin_p29v1_system_source_reuse(
+            prepared, *impl_->route_f_fingerprint);
+        co_await async_write_message(
+            socket, begin, frame_cap,
+            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->completions, control, verify);
+        if (control.stall_stage)
+            control.stall_stage->store(ClientStallStage::BeginWritten,
+                                       std::memory_order_relaxed);
+        co_await async_write_component<BodyMessage>(
+            socket, admitted->body, frame_cap,
+            impl_->stamp(session, AsyncOperationKind::WriteFragment),
+            impl_->completions, control, verify);
+        codec::P29WireLimits wire_limits;
+        wire_limits.max_tu_bytes =
+            static_cast<size_t>(impl_->caps.zstd.max_raw_bytes);
+        wire_limits.max_region_bytes = wire_limits.max_tu_bytes;
+        const auto inner_fill =
+            impl_->preparation->fill_p29v1_before_need(prepared);
+        if (!inner_fill) {
+            // fill_p29v1_before_need refused an eager FILL (NEED could list
+            // more regions than the bound). A successor must not build an
+            // answer-FILL path: deviate conservatively. This TX's own
+            // transfer takes the cold-replacement route.
+            deviate(ClientRunStatus::Disconnected,
+                    ClientRunObservation::Disconnected,
+                    EndpointReconnectOutcome::RouteHistoryReset);
+            close_now(socket);
+            cancel_quietly(io->timer);
+            clear_slot();
+            co_return result;
+        }
+        bool fill_sent = false;
+        for (const FillMessage& fill : encode_p29v1_fill_messages(
+                 *inner_fill, frame_cap,
+                 codec::p29v1_fill_inner_bound(wire_limits)))
+            co_await async_write_message(
+                socket, fill, frame_cap,
+                impl_->stamp(session, AsyncOperationKind::WriteFragment),
+                impl_->completions, control, verify);
+        fill_sent = true;
+        // Predict-commit this TX's serializer locally, symmetric with the
+        // head's Site A: frees the route serializer for the next successor's
+        // begin BEFORE the route lock releases at write-complete.
+        impl_->preparation->commit_predicted_p29v1(prepared);
+        if (control.write_complete)
+            control.write_complete();
+
+        // Its own STATE frame on its own socket, compared against the
+        // values captured at open. F defers stage()+STATE until park
+        // release (design section 1.2 point 4), so a released successor
+        // sees the post-predecessor cursor: its own rel_seq with its own
+        // predicted pre-state.
+        Frame state_frame = co_await async_read_frame(
+            socket, impl_->caps.wire.max_frame_payload,
+            impl_->stamp(session, AsyncOperationKind::ReadHeader),
+            impl_->completions, verify);
+        client_checked(impl_->caps.wire.max_frame_payload, [&] {
+            if (state_frame.type == MessageType::ERROR)
+                throw ClientTerminalResult(decode_as<ErrorMessage>(state_frame),
+                                           impl_->caps.wire.max_frame_payload);
+            SessionState received = decode_as<SessionState>(state_frame);
+            validate_session_state(hello, received);
+            const bool exact =
+                received.f_store_guid == impl_->f_guid &&
+                received.namespace_present && received.route_present &&
+                impl_->route_known &&
+                received.history_nonce == impl_->history_nonce &&
+                received.next_rel_seq == own_rel &&
+                received.state_digest == begin.pre_state_digest &&
+                received.system_source_fingerprint == *impl_->route_f_fingerprint &&
+                received.limits == impl_->route_limits &&
+                (received.negotiated_profiles &
+                 profile_bit(impl_->caps.profile)) != 0;
+            if (!exact)
+                throw std::invalid_argument(
+                    "pipelined successor STATE differs from the predicted "
+                    "route witness");
+        });
+
+        // NEED, confirmed through this TX's recorded snapshot (its
+        // serializer pending ended at predict-commit above).
+        if (begin.profile == ProfileId::P29V1) {
+            P29V1NeedStreamDecoder need_decoder(
+                codec::p29v1_need_inner_bound(wire_limits));
+            for (;;) {
+                Frame need_frame = co_await async_read_frame(
+                    socket, frame_cap,
+                    impl_->stamp(session, AsyncOperationKind::ReadHeader),
+                    impl_->completions, verify);
+                if (need_frame.type == MessageType::ERROR)
+                    throw ClientTerminalResult(
+                        decode_as<ErrorMessage>(need_frame), frame_cap);
+                if (need_frame.type != MessageType::NEED)
+                    throw std::invalid_argument(
+                        "P29V1 expected NEED before FILL");
+                need_decoder.push(decode_as<NeedMessage>(need_frame));
+                if (need_decoder.complete())
+                    break;
+            }
+            if (!fill_sent)
+                throw std::logic_error(
+                    "P29V1 successor confirmed NEED without an eager FILL");
+            impl_->preparation->confirm_p29v1_need(
+                prepared, need_decoder.inner_frames());
+        }
+
+        // Level-triggered wait for the predecessor to retire, bounded by
+        // this TX's own deadline. Re-checked before arming and after every
+        // wake, spurious included: predicate is the confirmed cursor
+        // passing the predecessor, the route not being poisoned, and the
+        // pipeline epoch this successor opened under.
+        while (impl_->next_rel.value <= predecessor_rel.value) {
+            if (deadline_crossed()) {
+                deviate(ClientRunStatus::DeadlineExceeded,
+                        ClientRunObservation::DeadlineExpired,
+                        EndpointReconnectOutcome::RouteHistoryReset);
+                close_now(socket);
+                cancel_quietly(io->timer);
+                clear_slot();
+                co_return result;
+            }
+            if (impl_->poisoned ||
+                impl_->pipeline_epoch != epoch_at_open) {
+                deviate(ClientRunStatus::Disconnected,
+                        ClientRunObservation::Disconnected,
+                        EndpointReconnectOutcome::RouteHistoryReset);
+                close_now(socket);
+                cancel_quietly(io->timer);
+                clear_slot();
+                co_return result;
+            }
+            auto timer = std::make_shared<asio::steady_timer>(
+                executor, *deadline - std::chrono::steady_clock::now());
+            // Successors are strictly rel_seq-ordered, so this predecessor
+            // key is exclusively ours: emplace cannot collide.
+            const auto [position, inserted] = impl_->retire_waiters.emplace(
+                predecessor_rel.value, timer);
+            if (!inserted)
+                throw std::logic_error(
+                    "pipelined successor predecessor already has a retire "
+                    "waiter");
+            boost::system::error_code error;
+            co_await timer->async_wait(
+                asio::redirect_error(asio::use_awaitable, error));
+            if (position->second == timer)
+                impl_->retire_waiters.erase(position);
+            if (error && error != asio::error::operation_aborted) {
+                deviate(ClientRunStatus::Disconnected,
+                        ClientRunObservation::Disconnected,
+                        EndpointReconnectOutcome::RouteHistoryReset);
+                close_now(socket);
+                cancel_quietly(io->timer);
+                clear_slot();
+                co_return result;
+            }
+        }
+
+        // Promoted: now the head. Its STATE is already in hand (never read
+        // STATE twice); install the frozen begin and read this TX's COMMIT
+        // through the shared accept() path.
+        if (impl_->poisoned || impl_->pipeline_epoch != epoch_at_open) {
+            deviate(ClientRunStatus::Disconnected,
+                    ClientRunObservation::Disconnected,
+                    EndpointReconnectOutcome::RouteHistoryReset);
+            close_now(socket);
+            cancel_quietly(io->timer);
+            clear_slot();
+            co_return result;
+        }
+        clear_slot();
+        Impl::Active promoted;
+        promoted.prepared = admitted;
+        promoted.handle = prepared;
+        promoted.begin = begin;
+        if (impl_->active)
+            throw std::logic_error(
+                "pipelined successor promoted over a live head dialogue");
+        impl_->active = std::move(promoted);
+        impl_->record(ActionType::TX_BEGIN, begin, serial,
+                      begin.pre_state_digest);
+        Frame commit_frame = co_await async_read_frame(
+            socket, frame_cap,
+            impl_->stamp(session, AsyncOperationKind::ReadHeader),
+            impl_->completions, verify);
+        if (control.stall_stage)
+            control.stall_stage->store(ClientStallStage::CommitRead,
+                                       std::memory_order_relaxed);
+        client_checked(frame_cap, [&] {
+            if (commit_frame.type == MessageType::ERROR)
+                throw ClientTerminalResult(decode_as<ErrorMessage>(commit_frame),
+                                           frame_cap);
+            const TxCommit commit = decode_as<TxCommit>(commit_frame);
+            require_deadline();
+            impl_->accept(commit, ActionType::COMMIT_ACCEPTED, serial);
+            io->committed = true;
+            result.committed_commit = commit;
+            result.committed_input =
+                InputRecordKey{impl_->c_guid, commit.tu_seq};
+            result.observation = ClientRunObservation::ExactCommitObserved;
+        });
+        result.status = ClientRunStatus::Committed;
+        close_now(socket);
+    } catch (const ClientTerminalResult& terminal) {
+        close_now(socket);
+        impl_->poison_pipeline();
+        set_client_terminal_result(result, terminal.error());
+    } catch (const StaleCompletion&) {
+        close_now(socket);
+        impl_->poison_pipeline();
+        result.status = ClientRunStatus::Disconnected;
+        result.observation = ClientRunObservation::Disconnected;
+    } catch (const boost::system::system_error&) {
+        close_now(socket);
+        impl_->poison_pipeline();
+        result.status = io->expired || deadline_crossed()
+                            ? ClientRunStatus::DeadlineExceeded
+                            : ClientRunStatus::Disconnected;
+        result.observation = io->expired || deadline_crossed()
+                                 ? ClientRunObservation::DeadlineExpired
+                                 : ClientRunObservation::Disconnected;
+    } catch (...) {
+        close_now(socket);
+        impl_->poison_pipeline();
+        result.status = ClientRunStatus::Disconnected;
+        result.observation = ClientRunObservation::Disconnected;
+        result.reconnect = EndpointReconnectOutcome::RouteHistoryReset;
+    }
+    clear_slot();
+    cancel_quietly(io->timer);
+    co_return result;
+}
+
 std::optional<tcp::socket> P50ClientEndpoint::adopt_connected_fd(
     asio::any_io_executor executor, int fd, boost::system::error_code& error) {
     // Keep one ownership/validation law for both endpoint directions.  The
@@ -4079,7 +4643,56 @@ void P50ClientEndpoint::reset_after_pipeline_poison() {
     impl_->queued.reset();
     impl_->queued_handle = {};
     impl_->route_f_fingerprint.reset();
+    // Step 4d core (brief point 5): any successor still parked on the old
+    // route line must fail, not resume into the fresh cold route. Bump the
+    // epoch so each parked wait re-checks into a mismatch, drop the window
+    // (the successor coroutines own their own teardown once woken), and
+    // clear the poison flag LAST.
+    ++impl_->pipeline_epoch;
+    impl_->successors.clear();
+    impl_->wake_retire_waiters();
+    impl_->wake_window_slot_waiters();
     impl_->poisoned = false;
+}
+
+boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_window_slot(
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+    impl_->owner.require();
+    // Depth 1: the window can never hold more than the head, so the wait is
+    // invisible -- no timer, no suspension, byte-identical to today.
+    if (impl_->route_pipeline_depth() <= 1)
+        co_return true;
+    const auto executor = co_await asio::this_coro::executor;
+    // Level-triggered: re-check the predicate before arming and after every
+    // wake (spurious included). A cancel from accept() /
+    // reset_after_pipeline_poison() only ever means "re-check now". The
+    // predicate is exactly the negation of prepare_for_route's admission
+    // throw (p50_endpoint.cpp:1107-1110) as seen from the endpoint: a slot
+    // free means the (K+1)-th transfer never reaches that throw.
+    for (;;) {
+        if (impl_->window_size() < impl_->route_pipeline_depth())
+            co_return true;
+        if (!deadline || *deadline <= std::chrono::steady_clock::now())
+            co_return false;
+        auto timer = std::make_shared<asio::steady_timer>(
+            executor, *deadline - std::chrono::steady_clock::now());
+        impl_->window_slot_waiters.push_back(timer);
+        boost::system::error_code error;
+        co_await timer->async_wait(
+            asio::redirect_error(asio::use_awaitable, error));
+        const auto position = std::find(
+            impl_->window_slot_waiters.begin(),
+            impl_->window_slot_waiters.end(), timer);
+        if (position != impl_->window_slot_waiters.end())
+            impl_->window_slot_waiters.erase(position);
+        if (error && error != asio::error::operation_aborted)
+            co_return false;
+        // Poisoned or a crossed epoch in the window means the route line
+        // this transfer prepared against is gone: fail as a slot wait
+        // timeout would, through the ordinary route-local path.
+        if (impl_->poisoned)
+            co_return false;
+    }
 }
 
 P50ServerEndpoint::P50ServerEndpoint(FStoreGuid f_store_guid, EndpointCaps caps,

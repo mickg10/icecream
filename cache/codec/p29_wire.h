@@ -977,6 +977,19 @@ inline void p29v1_materialize_thp_note_madvise_call() noexcept {
 
 } // namespace p29_wire_detail
 
+// Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08 errata):
+// at depth > 1 the sender predict-commits TX n locally (P29Serializer::commit)
+// before TX n+1's begin_tu() runs, which clear_pending()s the NEED expectation
+// TX n's confirm would otherwise validate through pending_. A predict-committed
+// TX snapshots it here (P29Serializer::need_expectation()) and confirms later
+// through the snapshot (P29Serializer::confirm_need_snapshot()), which needs no
+// pending TU. Namespace scope, not a nested type, so route bookkeeping
+// (CActiveTx) can name it without naming the serializer template.
+struct P29NeedExpectation {
+  bool expected = false;
+  std::vector<std::uint32_t> missing_regions;
+};
+
 template <P29SenderProvider Provider, P29WireDictionary Dictionary>
 class P29Serializer {
 public:
@@ -1129,6 +1142,33 @@ public:
     if (!pending_.fill_ready)
       fail("P29 serializer confirms NEED before FILL");
     validate_need(need_frames);
+  }
+
+  // Route pipelining (P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+  // errata): at depth > 1 the sender predict-commits TX n locally (commit()
+  // below) before TX n + 1 begin_tu() runs, which clear_pending()s the NEED
+  // expectation this TX's confirm would otherwise have validated through
+  // pending_. A predict-committed TX therefore snapshots its expectation
+  // first (need_expectation()) and confirms later through the snapshot
+  // (confirm_need_snapshot()), which needs no pending TU. Decoding the late
+  // NEED frames is still safe after a successor begin: MessageCodec::decode
+  // resets its zstd session on every call.
+  [[nodiscard]] P29NeedExpectation need_expectation() const {
+    require_pending();
+    if (!pending_.fill_ready)
+      fail("P29 serializer snapshots NEED before FILL");
+    P29NeedExpectation snapshot;
+    snapshot.expected =
+        !pending_.manifest_blocks.empty() || !pending_.missing_regions.empty();
+    snapshot.missing_regions = pending_.missing_regions;
+    return snapshot;
+  }
+
+  void confirm_need_snapshot(
+      const P29NeedExpectation &snapshot,
+      std::span<const std::uint8_t> need_frames) {
+    validate_need_against(snapshot.expected, snapshot.missing_regions,
+                          need_frames);
   }
 
   void commit() {
@@ -1405,9 +1445,16 @@ private:
   }
 
   void validate_need(std::span<const std::uint8_t> bytes) {
+    validate_need_against(!pending_.manifest_blocks.empty() ||
+                              !pending_.missing_regions.empty(),
+                          pending_.missing_regions, bytes);
+  }
+
+  void validate_need_against(
+      bool expected,
+      const std::vector<std::uint32_t> &missing_regions,
+      std::span<const std::uint8_t> bytes) {
     using namespace p29_wire_detail;
-    const bool expected =
-        !pending_.manifest_blocks.empty() || !pending_.missing_regions.empty();
     if (!expected) {
       if (!bytes.empty())
         fail("P29 received an unrequested NEED");
@@ -1420,9 +1467,9 @@ private:
         frames[0].payload, provider_.wire_limits().max_tu_bytes);
     Cursor cursor(raw);
     const std::uint64_t count = cursor.varint();
-    if (count != pending_.missing_regions.size())
+    if (count != missing_regions.size())
       fail("P29 NEED Region count differs");
-    for (std::uint32_t expected_id : pending_.missing_regions)
+    for (std::uint32_t expected_id : missing_regions)
       if (cursor.varint() != expected_id)
         fail("P29 NEED Region identity differs");
     if (cursor.varint() != 0 || !cursor.empty())

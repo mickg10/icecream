@@ -574,6 +574,25 @@ P50ZstdSourceSender::transfer_bytes(
     // completions so byte accounting is bounded and includes either retry.
     impl_->wire_completions.clear();
 
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata item 5): wait for a free outstanding-dialogue slot
+    // BEFORE prepare_for_route, so a (K+1)-th concurrent transfer never
+    // reaches the authority's admission throw
+    // (cache/p50_endpoint.cpp:1107-1110) which would escalate to the sticky
+    // cold-replacement path. At the default depth of 1 this returns true
+    // without suspending. On timeout the transfer takes its ordinary
+    // route-local deadline failure, never the sticky path.
+    if (impl_->route_bound) {
+        const bool slot = co_await impl_->endpoint->wait_for_window_slot(
+            std::optional<Clock::time_point>(deadline));
+        if (!slot) {
+            ZstdSourceTransferResult result =
+                impl_->invalid(ZstdSourceTransferStatus::DeadlineExceeded);
+            impl_->quarantine_transport(result, explicit_route);
+            co_return result;
+        }
+    }
+
     PreparedTuHandle prepared;
     uint64_t prepare_route_ns = 0;
     try {

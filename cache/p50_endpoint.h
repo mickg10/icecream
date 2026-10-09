@@ -326,8 +326,22 @@ public:
     // outgrow a socket buffer.  confirm_p29v1_need() must check NEED later.
     std::optional<std::span<const uint8_t>> fill_p29v1_before_need(
         PreparedTuHandle handle);
+    // Read-only probe of the same bound: true exactly when
+    // fill_p29v1_before_need() would return a FILL, without building one.
+    // Route pipelining, P50_ROUTE_PIPELINING.md section 1.1, 2026-10-08
+    // errata: the endpoint dispatch uses this to keep a would-be successor
+    // that must answer NEED interactively on the head path instead.
+    [[nodiscard]] bool p29v1_fill_before_need_possible(PreparedTuHandle handle);
     void confirm_p29v1_need(PreparedTuHandle handle,
                             std::span<const uint8_t> inner_need);
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata): run this handle's P29V1 serializer commit locally,
+    // ahead of F's TX_COMMIT ack, recording its predicted post-state digest
+    // and freeing the route's serializer for the next successor's begin.
+    // Only valid at route_pipeline_depth > 1; nothing calls it at the
+    // default depth of 1, where the legacy confirm-only commit inside
+    // commit() stays byte-identical.
+    void commit_predicted_p29v1(PreparedTuHandle handle);
     [[nodiscard]] Digest128 p29v1_system_source_fingerprint(
         PreparedTuHandle handle) const;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse(
@@ -361,6 +375,10 @@ public:
     [[nodiscard]] size_t route_history_entries() const;
     [[nodiscard]] size_t route_history_entries(PreparationRouteKey route) const;
     [[nodiscard]] ProfileId profile() const;
+    // Route pipelining (research/designs/P50_ROUTE_PIPELINING.md "Step 4"):
+    // the per-route outstanding-successor bound this authority admits.
+    // 1 is the byte-identical default.
+    [[nodiscard]] uint32_t route_pipeline_depth() const;
 
     // Route owners call this only after all handles for the relationship have
     // been released.  It drops matcher/history state without touching the
@@ -654,11 +672,36 @@ public:
     // poison.
     void reset_after_pipeline_poison();
 
+    // Step 4d core (research/designs/P50_ROUTE_PIPELINING.md section 1.1,
+    // 2026-10-08 errata): suspend this coroutine until the endpoint's
+    // outstanding-dialogue window has a free slot (fewer than
+    // route_pipeline_depth dialogues: head plus successors). Level
+    // triggered; woken by accept() retirement and by poison/epoch changes.
+    // Bounded by deadline: a timeout resolves to false and the caller takes
+    // its ordinary route-local deadline failure. At the default depth of 1
+    // this returns true immediately without suspending, so the sender's
+    // pre-prepare wait is invisible to every existing caller.
+    boost::asio::awaitable<bool> wait_for_window_slot(
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
 private:
     boost::asio::awaitable<ClientRunResult> run_connected(
         std::optional<boost::asio::ip::tcp::endpoint> remote,
         std::optional<boost::asio::ip::tcp::socket> socket,
         PreparedTuHandle prepared, EndpointIoControl control,
+        std::optional<std::chrono::steady_clock::time_point> deadline);
+
+    // Step 4d core: one successor dialogue at depth > 1. Never touches the
+    // confirmed cursor fields until promoted; opens its own connection;
+    // predict-commits its own serializer right after its eager FILL write
+    // (symmetric with the head's Site A) so the next successor can begin;
+    // waits level-triggered for its predecessor to retire before reading
+    // its own COMMIT through the shared accept() path.
+    boost::asio::awaitable<ClientRunResult> run_connected_successor(
+        std::optional<boost::asio::ip::tcp::endpoint> remote,
+        std::optional<boost::asio::ip::tcp::socket> adopted,
+        PreparedTuHandle prepared, PreparedInputPtr admitted,
+        EndpointIoControl control,
         std::optional<std::chrono::steady_clock::time_point> deadline);
 
     struct Impl;
