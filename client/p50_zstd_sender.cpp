@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <chrono>
 #include <exception>
 #include <fcntl.h>
@@ -23,6 +24,22 @@
 
 namespace icecc::p50 {
 namespace {
+
+// Diagnostic only: name the exception a catch-all is about to turn into an
+// untyped TerminalError, so a farm leg can tell which local invariant fired.
+void report_swallowed_exception(const char* site, unsigned attempt) noexcept {
+    const char* what = "non-standard exception";
+    try {
+        throw;
+    } catch (const std::exception& error) {
+        what = error.what();
+    } catch (...) {
+    }
+    std::fprintf(stderr,
+                 "P50_SENDER_EXCEPTION site=%s attempt=%u what=%s\n", site,
+                 attempt, what);
+    std::fflush(stderr);
+}
 
 using Clock = std::chrono::steady_clock;
 
@@ -693,6 +710,7 @@ P50ZstdSourceSender::transfer_bytes(
                             std::get<ConnectedFdFactory>(target), deadline,
                             reopen ? impl_->config.reopen : std::nullopt);
                     } catch (...) {
+                        report_swallowed_exception("open", attempt);
                         ZstdSourceTransferResult result =
                             impl_->invalid(ZstdSourceTransferStatus::TerminalError);
                         result.attempts = attempt;
@@ -731,6 +749,7 @@ P50ZstdSourceSender::transfer_bytes(
             // is gone for this READY lease, which is not a route ambiguity.
             throw;
         } catch (...) {
+            report_swallowed_exception("run", attempt);
             ZstdSourceTransferResult result =
                 impl_->invalid(ZstdSourceTransferStatus::TerminalError);
             result.attempts = attempt;

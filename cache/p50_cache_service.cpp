@@ -3086,6 +3086,20 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                         local::SourceTransferErrorCode::
                             PermanentLocalProfileUnavailable));
                 } catch (...) {
+                    {
+                        // Diagnostic only: name what the catch-all swallows.
+                        const char* what = "non-standard exception";
+                        try {
+                            throw;
+                        } catch (const std::exception& error) {
+                            what = error.what();
+                        } catch (...) {
+                        }
+                        std::fprintf(stderr,
+                                     "P50_SENDER_EXCEPTION site=owner attempt=0 what=%s\n",
+                                     what);
+                        std::fflush(stderr);
+                    }
                     observed.status = ZstdSourceTransferStatus::TerminalError;
                     observed.profile = relationship.profile;
                     observed.replacement_required = true;
