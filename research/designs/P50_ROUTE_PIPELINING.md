@@ -87,6 +87,75 @@ so this whole paragraph is dead code there, and
 `test_p29v1_k1_pipeline_wire_identity` (§5.1, part of 4a) remains the
 byte-identity gate.
 
+**Errata (2026-10-08, during Step 4 sub-step 4d core implementation):** the
+"`K>1`: called locally ... right after the FILL write completes" paragraph
+above (at ~276-285 in this file) is correct about the *write-completion /
+lock-release point* but incomplete about one interaction it did not call out:
+the head's own NEED confirm. `CRoute::confirm_need_v1`
+(`cache/p50_slice0.cpp:2032-2046`) validates a NEED through the *shared,
+per-route* `P29V1State` serializer while TX `n` is still its pending TU
+(`P29Serializer::confirm_need`, `cache/codec/p29_wire.h:1127-1132`, calls
+`require_pending()`, `p29_wire.h:1240-1243`), and `begin_v1`
+(`cache/p50_slice0.cpp:1923-1924`) clears the per-route
+`answered_need`/`fill_answered` flags that guard it. Under `K>1`, TX `n+1`'s
+`begin_tu()` (in its `prepare_for_route`, after the 4c lock release at TX
+`n`'s FILL write) can therefore run before TX `n`'s NEED frame is read back,
+and TX `n`'s legacy confirm would then either throw ("no early P29V1 FILL to
+confirm", because `fill_answered` was cleared) or validate TX `n`'s NEED
+against TX `n+1`'s pending state. The local predict-commit of TX `n`
+(`commit_predicted_v1`) additionally ends TX `n`'s serializer pending
+(`clear_pending()`, `p29_wire.h:1180`), so the NEED expectation must be
+captured *before* it. Resolution (approved by sorbet-main, 2026-10-08; the
+§1.1 "~3555" placement itself stands):
+
+1. `P29Serializer` (`cache/codec/p29_wire.h`) gains
+   `struct P29NeedExpectation { bool expected; std::vector<uint32_t> missing_regions; }`,
+   `need_expectation()` (requires a pending TU with `fill_ready`, snapshots
+   `!manifest_blocks.empty() || !missing_regions.empty()` plus the
+   `missing_regions` list — exactly what `validate_need`
+   (`p29_wire.h:1407-1430`) computes), and
+   `confirm_need_snapshot(const P29NeedExpectation&, need_frames)`, which
+   needs **no** pending TU: `validate_need`'s body is factored into one
+   helper taking `(expected, missing_regions, bytes)` and called by both
+   `validate_need` and `confirm_need_snapshot` with identical `fail()`
+   strings, so `K=1` stays byte-identical. Decoding TX `n`'s NEED frames
+   after TX `n+1`'s `begin_tu()` is safe: `MessageCodec::decode`
+   (`p29_wire.h:485-512`) resets its zstd session on every call.
+2. `CActiveTx` (`cache/p50_slice0.h:325-338`) gains
+   `std::optional<codec::P29NeedExpectation> predicted_need` and
+   `bool need_confirmed`. `commit_predicted_v1()` records, *before*
+   `serializer.commit()`: the snapshot (eager-FILL case, per-route
+   `answered_need` empty) or `need_confirmed = true` (fresh-head answer
+   case, NEED already consumed). A per-entry confirm keyed by `rel_seq`
+   replaces the serializer-pending path for predict-committed entries; the
+   per-route `answered_need`/`fill_answered` flags continue to gate only the
+   newest (pending) TX. `retire_locked_commits` treats a predict-committed
+   head with `!need_confirmed` as a deviation (F always sends NEED before
+   COMMIT).
+3. `run_connected`'s `K>1` gates are: at Site A/B, immediately after the
+   FILL write, `commit_predicted_p29v1(handle)` (a new owner-checked
+   `P50PreparationAuthority` wrapper) *then* `control.write_complete()` —
+   the 4c lock-release point stays where 4c landed it — plus the
+   poison-on-deviation guard from the 4d brief (no reconcile branches while
+   successors exist). At `depth == 1` no predict-commit runs and
+   `write_complete` fires exactly where 4c landed it. Nothing else in the
+   straight-line body changes.
+4. A would-be successor for which `fill_p29v1_before_need` returns
+   `nullopt` (NEED could list more regions than the early-FILL bound) does
+   not open a successor dialogue: it keeps the route lock, waits
+   level-triggered on the same waiter machinery until the window is empty,
+   then runs the *unchanged* head path (fresh-head, Site B). Its begun
+   `pre_state_digest` equals `impl_->state` once the head retires as
+   predicted; a mismatch is a deviation.
+5. The endpoint's window-slot wait (`wait_for_window_slot`) runs in
+   `P50ZstdSourceSender::transfer_bytes` *before* `prepare_for_route`, so a
+   `(K+1)`-th concurrent transfer never reaches
+   `prepare_for_route`'s admission throw (`cache/p50_endpoint.cpp:1107-1110`
+   / `begin_v1`'s `cache/p50_slice0.cpp:1881-1882`), which would otherwise
+   escalate to the sticky cold-replacement path
+   (`client/p50_zstd_sender.cpp:600-607`). The admission throw stays as a
+   defensive assert. At `depth == 1` the wait returns without suspending.
+
 Branch: `perf-pipe`, off `a348414e` ("services/sys_close_range.h: guard the UAPI
 include with `__has_include`"), the current farm "perf-combo" build
 (instrumentation + robustness fixes + perf-opt).
