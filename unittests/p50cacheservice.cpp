@@ -3587,6 +3587,124 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(second_owner_id != second_caller_id);
 }
 
+// Regression coverage for the sidecar input-lifecycle retirement bug: a
+// non-retirement InputLifecycle action (e.g. CloseAcceptedJob) must get a
+// sidecar-local owner-apply budget sized from decode time (Options::
+// sidecar_lifecycle_apply_budget / ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS), not
+// the pre-decode 500ms handshake deadline. apply_input_lifecycle_on_owner()
+// is called directly on a freshly constructed SidecarRuntime -- no control
+// socket, no HandoffRequest dialogue, exactly like attach_input_on_owner /
+// finish_input_attachment_on_owner above -- because its nullopt-vs-value
+// outcome depends only on timing against the owner thread, not on the
+// InputLifecycleRequest resolving to a real, previously-attached input
+// record (an unresolved key still completes the owner-side future with some
+// non-Applied InputLifecycleApplyStatus; see the `decision.status !=
+// InputLifecycleApplyStatus::Applied` early-return inside the posted lambda).
+void test_input_lifecycle_owner_apply_stall_budget() {
+    service::RuntimeConfig config = test_runtime_config();
+    // Test-only seam (ICECC_P50_ENDPOINT_TEST_HOOKS only): makes every
+    // apply_input_lifecycle_on_owner() call on this runtime stall the owner
+    // for 1500ms before applying, standing in for a genuinely busy F without
+    // needing real contention.
+    config.input_lifecycle_owner_apply_stall_for_test = std::chrono::milliseconds(1500);
+    service::SidecarRuntime runtime(std::move(config));
+
+    InputLifecycleRequest request{};
+    request.action = InputLifecycleAction::CloseAcceptedJob;
+    request.operation_id = 4001;
+
+    // Before the fix, handle_connection reused the 500ms pre-decode
+    // kHandshakeMilliseconds handshake deadline as the budget for this exact
+    // owner-apply/response/ack sequence. A 500ms budget cannot cover a
+    // 1500ms owner stall, so the call must come back empty (handle_connection
+    // then closes the connection with no reply at all).
+    {
+        request.operation_id = 4001;
+        const auto start = std::chrono::steady_clock::now();
+        const std::optional<InputLifecycleApplyStatus> result =
+            runtime.apply_input_lifecycle_on_owner(
+                request, start + std::chrono::milliseconds(500));
+        // 500ms budget (pre-fix handshake-deadline reuse) does not cover a
+        // 1500ms owner stall; apply_input_lifecycle_on_owner returns nullopt.
+        CHECK(!result.has_value());
+    }
+    // After the fix, the default 5000ms sidecar_lifecycle_apply_budget
+    // (ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS unset) comfortably covers the
+    // same 1500ms owner stall, and a normal reply can be sent.
+    {
+        request.operation_id = 4002;
+        const auto start = std::chrono::steady_clock::now();
+        const std::optional<InputLifecycleApplyStatus> result =
+            runtime.apply_input_lifecycle_on_owner(
+                request, start + std::chrono::milliseconds(5000));
+        // default 5000ms sidecar_lifecycle_apply_budget covers a 1500ms
+        // owner stall; apply_input_lifecycle_on_owner returns a value
+        // instead of nullopt.
+        CHECK(result.has_value());
+    }
+}
+
+// Captures stderr around a single, synchronous apply_input_lifecycle_on_owner()
+// call made with a deadline that has already elapsed *before* the call, so
+// the outcome is deterministic (no race against the owner thread or the
+// 2ms-granularity spin-wait poll): it must take the function's very first
+// (stop_requested_ || now >= deadline) branch and print exactly one
+// `P50_INPUT_LIFECYCLE_REFUSED stage=owner-apply-deadline` line. This is the
+// diagnostic a tight ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS (e.g. "1000") would
+// eventually produce once its budget has fully elapsed; pinning the test to
+// an already-past deadline exercises that exact line without depending on
+// sleep/poll timing (a 1000ms-budget-vs-1500ms-stall race would instead most
+// likely be caught by the later 2ms-poll spin-wait loop and print
+// stage=owner-apply-wait, a *different* line -- see
+// test_input_lifecycle_owner_apply_stall_budget() above for that path).
+void test_input_lifecycle_owner_apply_deadline_refused_line() {
+    service::RuntimeConfig config = test_runtime_config();
+    service::SidecarRuntime runtime(std::move(config));
+
+    InputLifecycleRequest request{};
+    request.action = InputLifecycleAction::CloseAcceptedJob;
+    request.operation_id = 4003;
+    const auto already_past =
+        std::chrono::steady_clock::now() - std::chrono::milliseconds(50);
+
+    fflush(stderr);
+    char capture_path[] = "/tmp/p50_lifecycle_refused_capture_XXXXXX";
+    const int capture_fd = mkstemp(capture_path);
+    CHECK(capture_fd >= 0);
+    const int saved_stderr = dup(STDERR_FILENO);
+    CHECK(saved_stderr >= 0);
+    CHECK(dup2(capture_fd, STDERR_FILENO) >= 0);
+
+    const std::optional<InputLifecycleApplyStatus> result =
+        runtime.apply_input_lifecycle_on_owner(request, already_past);
+
+    fflush(stderr);
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+
+    std::string captured;
+    {
+        char buffer[4096];
+        const ssize_t read_bytes = pread(capture_fd, buffer, sizeof(buffer), 0);
+        if (read_bytes > 0)
+            captured.assign(buffer, static_cast<size_t>(read_bytes));
+    }
+    close(capture_fd);
+    ::unlink(capture_path);
+
+    // An already-elapsed deadline refuses the request before posting to
+    // the owner, returning nullopt.
+    CHECK(!result.has_value());
+    // The early deadline/stop_requested check prints the
+    // stage=owner-apply-deadline REFUSED line.
+    CHECK(captured.find("P50_INPUT_LIFECYCLE_REFUSED stage=owner-apply-deadline") !=
+          std::string::npos);
+    // The REFUSED line carries the CloseAcceptedJob action value (2).
+    CHECK(captured.find("action=2 ") != std::string::npos);
+    // The REFUSED line carries this request's operation_id.
+    CHECK(captured.find("operation=4003 ") != std::string::npos);
+}
+
 void test_operation_cancel_commit_race_preserves_witness() {
     namespace asio = boost::asio;
     std::vector<uint8_t> input(8192);
@@ -3893,6 +4011,8 @@ int main(int argc, char** argv) {
         test_runtime_owner_failure_fail_stop_subprocess();
         test_runtime_live_owner_failure_fail_stop_subprocess();
         test_runtime_zstd_tu_af_unix_loopback();
+        test_input_lifecycle_owner_apply_stall_budget();
+        test_input_lifecycle_owner_apply_deadline_refused_line();
         test_operation_cancel_commit_race_preserves_witness();
         test_runtime_stop_interrupts_active_endpoint();
         ready_reader_close_after_bind_is_fail_closed();
