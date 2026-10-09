@@ -411,10 +411,11 @@ def check(path: Path) -> None:
                 # it), so a SESSION_REPLACED that opened this session was
                 # ordinary pipelining, not a lost acknowledgement -- the
                 # predecessor's own connection is still the live ack channel.
-                # At K=1 this clear can never fire: C cannot begin while a
-                # commit is unacknowledged, so no F TX_BEGIN ever names a
-                # queued TX while commit_disconnected is set.
-                if f["commit_disconnected"]:
+                # Guarded on the pipelined shape (a queue holding a successor
+                # beyond the unacknowledged head) so a K=1 lost-ack marker
+                # can never be erased by a replayed begin: at K=1 the queue
+                # never holds more than the one unacknowledged member.
+                if f["commit_disconnected"] and len(c["queue"]) > 1:
                     f["commit_disconnected"] = False
                 if (
                     row["history_nonce"],
