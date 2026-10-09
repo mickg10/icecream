@@ -1339,10 +1339,22 @@ std::shared_ptr<const P50PreparationAuthority::PreparedSource>
 P50PreparationAuthority::prepare_source(
     PrepareRequestKey request,
     std::shared_ptr<const std::vector<uint8_t>> exact_input,
-    Digest128 raw_digest) {
+    Digest128 raw_digest,
+    PrepareSourceTiming* timing) {
     if (!exact_input || request.producer_session == 0 || request.request_token == 0 ||
         exact_input->size() > impl_->zstd_limits.max_raw_bytes)
         return nullptr;
+    const auto clock_now = [] {
+        return std::chrono::steady_clock::now();
+    };
+    const auto elapsed_ns = [](auto begin, auto end) -> uint64_t {
+        const auto value =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin)
+                .count();
+        return value > 0 ? static_cast<uint64_t>(value) : 0;
+    };
+    uint64_t mutex_wait_ns = 0;
+    uint64_t mutex_hold_ns = 0;
     auto shared = std::make_shared<Impl::Shared>();
     shared->request = request;
     shared->raw_bytes = exact_input->size();
@@ -1359,16 +1371,25 @@ P50PreparationAuthority::prepare_source(
     // The plan phase needs the interner to exist: ensure_p29v1_locked()
     // takes source_mutex itself, so it runs in its own short scope first.
     {
+        const auto wait_begin = clock_now();
         std::lock_guard lock(impl_->source_mutex);
+        const auto held_begin = clock_now();
+        mutex_wait_ns += elapsed_ns(wait_begin, held_begin);
         impl_->ensure_p29v1_locked();
+        mutex_hold_ns += elapsed_ns(held_begin, clock_now());
     }
     // Plan OUTSIDE the lock: the split walk + the read-only published
     // probes.  The single writer may intern concurrently; every hit was
     // content-validated against an immutable published record.
+    const auto plan_begin = clock_now();
     const std::vector<codec::P29RegionPlanEntry> plan =
         impl_->p29_authority->plan_p29v1(*shared->raw);
+    const uint64_t plan_ns = elapsed_ns(plan_begin, clock_now());
     {
+        const auto wait_begin = clock_now();
         std::lock_guard lock(impl_->source_mutex);
+        const auto held_begin = clock_now();
+        mutex_wait_ns += elapsed_ns(wait_begin, held_begin);
         const TuSeq tu_seq = impl_->p29_authority->reserve_tu_seq();
         shared->tu_seq = tu_seq;
         // Locked half of prepare_p29v1_at_seq: reserve, intern, stats.
@@ -1385,6 +1406,7 @@ P50PreparationAuthority::prepare_source(
             impl_->p29_authority->intern_p29v1_locked_planned(
                 *shared->raw, plan, tu_seq, raw_digest);
         impl_->p29_authority->commit_tu_seq(tu_seq);
+        mutex_hold_ns += elapsed_ns(held_begin, clock_now());
     }
     // Verify OUTSIDE the C-wide mutex.  On failure, re-take the mutex and
     // reproduce exactly today's combined-path behaviour: mark non-runnable
@@ -1397,6 +1419,11 @@ P50PreparationAuthority::prepare_source(
         std::lock_guard lock(impl_->source_mutex);
         impl_->p29_authority->mark_p29v1_nonrunnable(error);
         throw;
+    }
+    if (timing) {
+        timing->mutex_wait_ns = mutex_wait_ns;
+        timing->mutex_hold_ns = mutex_hold_ns;
+        timing->plan_ns = plan_ns;
     }
     auto prepared = std::make_shared<PreparedSource>();
     prepared->shared = std::move(shared);

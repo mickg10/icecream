@@ -319,10 +319,21 @@ public:
     // owner installs the result; prepare_for_route then reuses it for the
     // same request, and release_source drops it if no route admitted it.
     class PreparedSource;
+    // Optional per-call timings for the stage trace (all zero when the
+    // caller does not ask): mutex_wait_ns is the time blocked acquiring the
+    // C-wide source mutex (both acquisitions), mutex_hold_ns the time it
+    // was HELD (reserve+intern+commit, the serialized term), plan_ns the
+    // lock-free planning walk.  steady_clock deltas; nanoseconds.
+    struct PrepareSourceTiming {
+        uint64_t mutex_wait_ns = 0;
+        uint64_t mutex_hold_ns = 0;
+        uint64_t plan_ns = 0;
+    };
     std::shared_ptr<const PreparedSource> prepare_source(
         PrepareRequestKey request,
         std::shared_ptr<const std::vector<uint8_t>> exact_input,
-        Digest128 raw_digest);
+        Digest128 raw_digest,
+        PrepareSourceTiming* timing = nullptr);
     void install_source(PrepareRequestKey request,
                         std::shared_ptr<const PreparedSource> prepared);
     void release_source(PrepareRequestKey request) noexcept;

@@ -2824,6 +2824,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     std::optional<std::shared_ptr<const std::vector<uint8_t>>> source_bytes;
     Digest128 source_digest{};
     std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared_source;
+    P50PreparationAuthority::PrepareSourceTiming prepare_timing{};
     if (prep_ahead) {
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
         if (config_.before_source_read_for_test)
@@ -2847,13 +2848,17 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             source_digest = digest128(**source_bytes);
             try {
                 prepared_source = source_authority_->prepare_source(
-                    route_request, *source_bytes, source_digest);
+                    route_request, *source_bytes, source_digest,
+                    &prepare_timing);
             } catch (...) {
             }
             icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
-                {{"ok", prepared_source != nullptr ? 1 : 0}});
+                {{"ok", prepared_source != nullptr ? 1 : 0},
+                 {"mutex_wait_ns", (int64_t)prepare_timing.mutex_wait_ns},
+                 {"mutex_hold_ns", (int64_t)prepare_timing.mutex_hold_ns},
+                 {"plan_ns", (int64_t)prepare_timing.plan_ns}});
         }
     }
 
@@ -2929,13 +2934,17 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         if (profile == ProfileId::P29V1 && source_authority_) {
             try {
                 prepared_source = source_authority_->prepare_source(
-                    route_request, *source_bytes, source_digest);
+                    route_request, *source_bytes, source_digest,
+                    &prepare_timing);
             } catch (...) {
             }
             icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
-                {{"ok", prepared_source != nullptr ? 1 : 0}});
+                {{"ok", prepared_source != nullptr ? 1 : 0},
+                 {"mutex_wait_ns", (int64_t)prepare_timing.mutex_wait_ns},
+                 {"mutex_hold_ns", (int64_t)prepare_timing.mutex_hold_ns},
+                 {"plan_ns", (int64_t)prepare_timing.plan_ns}});
         }
     }
 
