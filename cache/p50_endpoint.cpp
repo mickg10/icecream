@@ -4542,8 +4542,12 @@ P50ClientEndpoint::run_connected_successor(
                 clear_slot();
                 co_return result;
             }
-            auto timer = std::make_shared<asio::steady_timer>(
-                executor, *deadline - std::chrono::steady_clock::now());
+            const auto arm =
+                deadline
+                    ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                          *deadline - std::chrono::steady_clock::now())
+                    : std::chrono::milliseconds(10);
+            auto timer = std::make_shared<asio::steady_timer>(executor, arm);
             // Successors are strictly rel_seq-ordered, so this predecessor
             // key is exclusively ours: emplace cannot collide.
             const auto [position, inserted] = impl_->retire_waiters.emplace(
@@ -4782,11 +4786,19 @@ boost::asio::awaitable<bool> P50ClientEndpoint::wait_for_window_slot(
     for (;;) {
         if (impl_->window_size() < impl_->route_pipeline_depth())
             co_return true;
-        if (!deadline || *deadline <= std::chrono::steady_clock::now())
+        if (deadline && *deadline <= std::chrono::steady_clock::now())
             co_return false;
-        auto timer = std::make_shared<asio::steady_timer>(
-            executor, *deadline - std::chrono::steady_clock::now());
-        impl_->window_slot_waiters.push_back(timer);
+        // No deadline: the historical unbounded-wait behavior of run()
+        // itself -- poll level-triggered instead of failing a caller that
+        // never asked for a bound.
+        const auto arm =
+            deadline
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                      *deadline - std::chrono::steady_clock::now())
+                : std::chrono::milliseconds(10);
+        auto timer = std::make_shared<asio::steady_timer>(executor, arm);
+        if (deadline)
+            impl_->window_slot_waiters.push_back(timer);
         boost::system::error_code error;
         co_await timer->async_wait(
             asio::redirect_error(asio::use_awaitable, error));
