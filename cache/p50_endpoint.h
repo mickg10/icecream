@@ -493,6 +493,14 @@ struct ServerRunResult {
     // via the classic four-timestamp NTP algorithm. Never sent over the
     // wire; populated only for ICECC_P50_F_RESULT_TRACE.
     uint64_t f_begin_recv_wall_ns = 0;
+    // Diagnostic-only. Set by step 5b's MSG_PEEK (taken immediately before
+    // stage()/the SESSION_STATE write; see run_connected) when a TX_BEGIN
+    // was already sitting in the socket's receive buffer at that point --
+    // e.g. a client using enable_pipelined_begin(), or, in the future, any
+    // outstanding leg of a K>1 pipelined route. Never gates behavior and
+    // never travels over the wire; step 5c's per-route sequencer is what
+    // turns this observation into an admission decision.
+    std::optional<RelSeq> f_hello_time_peeked_begin_rel_seq;
 };
 
 enum class InputJobState : uint8_t {

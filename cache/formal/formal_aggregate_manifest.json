@@ -120,6 +120,24 @@
       ]
     },
     {
+      "id": "route-pipeline",
+      "runner": "run_route_pipeline_tlc.sh",
+      "timeout_seconds": 3600,
+      "rows": [
+        {"id": "route-pipeline-k1", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipeline.cfg", "outcome": "clean", "marker": "== route-pipeline-k1 =="},
+        {"id": "route-pipeline-k2", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineK2.cfg", "outcome": "clean", "marker": "== route-pipeline-k2 =="},
+        {"id": "route-pipeline-k3", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineK3.cfg", "outcome": "clean", "marker": "== route-pipeline-k3 =="},
+        {"id": "route-pipeline-progress", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineProgress.cfg", "outcome": "clean", "marker": "== route-pipeline-progress =="},
+        {"id": "route-pipeline-early-activate-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM1.cfg", "outcome": "expected-failure", "invariant": "ActiveIsNextExpected", "marker": "== route-pipeline-early-activate-mutant ("},
+        {"id": "route-pipeline-skip-successor-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM2.cfg", "outcome": "expected-failure", "invariant": "ActiveIsNextExpected", "marker": "== route-pipeline-skip-successor-mutant ("},
+        {"id": "route-pipeline-no-bulk-release-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM3.cfg", "outcome": "expected-failure", "invariant": "ParkedCurrentEpochOnly", "marker": "== route-pipeline-no-bulk-release-mutant ("},
+        {"id": "route-pipeline-state-at-park-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM4.cfg", "outcome": "expected-failure", "invariant": "StateSentNeverAheadOfCursor", "marker": "== route-pipeline-state-at-park-mutant ("},
+        {"id": "route-pipeline-retire-any-order-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM5.cfg", "outcome": "expected-failure", "invariant": "DigestChainConsistency", "marker": "== route-pipeline-retire-any-order-mutant ("},
+        {"id": "route-pipeline-successor-survives-fault-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM6.cfg", "outcome": "expected-failure", "invariant": "QueueCurrentEpochOnly", "marker": "== route-pipeline-successor-survives-fault-mutant ("},
+        {"id": "route-pipeline-stale-ack-mutant", "module": "Protocol50RoutePipeline.tla", "config": "Protocol50RoutePipelineM7.cfg", "outcome": "expected-failure", "invariant": "NoCrossEpochRetire", "marker": "== route-pipeline-stale-ack-mutant ("}
+      ]
+    },
+    {
       "id": "zstd-route-finput",
       "runner": "run_zstd_route_finput_composition_tlc.sh",
       "selection_authority": "s6_mutation_manifest.jsonl",

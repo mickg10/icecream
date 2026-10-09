@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -15,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -327,12 +329,26 @@ struct CActiveTx {
     size_t region_count = 0;
     size_t block_use_count = 0;
     size_t new_block_count = 0;
+    // Set only once this entry's P29Serializer::commit() has already run
+    // locally on C, ahead of F's real TX_COMMIT ack (route pipeline depth >
+    // 1).  accept_commit() uses this to tell an eagerly-committed entry
+    // (confirm-only: compare against this digest) from one whose serializer
+    // commit is still owed to it (depth == 1, byte-identical legacy path).
+    std::optional<Digest128> predicted_post_digest;
 };
 
 class CRoute {
 public:
+    // max_active_tx bounds how many TX_BEGINs this route may have
+    // outstanding (begun but not yet retired by a real F TX_COMMIT ack) at
+    // once.  The default of 1 reproduces every existing call site and every
+    // existing behavior byte-for-byte: begin_v1() cannot be called again
+    // until accept_commit() retires the sole outstanding entry, exactly as
+    // today.  Values above 1 are the route-pipelining feature; see
+    // commit_predicted_v1() and research/designs/P50_ROUTE_PIPELINING.md.
     CRoute(CAuthority& authority, FStoreGuid f_store_guid,
-           HistoryNonce history_nonce, ActionTrace* trace = nullptr);
+           HistoryNonce history_nonce, ActionTrace* trace = nullptr,
+           size_t max_active_tx = 1);
     ~CRoute();
     CRoute(const CRoute&) = delete;
     CRoute& operator=(const CRoute&) = delete;
@@ -347,6 +363,15 @@ public:
     std::optional<std::span<const uint8_t>> fill_v1_before_need(
         size_t max_need_regions);
     void confirm_need_v1(std::span<const uint8_t> inner_need);
+    // Run the newest ACTIVE_TX's P29Serializer::commit() locally, ahead of
+    // F's real TX_COMMIT ack, and record its predicted post-state digest.
+    // This is what frees the (non-reentrant) P29V1 serializer so a second
+    // TX_BEGIN can be issued while the first is still only predicted, not
+    // F-confirmed -- it is the only way max_active_tx() > 1 can ever hold
+    // more than one entry.  At max_active_tx() == 1 nothing in this design
+    // calls it: the legacy path still runs the equivalent commit() lazily,
+    // inside accept_commit(), once F's ack actually arrives.
+    const CActiveTx& commit_predicted_v1();
     void restart_v1_for_transport_retry();
     void reset_v1_route(FStoreGuid f_store_guid,
                         HistoryNonce history_nonce);
@@ -354,26 +379,53 @@ public:
                        ActionType action = ActionType::COMMIT_ACCEPTED);
     void abandon_active();
 
-    [[nodiscard]] const std::optional<CActiveTx>& active() const { return active_; }
+    // The oldest not-yet-F-confirmed ACTIVE_TX, or null when none is
+    // outstanding.  Test-only: no production call site reads this.
+    [[nodiscard]] const CActiveTx* active() const {
+        return active_queue_.empty() ? nullptr : &active_queue_.front();
+    }
+    [[nodiscard]] size_t active_count() const { return active_queue_.size(); }
+    [[nodiscard]] size_t max_active_tx() const { return max_active_tx_; }
     [[nodiscard]] const CStoreGuid& c_store_guid() const { return authority_.guid(); }
     [[nodiscard]] const FStoreGuid& f_store_guid() const { return f_store_guid_; }
     [[nodiscard]] HistoryNonce history_nonce() const { return history_nonce_; }
-    [[nodiscard]] RelSeq next_rel_seq() const { return next_rel_seq_; }
+    // The rel_seq the next begin_v1() will allocate.  Advances as soon as a
+    // TX_BEGIN is issued (or predict-committed), independent of F's ack.
+    [[nodiscard]] RelSeq next_rel_seq() const { return predicted_cursor_; }
+    // The rel_seq boundary F has actually, durably acknowledged via
+    // TX_COMMIT.  Equals next_rel_seq() whenever max_active_tx() == 1.
+    [[nodiscard]] RelSeq confirmed_rel_seq() const { return confirmed_cursor_; }
     [[nodiscard]] Digest128 state_digest() const { return state_digest_; }
     [[nodiscard]] uint64_t p29v1_route_state_bytes() const noexcept;
     [[nodiscard]] std::optional<bool> p29v1_system_source_reuse() const noexcept;
 
 private:
     void reset_history(FStoreGuid f_store_guid, HistoryNonce history_nonce);
-    void record(ActionType action, const CActiveTx& active);
+    // queue_position is the emitting entry's 0-based index in active_queue_
+    // (0 = head/front).  Callers pass it explicitly: begin_v1 emits the back
+    // (size-1 after push), retire_locked_commits/abandon head records emit
+    // 0, and abandon_active enumerates the whole FIFO front-to-back.  The
+    // additive queue_position/queue_depth trace fields are stamped only
+    // when max_active_tx_ > 1 (route pipelining, P50_ROUTE_PIPELINING.md
+    // step 7); at depth 1 the ActionRecord bytes are unchanged.
+    void record(ActionType action, const CActiveTx& active,
+                size_t queue_position);
     void poison_v1() noexcept;
+    void retire_locked_commits();
 
     CAuthority& authority_;
     FStoreGuid f_store_guid_{};
     HistoryNonce history_nonce_{};
-    RelSeq next_rel_seq_{};
+    RelSeq confirmed_cursor_{};
+    RelSeq predicted_cursor_{};
     Digest128 state_digest_{};
-    std::optional<CActiveTx> active_;
+    size_t max_active_tx_ = 1;
+    std::deque<CActiveTx> active_queue_;
+    // F's TX_COMMITs for different outstanding dialogues may be observed out
+    // of order once max_active_tx() > 1; an early ack for a successor waits
+    // here until its predecessor retires.  Always empty when
+    // max_active_tx() == 1.
+    std::vector<std::pair<TxCommit, ActionType>> reorder_buffer_;
     struct P29V1State;
     std::unique_ptr<P29V1State> p29v1_;
     ActionTrace* trace_ = nullptr;

@@ -221,6 +221,14 @@ public:
     [[nodiscard]] bool seed_route_relationship_for_test(
         std::string host, uint32_t cache_port, FStoreGuid guid,
         uint64_t generation, ProfileId profile) noexcept;
+    // Exposes RouteGate::route_pipeline_depth for direct unit testing
+    // without a full transfer_source_on_owner() call: it is a pure function
+    // of environment variables and the raw cache_profile bitmask, reading
+    // and mutating no runtime state.
+    [[nodiscard]] static uint32_t route_pipeline_depth_for_test(
+        uint32_t cache_profile) noexcept {
+        return RouteGate::route_pipeline_depth(cache_profile);
+    }
 #endif
 
 private:
@@ -300,6 +308,35 @@ private:
         // fits lanes * armed_window_slots() within max_live_sessions, with a
         // P50_ROUTE_LANES_CLAMPED warning on stderr.
         static uint32_t route_lane_count(size_t max_live_sessions) noexcept;
+
+        // ICECC_P50_ROUTE_PIPELINE_DEPTH overrides the per-route outstanding
+        // TX depth (K) below. Unset, empty, non-numeric, or non-positive
+        // keeps 1 -- today's single-successor behaviour, byte-identical. A
+        // request above 1 is further bounded by: (a) armed_window_slots(),
+        // since every outstanding TX still needs its own live, armed F
+        // session drawn from the same lane window; (b) kMaxPipelineDepth, a
+        // hard ceiling regardless of (a); (c) the route's raw cache_profile
+        // bitmask -- only CACHE_PROFILE_P29V1 is in scope for pipelining
+        // (see research/designs/P50_ROUTE_PIPELINING.md); every other
+        // profile is unconditionally forced back to 1. Each reduction is
+        // reported once on stderr as P50_ROUTE_PIPELINE_DEPTH_CLAMPED,
+        // mirroring route_lane_count's P50_ROUTE_LANES_CLAMPED above. A
+        // depth above 1 also forces this route's lane count to 1 at the
+        // transfer_source_on_owner call site: lanes and pipelining would
+        // otherwise both multiply F's armed-session budget for the same
+        // route, and combining them is out of scope (see the design doc's
+        // settled decisions).
+        //
+        // SAFETY GATE (temporary, pre-F-sequencer): the F-side per-route
+        // sequencer that lets F actually admit a parked successor (design
+        // doc, step 5) does not exist yet. Until it lands, a request above
+        // 1 unconditionally collapses back to 1 unless
+        // ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is *also* set to a
+        // nonempty value other than "0" -- that escape is for this step's
+        // own tests, to exercise the C-side plumbing ahead of F's half
+        // landing, and must never be set outside a test process.
+        static constexpr uint32_t kMaxPipelineDepth = 4;
+        static uint32_t route_pipeline_depth(uint32_t cache_profile) noexcept;
 
         // One lane's armed-window admission and transfer serialization. Each
         // lane presents its own derived C-store GUID to F (see

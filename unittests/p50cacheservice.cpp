@@ -3284,6 +3284,165 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     CHECK(f_trace.find("\"wall_clock_ns\":") != std::string::npos);
 }
 
+// ICECC_P50_ROUTE_PIPELINE_DEPTH (step 1 of
+// research/designs/P50_ROUTE_PIPELINING.md): route_pipeline_depth_for_test
+// exposes RouteGate::route_pipeline_depth directly (ICECC_P50_ENDPOINT_TEST_HOOKS
+// build only), since RouteGate is private and nothing yet consumes a depth
+// above 1 end-to-end -- steps 2-4 are what will. This test covers every
+// clamp in isolation, with no SidecarRuntime/F endpoint involved: (a) K=1
+// identity -- unset, empty, "0", "-3", and "1" all return 1, matching
+// today's single-successor behaviour exactly, with or without the unsafe
+// gate; (b) the pre-F-sequencer safety gate -- a request above 1 stays at 1
+// unless ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is also set to a
+// nonempty value other than "0" (this is the only state reachable outside
+// this step's own tests, since step 5's F-side sequencer does not exist
+// yet); (c) once unsafe-allowed, the hard kMaxPipelineDepth=4 ceiling;
+// (d) the armed_window_slots() ceiling, probed through
+// ICECC_P50_ARMED_WINDOW; (e) the P29V1-only profile gate -- any other
+// cache_profile bitmask unconditionally forces 1 even when unsafe-allowed
+// and within every numeric bound.
+void test_route_pipeline_depth_env_parsing_and_clamps() {
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+    CHECK(::unsetenv("ICECC_P50_ARMED_WINDOW") == 0);
+
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 1);
+    for (const char* value : {"", "nope", "0", "-3", "1"}) {
+        CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", value, 1) == 0);
+        CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+                  CACHE_PROFILE_P29V1) == 1);
+    }
+
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 1);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "0", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 1);
+
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 2);
+
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "9", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 4);
+
+    CHECK(::setenv("ICECC_P50_ARMED_WINDOW", "2", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 2);
+    CHECK(::unsetenv("ICECC_P50_ARMED_WINDOW") == 0);
+
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_ZSTD_TU) == 1);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_ZSTD_ROUTE) == 1);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(0) == 1);
+
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+    CHECK(::unsetenv("ICECC_P50_ARMED_WINDOW") == 0);
+}
+
+// ICECC_P50_ROUTE_PIPELINE_DEPTH forcing lanes to 1 (step 1): with both
+// ICECC_P50_ROUTE_LANES=2 and a test-unsafe-allowed
+// ICECC_P50_ROUTE_PIPELINE_DEPTH=2 set, two concurrent transfers to one F
+// endpoint must still select the SAME (lane-0/base) c_store_guid -- proving
+// the gate was constructed with lane_count=1 despite ICECC_P50_ROUTE_LANES'
+// request. This exactly mirrors
+// test_route_lanes_concurrent_transfers_use_distinct_lanes above (same
+// after_admission_for_test hand-off, proving genuine overlap) but with the
+// opposite outcome: were lanes not forced, this test would behave
+// identically to that one and the two observed guids would differ.
+void test_route_pipeline_depth_forces_single_lane() {
+    constexpr uint64_t kFStoreGeneration = 31;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x97;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xd3;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    const CStoreGuid c_store = c_config.c_store_guid;
+
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
+    bool first_in_hook = false;
+    bool release_first = false;
+    c_config.after_admission_for_test = [&] {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        if (!first_in_hook) {
+            first_in_hook = true;
+            sync_cv.notify_all();
+            sync_cv.wait(lock, [&] { return release_first; });
+        } else {
+            release_first = true;
+            sync_cv.notify_all();
+        }
+    };
+
+    CHECK(::setenv("ICECC_P50_ROUTE_LANES", "2", 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    CapacityFront front(f_runtime, kFStoreGeneration);
+
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    const auto transfer = [&](uint64_t identity) {
+        const std::string text =
+            "route-pipeline-depth-lane-" + std::to_string(identity) + "\n";
+        const std::vector<uint8_t> source(text.begin(), text.end());
+        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+            std::chrono::steady_clock::now() + std::chrono::seconds(20),
+            clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
+            deadline, local::HandoffFd(source_file("p50-pipeline-depth-lane", source)));
+    };
+
+    local::P50SourceTransferResult result_a{};
+    local::P50SourceTransferResult result_b{};
+    std::thread thread_a([&] { result_a = transfer(930); });
+    bool first_seen = false;
+    {
+        std::unique_lock<std::mutex> lock(sync_mutex);
+        first_seen = sync_cv.wait_for(lock, std::chrono::seconds(10),
+                                      [&] { return first_in_hook; });
+    }
+    CHECK(first_seen);
+    std::thread thread_b([&] { result_b = transfer(940); });
+    thread_a.join();
+    thread_b.join();
+    front.stop();
+
+    CHECK(::unsetenv("ICECC_P50_ROUTE_LANES") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+
+    CHECK(result_a.code == local::SourceTransferResultCode::Committed);
+    CHECK(result_b.code == local::SourceTransferResultCode::Committed);
+
+    const std::vector<CStoreGuid> observed = front.observed_guids();
+    std::fprintf(stderr,
+                 "p50cacheservice: ROUTE_PIPELINE_DEPTH=2 (unsafe) + "
+                 "ROUTE_LANES=2 observed %zu guids\n",
+                 observed.size());
+    CHECK(observed.size() == 2);
+    CHECK(observed[0] == c_store);
+    CHECK(observed[1] == c_store);
+}
+
 // Round-3 owner-lag probe (ICECC_P50_OWNER_LAG_TRACE): confirms the
 // per-second icecream-p50-owner-lag-v1 line fires unconditionally off
 // endpoint_owner_thread_'s 20ms steady_timer -- independent of any real
@@ -3974,6 +4133,8 @@ int main(int argc, char** argv) {
             test_armed_window_env_override_shifts_gate_capacity();
             test_route_lanes_concurrent_transfers_use_distinct_lanes();
             test_route_lanes_default_off_trace_matches_base_guid();
+            test_route_pipeline_depth_env_parsing_and_clamps();
+            test_route_pipeline_depth_forces_single_lane();
             test_owner_lag_trace_default_off_then_emits_per_second_line();
             return 0;
         }

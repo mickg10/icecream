@@ -1036,6 +1036,91 @@ void test_p29v1_pipelined_begin() {
         fail("pipelined abort trace: " + *error);
 }
 
+// P50 route pipelining (research/designs/P50_ROUTE_PIPELINING.md), step 5a.
+//
+// F has no awareness of K (ICECC_P50_ROUTE_PIPELINE_DEPTH) at all: the
+// per-route sequencer added in step 5c only ever parks a TX_BEGIN that
+// arrives strictly ahead of route.next_rel, which is structurally
+// impossible at K=1 (one outstanding TX per route means every BEGIN F ever
+// observes is already at-cursor). This test pins the K=1 observable shape
+// -- route.next_rel advancing by exactly one per committed TX, and F never
+// deferring its first write past its first read on any session -- for both
+// an ordinary client and a client with the pre-existing
+// enable_pipelined_begin() feature enabled (which can legitimately make C
+// write BEGIN/BODY/FILL before reading F's STATE even at K=1, exercising
+// the same "something is already in the socket buffer" condition the
+// step-5c peek relies on, without ever requiring F to park). It must stay
+// green, byte-for-byte in these observable terms, across every later
+// step-5b/5c/5d change.
+std::vector<uint64_t> run_route_pipeline_k1_sequence(bool use_pipelined_begin) {
+    const P5coStoreGuids guids = p5co_store_guids(use_pipelined_begin ? 701 : 700);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    CompletionLog completions;
+    P50ServerEndpoint server(guids.f, caps, &completions, &actions);
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, &completions, &actions,
+                      authority_limits);
+    if (use_pipelined_begin)
+        client.endpoint.enable_pipelined_begin();
+    for (int run = 0; run != 3; ++run) {
+        const std::vector<uint8_t> input = bytes(
+            "# 1 \"/tmp/p50-pipeline-k1.cc\"\nsame-line\nsame-line\nrun-" +
+            std::to_string(run) + "\n");
+        const PairResult pair = run_pair(client, server, admit(client, input));
+        require(pair.client.status == ClientRunStatus::Committed &&
+                    pair.server.status == ServerRunStatus::Completed &&
+                    copy_input(server, guids.c) == input,
+                "k1 identity: TU did not commit exact bytes");
+    }
+    if (const auto error = check_action_trace(actions.records()))
+        fail("k1 identity: " + *error);
+
+    // route.next_rel must advance 0, 1, 2 in strict order: no gap, repeat,
+    // or reorder, i.e. nothing was ever held back waiting on a successor
+    // that cannot exist at K=1.
+    std::vector<uint64_t> f_begin_rel_seq;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor == ActorSide::F && record.c_store_guid == guids.c &&
+            (record.action == ActionType::TX_BEGIN ||
+             record.action == ActionType::ACTIVE_REPLAYED))
+            f_begin_rel_seq.push_back(record.rel_seq.value);
+    }
+    require(f_begin_rel_seq == std::vector<uint64_t>{0, 1, 2},
+            "k1 identity: F route cursor did not advance 0,1,2 in order");
+
+    // F's first write on a session is never recorded ahead of its first
+    // read on that same session (SESSION_HELLO always precedes SESSION_STATE).
+    std::set<uint64_t> f_sessions_seen;
+    std::set<uint64_t> f_read_before_first_write;
+    for (const AsyncCompletion& completion : completions.completions()) {
+        if (completion.stamp.actor != ActorSide::F)
+            continue;
+        const uint64_t serial = completion.stamp.session_serial;
+        if (completion.stamp.operation == AsyncOperationKind::ReadHeader)
+            f_sessions_seen.insert(serial);
+        else if (completion.stamp.operation == AsyncOperationKind::WriteFragment &&
+                 f_sessions_seen.contains(serial))
+            f_read_before_first_write.insert(serial);
+    }
+    require(f_sessions_seen.size() == 3 &&
+                f_read_before_first_write == f_sessions_seen,
+            "k1 identity: F wrote on a session before reading on it");
+    return f_begin_rel_seq;
+}
+
+void test_route_pipeline_k1_identity() {
+    const std::vector<uint64_t> plain = run_route_pipeline_k1_sequence(false);
+    const std::vector<uint64_t> pipelined = run_route_pipeline_k1_sequence(true);
+    require(plain == pipelined,
+            "k1 identity: plain and pipelined_begin clients diverged on F's "
+            "route cursor progression");
+}
+
 void test_profile_materialized_result_digest_gates() {
     uint64_t identity = 19000;
     for (const ProfileId profile : {ProfileId::P29V1, ProfileId::ZSTD_TU,
@@ -6320,6 +6405,388 @@ void test_lost_final_commit_identity_negative_matrix() {
     }
 }
 
+// Write-ahead batch for the step-5d reset-before-begin test: HELLO, then a
+// cold HISTORY_RESET, then a TX_BEGIN whose rel_seq is ahead of the PRE-reset
+// cursor -- all before this client reads anything from F, so the whole batch
+// is already in the socket's receive buffer at F's step-5b peek.
+asio::awaitable<void> raw_reset_then_ahead_begin(tcp::endpoint remote, CStoreGuid c_guid,
+                                                 const HistoryReset& reset,
+                                                 const ZstdTuEnvelope& tu) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    SessionHello hello;
+    hello.c_store_guid = c_guid;
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    hello.limits = {};
+    co_await raw_write(socket, hello);
+    co_await raw_write(socket, reset);
+    co_await raw_write(socket, tu.begin);
+    Message body_message = BodyMessage{tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    // First SESSION_STATE reflects the pre-reset route (the reset has not
+    // been processed yet); the reset acknowledgement is the second one.
+    const SessionState pre_reset = raw_decode<SessionState>(
+        co_await raw_read(socket, hello.limits.max_frame_payload));
+    require(pre_reset.route_present,
+            "reset-before-begin fixture did not reach an established route");
+    const SessionState reset_ack = raw_decode<SessionState>(
+        co_await raw_read(socket, hello.limits.max_frame_payload));
+    require(reset_ack.route_present && reset_ack.history_nonce == reset.history_nonce &&
+                reset_ack.next_rel_seq.value == 0 &&
+                reset_ack.state_digest == reset.initial_state_digest,
+            "reset-before-begin fixture did not process its cold HISTORY_RESET");
+    // The post-reset BEGIN (one ahead of the fresh cursor) is rejected through
+    // the ordinary cursor-mismatch path, bounded, never a hang.
+    const Frame terminal =
+        co_await raw_read(socket, reset_ack.limits.max_frame_payload);
+    require(terminal.type == MessageType::ERROR,
+            "reset-before-begin fixture did not reject its post-reset BEGIN "
+            "through the ordinary cursor path");
+    (void)raw_decode<ErrorMessage>(terminal);
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+// P50 route pipelining (research/designs/P50_ROUTE_PIPELINING.md), step 5d.
+//
+// F-side unit tests for the step-5c per-route sequencer (the park/release
+// admission gate in run_connected). Park/release deliberately has no
+// dedicated ActionTrace event (the ActionType set has no PARKED action), so
+// both tests assert it indirectly:
+//
+//  - test_route_pipeline_park_releases_in_commit_order proves a successor
+//    TX_BEGIN that arrives ahead of the route cursor is not processed before
+//    its predecessor commits -- the successor's SESSION_STATE is only staged
+//    after the predecessor's TX_COMMIT advanced the cursor -- and that it then
+//    commits exact bytes in route order.
+//  - test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor
+//    proves the coordinator's HISTORY_RESET-before-TX_BEGIN rule: a cold
+//    epoch change inside one already-buffered batch must never be gated
+//    behind the pre-reset cursor. The batch below carries a HISTORY_RESET
+//    followed by a TX_BEGIN one rel_seq AHEAD of the pre-reset cursor --
+//    exactly the shape the step-5c gate would otherwise park (and then
+//    strand forever: the reset that would advance the epoch lives in this
+//    same parked connection's own buffer). It must instead take the unchanged
+//    dispatch path: process the reset, then evaluate the post-reset BEGIN
+//    against the fresh epoch's own cursor (an ordinary bounded rejection,
+//    never a hang), leaving the new epoch fully usable afterwards.
+//
+// Both tests use the bounded-wait idiom (context.run_for + future readiness
+// checks) instead of a plain blocking context.run(): ordinary accept_one
+// sessions have no internal watchdog (EndpointCaps has no deadline field), so
+// a park/release regression would otherwise hang the whole test binary
+// instead of failing it. A failed require() exits the process directly, so no
+// io_context teardown is needed on that path.
+struct ParkReleaseRace {
+    bool successor_batch_written = false;
+};
+
+asio::awaitable<void> raw_pipelined_successor(tcp::endpoint remote, CStoreGuid c_guid,
+                                              const ZstdTuEnvelope& successor_tu,
+                                              HistoryNonce nonce,
+                                              ParkReleaseRace& race) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    co_await socket.async_connect(remote, asio::use_awaitable);
+    SessionHello hello;
+    hello.c_store_guid = c_guid;
+    hello.supported_profiles = profile_bit(ProfileId::ZSTD_TU);
+    hello.limits = {};
+    co_await raw_write(socket, hello);
+    // Write-ahead: BEGIN and BODY land in the socket's receive buffer before
+    // this client ever reads SESSION_STATE, so F's step-5b MSG_PEEK (taken
+    // immediately before its SESSION_STATE write) observes the successor
+    // rel_seq and the step-5c gate parks this session instead of processing
+    // it against a cursor the predecessor has not advanced yet.
+    co_await raw_write(socket, successor_tu.begin);
+    Message body_message = BodyMessage{successor_tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    race.successor_batch_written = true;
+    const SessionState state = raw_decode<SessionState>(
+        co_await raw_read(socket, hello.limits.max_frame_payload));
+    // Indirect parking proof: this session's SESSION_STATE is only staged
+    // after the predecessor's commit released it, so the route cursor F
+    // advertises here has already advanced past the predecessor. A
+    // regression that processes the write-ahead BEGIN immediately would
+    // advertise the pre-predecessor cursor here instead.
+    require(state.route_present && state.history_nonce == nonce &&
+                state.next_rel_seq.value == 1,
+            "parked successor observed a route cursor that never advanced");
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, state.limits.max_frame_payload));
+    require(commit.transaction_digest == successor_tu.begin.transaction_digest &&
+                commit.raw_digest == successor_tu.begin.raw_digest,
+            "parked successor received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+asio::awaitable<void> raw_pipelined_predecessor(tcp::endpoint remote, CStoreGuid c_guid,
+                                                const ZstdTuEnvelope& predecessor_tu,
+                                                HistoryNonce nonce,
+                                                ParkReleaseRace& race) {
+    const auto executor = co_await asio::this_coro::executor;
+    asio::steady_timer timer(executor);
+    while (!race.successor_batch_written) {
+        timer.expires_after(std::chrono::milliseconds(1));
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+    // Deterministic ordering margin: the successor's write-ahead batch is
+    // already in its socket's receive buffer, and this delay lets F accept and
+    // peek that connection (and park it) before the predecessor connects.
+    timer.expires_after(std::chrono::milliseconds(50));
+    co_await timer.async_wait(asio::use_awaitable);
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    require(open.state.route_present && open.state.history_nonce == nonce &&
+                open.state.next_rel_seq.value == 0,
+            "predecessor observed a route cursor its successor consumed");
+    co_await raw_write(socket, predecessor_tu.begin);
+    Message body_message = BodyMessage{predecessor_tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, open.state.limits.max_frame_payload));
+    require(commit.transaction_digest == predecessor_tu.begin.transaction_digest &&
+                commit.raw_digest == predecessor_tu.begin.raw_digest,
+            "predecessor received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+// One ordinary committed TU over a raw socket: HELLO + SESSION_STATE round
+// trip, then BEGIN/BODY at the route's current cursor, then TX_COMMIT. Used
+// by the step-5d reset-before-begin test for its post-rejection recovery leg
+// (proving the fresh epoch is fully usable through the unchanged path).
+asio::awaitable<void> raw_commit_one_tu(tcp::endpoint remote, CStoreGuid c_guid,
+                                        const ZstdTuEnvelope& tu, HistoryNonce nonce,
+                                        RelSeq rel) {
+    const auto executor = co_await asio::this_coro::executor;
+    tcp::socket socket(executor);
+    const RawRoute open = co_await raw_open(socket, remote, c_guid);
+    require(open.state.route_present && open.state.history_nonce == nonce &&
+                open.state.next_rel_seq == rel &&
+                open.state.state_digest == tu.begin.pre_state_digest,
+            "recovery TU did not meet the route cursor it was prepared for");
+    co_await raw_write(socket, tu.begin);
+    Message body_message = BodyMessage{tu.body};
+    co_await raw_write(socket, std::move(body_message));
+    const TxCommit commit = raw_decode<TxCommit>(
+        co_await raw_read(socket, open.state.limits.max_frame_payload));
+    require(commit.transaction_digest == tu.begin.transaction_digest &&
+                commit.raw_digest == tu.begin.raw_digest,
+            "recovery TU received a different TX_COMMIT");
+    boost::system::error_code ignored;
+    socket.close(ignored);
+    co_return;
+}
+
+void test_route_pipeline_park_releases_in_commit_order() {
+    const P5coStoreGuids guids = p5co_store_guids(46);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    const HistoryNonce nonce{461};
+    require(force_route_reset(server, guids.c, nonce).status ==
+                ServerRunStatus::Disconnected,
+            "park/release fixture did not establish its route");
+    const Digest128 initial_state = initial_route_digest(guids.c, nonce);
+    // The predecessor TU commits at rel_seq 0. encode_zstd_tu produces a
+    // complete, ready-to-send TxBegin from the bootstrapped route cursor.
+    const ZstdTuEnvelope predecessor_tu =
+        encode_zstd_tu(nonce, RelSeq{0}, TuSeq{4610}, initial_state,
+                       bytes("park/release ordering: predecessor TU\n"));
+    // The successor's required pre_state_digest is derived entirely offline
+    // (no round trip to F), from the predecessor's OWN begin fields plus its
+    // transaction digest -- the same argument pattern every production
+    // commit path uses. That offline-only derivation is the point of route
+    // pipelining: C can prepare the successor before the predecessor commits.
+    const Digest128 successor_pre_state = compute_post_state_digest(
+        predecessor_tu.begin.pre_state_digest, predecessor_tu.begin.history_nonce,
+        predecessor_tu.begin.rel_seq, predecessor_tu.begin.tu_seq,
+        predecessor_tu.begin.transaction_digest);
+    const ZstdTuEnvelope successor_tu =
+        encode_zstd_tu(nonce, RelSeq{1}, TuSeq{4611}, successor_pre_state,
+                       bytes("park/release ordering: successor TU\n"));
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    ParkReleaseRace race;
+    // Two concurrent accept_one sessions on one acceptor: whichever raw
+    // connection arrives first binds to the first spawned future. The
+    // successor connects first (the predecessor waits on the race flag plus
+    // 50ms), so the first spawn is the successor's server session.
+    std::future<ServerRunResult> successor_server =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<ServerRunResult> predecessor_server =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<void> successor_client = asio::co_spawn(
+        context, raw_pipelined_successor(remote, guids.c, successor_tu, nonce, race),
+        asio::use_future);
+    std::future<void> predecessor_client = asio::co_spawn(
+        context, raw_pipelined_predecessor(remote, guids.c, predecessor_tu, nonce, race),
+        asio::use_future);
+    context.run_for(std::chrono::seconds(5));
+    require(successor_server.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready &&
+                predecessor_server.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                successor_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready &&
+                predecessor_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_park_releases_in_commit_order: hung "
+            "(park/release regression?)");
+    const ServerRunResult successor_result = successor_server.get();
+    const ServerRunResult predecessor_result = predecessor_server.get();
+    const auto describe_status = [](ServerRunStatus status) {
+        switch (status) {
+        case ServerRunStatus::Completed: return "Completed";
+        case ServerRunStatus::Disconnected: return "Disconnected";
+        case ServerRunStatus::TerminalError: return "TerminalError";
+        case ServerRunStatus::DeadlineExceeded: return "DeadlineExceeded";
+        }
+        return "unknown";
+    };
+    const auto describe_peeked = [](const std::optional<RelSeq>& peeked) {
+        return peeked ? std::to_string(peeked->value) : std::string("none");
+    };
+    require(successor_result.status == ServerRunStatus::Completed &&
+                predecessor_result.status == ServerRunStatus::Completed,
+            std::string("park/release pair did not complete both sessions: "
+                        "successor status=") +
+                describe_status(successor_result.status) + " peeked=" +
+                describe_peeked(successor_result.f_hello_time_peeked_begin_rel_seq) +
+                " f_rel=" + std::to_string(successor_result.f_rel_seq.value) +
+                ", predecessor status=" + describe_status(predecessor_result.status) +
+                " peeked=" +
+                describe_peeked(predecessor_result.f_hello_time_peeked_begin_rel_seq) +
+                " f_rel=" + std::to_string(predecessor_result.f_rel_seq.value));
+    successor_client.get();
+    predecessor_client.get();
+    require(successor_result.c_store_guid == guids.c &&
+                predecessor_result.c_store_guid == guids.c,
+            "park/release pair bound the wrong C store");
+    require(predecessor_result.f_rel_seq.value == 0 &&
+                successor_result.f_rel_seq.value == 1,
+            "park/release pair did not run at its declared rel_seq");
+    // Commit-order proof: despite the successor's bytes physically arriving
+    // on the wire first, F must record the predecessor's begin and commit
+    // before the successor's.
+    std::vector<uint64_t> f_begin_order;
+    std::vector<uint64_t> f_commit_order;
+    for (const ActionRecord& record : actions.records()) {
+        if (record.actor != ActorSide::F || record.c_store_guid != guids.c)
+            continue;
+        if (record.action == ActionType::TX_BEGIN)
+            f_begin_order.push_back(record.rel_seq.value);
+        else if (record.action == ActionType::INPUT_COMMITTED)
+            f_commit_order.push_back(record.rel_seq.value);
+    }
+    require(f_begin_order == std::vector<uint64_t>{0, 1},
+            "park/release pair began its TUs out of route order");
+    require(f_commit_order == std::vector<uint64_t>{0, 1},
+            "park/release pair committed its TUs out of route order");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(
+                    bytes("park/release ordering: successor TU\n")),
+            "parked successor did not materialize exact bytes");
+    // No require_trace here: this fixture drives raw sockets only, so the
+    // ActionTrace has F records and no C records, and check_action_trace's
+    // cross-actor model ("F TX_BEGIN names C's active transaction") cannot
+    // apply to a raw-only trace. Commit order is asserted explicitly above.
+}
+
+void test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor() {
+    const P5coStoreGuids guids = p5co_store_guids(47);
+    EndpointCaps caps;
+    caps.profile = ProfileId::ZSTD_TU;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, caps, nullptr, &actions);
+    // Bootstrap a stale route (a genuinely older epoch) so there IS a
+    // pre-reset cursor for the write-ahead batch to be ahead of.
+    const HistoryNonce stale_nonce{471};
+    require(force_route_reset(server, guids.c, stale_nonce).status ==
+                ServerRunStatus::Disconnected,
+            "reset-before-begin fixture did not establish its stale route");
+    const HistoryNonce fresh_nonce{472};
+    const HistoryReset reset{fresh_nonce,
+                             initial_route_digest(guids.c, fresh_nonce)};
+    // The write-ahead batch: HISTORY_RESET cold-starting a new epoch, then a
+    // TX_BEGIN one rel_seq AHEAD of the pre-reset cursor (rel 1 vs cursor 0).
+    // This is the exact shape the step-5c admission gate parks -- and, without
+    // the HISTORY_RESET-precedes-TX_BEGIN rule, strands forever (the reset
+    // that advances the epoch sits in this same parked connection's buffer).
+    // With the rule, the unchanged dispatch path runs: reset first, then the
+    // BEGIN evaluated against the fresh epoch's own cursor.
+    const ZstdTuEnvelope tu =
+        encode_zstd_tu(fresh_nonce, RelSeq{1}, TuSeq{4720}, reset.initial_state_digest,
+                       bytes("reset-before-begin: cold-epoch TU\n"));
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    std::future<ServerRunResult> server_future =
+        asio::co_spawn(context, server.accept_one(acceptor), asio::use_future);
+    std::future<void> client_future = asio::co_spawn(
+        context, raw_reset_then_ahead_begin(remote, guids.c, reset, tu),
+        asio::use_future);
+    context.run_for(std::chrono::seconds(5));
+    require(server_future.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready &&
+                client_future.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_reset_before_begin_does_not_park_on_stale_"
+            "cursor: hung (HISTORY_RESET-before-TX_BEGIN no-park "
+            "regression?)");
+    client_future.get();
+    const ServerRunResult rejected = server_future.get();
+    // The no-park path's outcome is the ORDINARY one the pre-existing cursor
+    // logic would have produced post-reset: a bounded terminal rejection,
+    // never a hang and never a park-then-release.
+    require(rejected.status == ServerRunStatus::TerminalError,
+            "reset-before-begin batch did not surface its ordinary rejection");
+    // The fresh epoch must be fully usable afterwards: an ordinary TU at the
+    // fresh cursor commits exact bytes through the unchanged path.
+    const std::vector<uint8_t> input =
+        bytes("reset-before-begin: first committed TU\n");
+    const ZstdTuEnvelope first =
+        encode_zstd_tu(fresh_nonce, RelSeq{0}, TuSeq{4721},
+                       reset.initial_state_digest, input);
+    asio::io_context recovery;
+    tcp::acceptor recovery_acceptor(
+        recovery, {asio::ip::address_v4::loopback(), 0});
+    std::future<ServerRunResult> recovery_server = asio::co_spawn(
+        recovery, server.accept_one(recovery_acceptor), asio::use_future);
+    std::future<void> recovery_client = asio::co_spawn(
+        recovery,
+        raw_commit_one_tu(recovery_acceptor.local_endpoint(), guids.c, first,
+                          fresh_nonce, RelSeq{0}),
+        asio::use_future);
+    recovery.run_for(std::chrono::seconds(5));
+    require(recovery_server.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready &&
+                recovery_client.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready,
+            "test_route_pipeline_reset_before_begin_does_not_park_on_stale_"
+            "cursor: recovery leg hung");
+    const ServerRunResult recovery_result = recovery_server.get();
+    recovery_client.get();
+    require(recovery_result.status == ServerRunStatus::Completed &&
+                recovery_result.f_rel_seq.value == 0,
+            "fresh-epoch recovery TU did not commit");
+    require(copy_input(server, guids.c) ==
+                std::optional<std::vector<uint8_t>>(input),
+            "fresh-epoch recovery TU did not materialize exact bytes");
+}
+
 int main(int argc, char** argv) {
     const bool performance_gate = argc == 2 && std::string_view(argv[1]) == "--performance";
     if (argc > 2 || (argc == 2 && !performance_gate))
@@ -6340,6 +6807,13 @@ int main(int argc, char** argv) {
         test_p29v1_endpoint_route_dialogue_lifetime();
         test_p29v1_pipelined_begin();
         std::cout << "p50_endpoint_test: focused P29V1 dialogue PASS\n";
+        return 0;
+    }
+    if (std::getenv("ICECC_P50_ROUTE_PIPELINE_FOCUS") != nullptr) {
+        test_route_pipeline_k1_identity();
+        test_route_pipeline_park_releases_in_commit_order();
+        test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor();
+        std::cout << "p50_endpoint_test: focused route pipeline PASS\n";
         return 0;
     }
     if (std::getenv("ICECC_P50_PROFILE_DIGEST_MUTANT_FOCUS") != nullptr) {
@@ -6389,6 +6863,8 @@ int main(int argc, char** argv) {
     test_server_routes_are_isolated_by_profile();
     test_p29v1_endpoint_route_dialogue_lifetime();
     test_p29v1_pipelined_begin();
+    test_route_pipeline_park_releases_in_commit_order();
+    test_route_pipeline_reset_before_begin_does_not_park_on_stale_cursor();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())
