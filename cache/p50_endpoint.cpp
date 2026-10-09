@@ -1900,7 +1900,13 @@ struct P50ClientEndpoint::Impl {
         result.actor = ActorSide::C;
         result.c_store_guid = c_guid;
         result.f_store_guid = session.f_guid.value_or(FStoreGuid{});
-        result.session_serial = active_session;
+        // Step 4d core: the head dialogue always has session.serial ==
+        // active_session (it stores its own serial there), so this is
+        // byte-identical for it. A successor dialogue deliberately does
+        // NOT touch active_session (it is not the head); stamping its own
+        // serial here keeps its completions fresh instead of failing the
+        // live-identity check against the head's serial.
+        result.session_serial = session.serial;
         if (session.provisional_nonce) {
             result.history_nonce = *session.provisional_nonce;
             result.rel_seq = session.provisional_rel;
