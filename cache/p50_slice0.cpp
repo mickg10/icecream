@@ -2071,27 +2071,33 @@ void CRoute::confirm_need_v1(RelSeq rel_seq, std::span<const uint8_t> inner_need
         entry->begin.profile != ProfileId::P29V1)
         throw std::logic_error(
             "P29V1 NEED does not name an outstanding route successor");
-    if (!entry->predicted_post_digest || entry->need_confirmed) {
-        if (entry != active_queue_.back())
-            throw std::logic_error(
-                "P29V1 NEED confirm is not the route's pending successor");
-        confirm_need_v1(inner_need);
-        return;
-    }
-    try {
-        if (!entry->predicted_need)
+    if (entry->predicted_post_digest) {
+        // Predict-committed: the serializer pending is gone, so the NEED
+        // validates through the snapshot recorded at predict-commit time.
+        // A confirm for an entry whose NEED was already consumed (or was
+        // never snapshotted) is a protocol deviation.
+        if (entry->need_confirmed || !entry->predicted_need)
             throw std::logic_error(
                 "P29V1 predict-committed successor has no NEED snapshot");
-        require_need_tu_end(inner_need);
-        p29v1_->serializer.confirm_need_snapshot(
-            *entry->predicted_need,
-            inner_need.first(inner_need.size() - 5));
-        entry->need_confirmed = true;
-        entry->predicted_need.reset();
-    } catch (...) {
-        poison_v1();
-        throw;
+        try {
+            require_need_tu_end(inner_need);
+            p29v1_->serializer.confirm_need_snapshot(
+                *entry->predicted_need,
+                inner_need.first(inner_need.size() - 5));
+            entry->need_confirmed = true;
+            entry->predicted_need.reset();
+        } catch (...) {
+            poison_v1();
+            throw;
+        }
+        return;
     }
+    // Legacy path (depth 1, or the not-yet-predict-committed newest entry):
+    // only the newest entry may confirm through the serializer's pending.
+    if (&*entry != &active_queue_.back())
+        throw std::logic_error(
+            "P29V1 NEED confirm is not the route's pending successor");
+    confirm_need_v1(inner_need);
 }
 
 const CActiveTx& CRoute::commit_predicted_v1() {
