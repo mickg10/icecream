@@ -6250,6 +6250,12 @@ struct RawParkedRouteState {
     // STATE proves the commit via LOST_COMMIT_ACCEPTED. The route must stay
     // usable: no sticky terminal, no poison.
     std::atomic<bool> head_commit_but_drop_commit_frame{false};
+    // T9 (follow-up review): the successor connection dies after HELLO --
+    // before its released STATE -- with the head healthy. C must poison the
+    // route (the successor's predict-commit advanced C's serializer past a
+    // TX F will never apply), the head must still commit, and the next TX
+    // must recover through the cold HISTORY_RESET path.
+    std::atomic<bool> successor_drop_after_hello{false};
 };
 
 // One connection of the parked fake F. `park` is set for successor
@@ -6268,6 +6274,13 @@ asio::awaitable<void> raw_parked_f_serve_connection(
         negotiate_session(hello, kP50WireRevision, kKnownProfileMask);
     const uint32_t cap = selection.limits.max_frame_payload;
     TxBegin& begin = out_begin;
+    if (park && state->successor_drop_after_hello.load()) {
+        // T9: the successor's own socket dies before its released STATE.
+        boost::system::error_code ignored;
+        socket.close(ignored);
+        co_return;
+    }
+    bool have_begin = false;
     if (!state->route_established) {
         SessionState fresh;
         fresh.wire_revision = selection.wire_revision;
@@ -6280,12 +6293,24 @@ asio::awaitable<void> raw_parked_f_serve_connection(
         state->store.start_route(state->session, reset.history_nonce,
                                  reset.initial_state_digest);
         state->route_established = true;
-        SessionState ack = state->store.resume(state->session);
-        ack.wire_revision = selection.wire_revision;
-        ack.negotiated_profiles = selection.negotiated_profiles;
-        co_await raw_write(socket, Message{ack});
+    } else if (!park) {
+        // Established route: present the live cursor. A cold C endpoint
+        // (post-pipeline-poison reset) answers with HISTORY_RESET; apply
+        // it and re-present, exactly the unchanged server behavior.
+        SessionState live = state->store.resume(state->session);
+        live.wire_revision = selection.wire_revision;
+        live.negotiated_profiles = selection.negotiated_profiles;
+        co_await raw_write(socket, Message{live});
+        Frame next = co_await raw_read(socket, cap);
+        if (next.type == MessageType::HISTORY_RESET) {
+            const HistoryReset reset = raw_decode<HistoryReset>(next);
+            state->store.start_route(state->session, reset.history_nonce,
+                                      reset.initial_state_digest);
+        } else {
+            begin = raw_decode<TxBegin>(next);
+            have_begin = true;
+        }
     }
-    begin = raw_decode<TxBegin>(co_await raw_read(socket, cap));
     if (park) {
         // Deferred stage()/STATE: park (polling, never blocking) until the
         // predecessor committed, then present the post-predecessor cursor.
@@ -6302,7 +6327,16 @@ asio::awaitable<void> raw_parked_f_serve_connection(
         if (state->corrupt_successor_state.load())
             staged.state_digest.bytes[0] ^= 0x80;
         co_await raw_write(socket, Message{staged});
+    } else if (!have_begin) {
+        // Fresh-route or reset-just-applied: acknowledge the new route with
+        // its own cursor, then read the begin.
+        SessionState ack = state->store.resume(state->session);
+        ack.wire_revision = selection.wire_revision;
+        ack.negotiated_profiles = selection.negotiated_profiles;
+        co_await raw_write(socket, Message{ack});
     }
+    if (!have_begin)
+        begin = raw_decode<TxBegin>(co_await raw_read(socket, cap));
     state->store.begin(state->session, begin);
     uint64_t body_bytes = 0;
     while (body_bytes < begin.body.encoded_bytes) {
@@ -6721,6 +6755,121 @@ void test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable() {
             "lost-commit recovery (sticky route poison)");
 }
 
+// T9 (follow-up review): a successor's own io failure is a route
+// deviation, not a local one. Its predict-commit already advanced C's
+// serializer and predicted cursor past a TX F will never apply, so any
+// later begin would build on state F does not have. The route must be
+// poisoned (all remaining successors torn down), the head must still
+// commit, and the next TX must recover through the cold HISTORY_RESET
+// path with a fresh nonce -- never a sticky route.
+void test_p29v1_k2_pipeline_successor_io_death_poisons_route() {
+    const P5coStoreGuids guids = p5co_store_guids(247);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 4U << 20;
+    caps.zstd.max_encoded_body_bytes = 4U << 20;
+    PreparationAuthorityLimits limits;
+    limits.route_pipeline_depth = 2;
+    limits.max_interner_reserved_bytes = UINT64_C(1044398080);
+    TestClient client(guids.c, caps, HistoryNonce{1}, nullptr, nullptr, limits);
+    auto state = std::make_shared<RawParkedRouteState>(guids.c, guids.f);
+    state->successor_drop_after_hello.store(true);
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    const tcp::endpoint remote = acceptor.local_endpoint();
+    const std::vector<uint8_t> tu1 = bytes("# 1 \"/tmp/k2-t9.cc\"\nhead-ok\n");
+    const std::vector<uint8_t> tu2 = bytes("# 1 \"/tmp/k2-t9.cc\"\nsucc-dies\n");
+    const PreparedTuHandle head_handle = admit(client, tu1);
+
+    TxBegin head_begin_capture, succ_begin_wire;
+    std::vector<uint8_t> head_body_wire, succ_body_wire;
+    std::future<void> head_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, false, false,
+                                      head_begin_capture, head_body_wire),
+        asio::use_future);
+    std::future<void> succ_fake = asio::co_spawn(
+        context,
+        raw_parked_f_serve_connection(acceptor, state, true, false,
+                                      succ_begin_wire, succ_body_wire),
+        asio::use_future);
+
+    std::atomic<bool> head_write_complete_fired{false};
+    std::optional<std::future<ClientRunResult>> successor_result;
+    PreparedTuHandle successor_handle;
+    EndpointIoControl head_control;
+    head_control.write_complete = [&]() {
+        if (head_write_complete_fired.exchange(true))
+            return;
+        successor_handle = admit(client, tu2);
+        successor_result.emplace(asio::co_spawn(
+            context,
+            client.endpoint.run(remote, successor_handle, EndpointIoControl{},
+                                std::nullopt),
+            asio::use_future));
+    };
+    std::future<ClientRunResult> head_result = asio::co_spawn(
+        context, client.endpoint.run(remote, head_handle, head_control),
+        asio::use_future);
+    context.run();
+    const ClientRunResult head = head_result.get();
+    require(head.status == ClientRunStatus::Committed,
+            "T9: the healthy head did not commit while its successor "
+            "died");
+    require(successor_result.has_value(), "T9: successor run never started");
+    const ClientRunResult successor = successor_result->get();
+    require(successor.status != ClientRunStatus::Committed,
+            "T9: the io-dead successor was not failed");
+    require(client.endpoint.has_pipeline_poison(),
+            "T9: a successor io death did not poison the route");
+    // Bridge: retire the successor's own uncommitted route state, then the
+    // cold endpoint reset (fresh nonce, rel 0). abandon_route clears the
+    // CRoute queue so the next prepare starts a fresh predicted line.
+    client.authority->abandon_route(successor_handle);
+    client.endpoint.reset_after_pipeline_poison();
+    require(!client.endpoint.has_pipeline_poison() &&
+                client.endpoint.next_rel_seq().value == 0,
+            "T9: cold reset did not land after the successor io death");
+    (void)head_fake;
+    (void)succ_fake;
+
+    // The next TX recovers through the cold HISTORY_RESET path: this fake
+    // route is already established, so the endpoint's fresh nonce forces
+    // the reset dance, and the TX commits with rel_seq 0 under the new
+    // nonce.
+    state->successor_drop_after_hello.store(false);
+    asio::io_context third_context;
+    tcp::acceptor third_acceptor(third_context,
+                                 {asio::ip::address_v4::loopback(), 0});
+    TxBegin third_begin_wire;
+    std::vector<uint8_t> third_body_wire;
+    std::future<void> third_fake = asio::co_spawn(
+        third_context,
+        raw_parked_f_serve_connection(third_acceptor, state, false, false,
+                                      third_begin_wire, third_body_wire),
+        asio::use_future);
+    const std::vector<uint8_t> tu3 = bytes("# 1 \"/tmp/k2-t9.cc\"\nrecovered\n");
+    const PreparedTuHandle third_handle = admit(client, tu3);
+    std::future<ClientRunResult> third_result = asio::co_spawn(
+        third_context,
+        client.endpoint.run(third_acceptor.local_endpoint(), third_handle,
+                            EndpointIoControl{}),
+        asio::use_future);
+    third_context.run();
+    const ClientRunResult third = third_result.get();
+    require(third.status == ClientRunStatus::Committed,
+            "T9: the route did not recover for the next TX after the "
+            "successor io death");
+    require(third_begin_wire.rel_seq.value == 0 &&
+                third_begin_wire.history_nonce.value !=
+                    head_begin_capture.history_nonce.value,
+            "T9: the recovered TX did not run cold (fresh nonce, rel 0)");
+    require(third.committed_commit.has_value() &&
+                third.committed_commit->rel_seq.value == 0,
+            "T9: the recovered commit did not land on the cold cursor");
+    (void)third_fake;
+}
+
 // T6b: at depth 1 the waiter machinery is never used -- the K=1 identity
 // gate (T6a, test_p29v1_k1_pipeline_wire_identity) stays byte-identical,
 // and both waiter structures stay empty through a full K=1 dialogue.
@@ -7070,6 +7219,7 @@ int main(int argc, char** argv) {
         test_p29v1_k2_pipeline_head_disconnect_tears_down_successor();
         test_p29v1_k2_pipeline_successor_wait_deadline();
         test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable();
+        test_p29v1_k2_pipeline_successor_io_death_poisons_route();
         test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
         test_p29v1_k1_pipeline_wire_identity();
         std::cout << "p50_endpoint_test: focused route-pipeline PASS\n";
@@ -7130,6 +7280,7 @@ int main(int argc, char** argv) {
     test_p29v1_k2_pipeline_head_disconnect_tears_down_successor();
     test_p29v1_k2_pipeline_successor_wait_deadline();
     test_p29v1_k2_pipeline_head_drop_after_fill_stays_recoverable();
+    test_p29v1_k2_pipeline_successor_io_death_poisons_route();
     test_p29v1_k2_pipeline_no_eager_fill_falls_back_to_head();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
