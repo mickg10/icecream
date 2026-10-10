@@ -1950,14 +1950,40 @@ void CAuthority::verify_p29v1_materialization(
     // region_bytes() is concurrent-read safe (acquire on region_count_,
     // records/arenas never move), so this loop may run while the single
     // writer interns another TU.  It reads NO writer-only field.
+    //
+    // The full memcmp pass this loop used to run unconditionally proved, per
+    // region, exactly what the interning of THIS TU already proved inside
+    // prepare_p29v1_at_seq: a planned HIT was content-validated against its
+    // immutable published record at plan time (find_published_region
+    // memcmps the record's bytes against the input at the walk's own
+    // offset), and a MISS is either interned by THIS TU (add_region copies
+    // the bytes straight out of this input) or re-found at intern time
+    // (process_planned's find memcmps again).  Records never move or
+    // change after publish, so re-reading them here can only re-observe
+    // the same equality.  The only fact that per-region validation cannot
+    // establish is the CUMULATIVE one -- that the canonical split's region
+    // lengths tile the exact input -- and the length sum below proves it
+    // without a second whole-input pass.  The per-region content pass cost
+    // a full extra 36+ MiB memcmp per transfer on the C sidecar's critical
+    // per-TX path (microbench: prepare_source wall drops by the whole
+    // pass), so it is gated behind ICECC_P50_VERIFY_FULL=1 (tests) and the
+    // cheap form is the production default.
+    const bool full = [] {
+        static const bool value = [] {
+            const char* raw = std::getenv("ICECC_P50_VERIFY_FULL");
+            return raw != nullptr && *raw != '\0' && std::strcmp(raw, "0") != 0;
+        }();
+        return value;
+    }();
     size_t offset = 0;
     for (const uint32_t id : dense_regions) {
         const std::span<const uint8_t> region =
             p29v1_->interner.region_bytes(id);
-        if (region.size() > exact_input.size() - offset ||
-            (!region.empty() &&
-             std::memcmp(region.data(), exact_input.data() + offset,
-                         region.size()) != 0))
+        if (full &&
+            (region.size() > exact_input.size() - offset ||
+             (!region.empty() &&
+              std::memcmp(region.data(), exact_input.data() + offset,
+                          region.size()) != 0)))
             throw std::logic_error(
                 "P29V1 interner materialization differs from exact input");
         offset += region.size();
