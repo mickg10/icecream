@@ -59,7 +59,9 @@ libprotocol50_a_SOURCES = \
 	p50_fsession_service_owner.cpp \
 	p50_fsession_service_owner.h \
 	p50_fsession_payloads.cpp \
-	p50_fsession_payloads.h
+	p50_fsession_payloads.h \
+	p50_source_view.cpp \
+	p50_source_view.h
 
 AM_CPPFLAGS = -I$(top_srcdir) $(LIBZSTD_CFLAGS)
 

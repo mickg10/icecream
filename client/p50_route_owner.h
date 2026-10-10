@@ -74,7 +74,8 @@ public:
         std::span<const uint8_t> source);
 
     // Shares the caller's buffer instead of copying it; raw_digest, when
-    // known, is digest128(*source). stall_stage, when non-null (only under
+    // known, is the source view's digest (the read fuses it; see
+    // cache/p50_source_view.h). stall_stage, when non-null (only under
     // ICECC_P50_OWNER_LAG_TRACE), receives relaxed atomic stores of the last
     // stage this transfer reached; see ClientStallStage in
     // cache/p50_endpoint.h. write_complete, when set (research/designs/
@@ -85,7 +86,7 @@ public:
         P50RouteRelationship relationship, PrepareRequestKey request,
         ConnectedFdFactory connection,
         std::chrono::steady_clock::time_point deadline,
-        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::shared_ptr<const p50::P50SourceView> source,
         std::optional<Digest128> raw_digest = std::nullopt,
         std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
         std::function<void()> write_complete = nullptr);

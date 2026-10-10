@@ -3,6 +3,7 @@
 #include "p50_input_fd_attachment.h"
 #include "p50_sidecar_lifecycle_apply_override.h"
 #include "services/comm.h"
+#include "p50_source_view.h"
 
 #include <algorithm>
 #include <array>
@@ -2071,34 +2072,16 @@ local::P50SourceTransferResult source_transfer_result(
     return result;
 }
 
-std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
+// The source read for one transfer.  Returns a MAP_PRIVATE view of the
+// regular file (page-cache pages faulted in place, no copy, with the
+// content digest fused into the same fault-in pass), falling back to the
+// historical owned pread copy whenever a mapping cannot be created; see
+// cache/p50_source_view.h.  Refuses exactly what the historical pread
+// read refused: bad descriptor, non-regular file, or a size above the
+// limit.
+std::optional<std::shared_ptr<const p50::P50SourceView>> read_source_fd(
     int fd, uint64_t limit) noexcept {
-    if (fd < 0 || limit > SIZE_MAX)
-        return std::nullopt;
-    struct stat info{};
-    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
-        static_cast<uint64_t>(info.st_size) > limit)
-        return std::nullopt;
-    try {
-        auto result = std::make_shared<std::vector<uint8_t>>(
-            static_cast<size_t>(info.st_size));
-        size_t offset = 0;
-        while (offset != result->size()) {
-            const ssize_t count = ::pread(fd, result->data() + offset,
-                                          result->size() - offset,
-                                          static_cast<off_t>(offset));
-            if (count > 0) {
-                offset += static_cast<size_t>(count);
-                continue;
-            }
-            if (count < 0 && errno == EINTR)
-                continue;
-            return std::nullopt;
-        }
-        return std::const_pointer_cast<const std::vector<uint8_t>>(result);
-    } catch (...) {
-        return std::nullopt;
-    }
+    return p50::P50SourceView::map_fd(fd, limit);
 }
 
 // ICECC_P50_PREP_AHEAD (default off): when set to a nonempty value other
@@ -2821,7 +2804,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                                           arm.assignment_nonce};
     const bool prep_ahead = profile == ProfileId::P29V1 &&
                             source_authority_ != nullptr && prep_ahead_enabled();
-    std::optional<std::shared_ptr<const std::vector<uint8_t>>> source_bytes;
+    std::optional<std::shared_ptr<const p50::P50SourceView>> source_bytes;
     Digest128 source_digest{};
     std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared_source;
     P50PreparationAuthority::PrepareSourceTiming prepare_timing{};
@@ -2845,11 +2828,14 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
             (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt,
             {{"ok", source_bytes.has_value() ? 1 : 0}});
         if (source_bytes.has_value()) {
-            source_digest = digest128(**source_bytes);
+            // The digest is fused into the source read (P50SourceView), so
+            // the separate whole-input hashing pass is gone; the value is
+            // byte-identical to digest128() over the same bytes.
+            source_digest = (*source_bytes)->digest();
             try {
                 prepared_source = source_authority_->prepare_source(
-                    route_request, *source_bytes, source_digest,
-                    &prepare_timing);
+                    route_request, (*source_bytes)->span(),
+                    *source_bytes, source_digest, &prepare_timing);
             } catch (...) {
             }
             icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",
@@ -2930,12 +2916,13 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     // inside the route's serialized dialogue.  A failure is left for the
     // transfer itself to report.  (Already done above when prep_ahead.)
     if (!prep_ahead) {
-        source_digest = digest128(**source_bytes);
+        // Fused into the source read; see the prep_ahead site above.
+        source_digest = (*source_bytes)->digest();
         if (profile == ProfileId::P29V1 && source_authority_) {
             try {
                 prepared_source = source_authority_->prepare_source(
-                    route_request, *source_bytes, source_digest,
-                    &prepare_timing);
+                    route_request, (*source_bytes)->span(),
+                    *source_bytes, source_digest, &prepare_timing);
             } catch (...) {
             }
             icecc::stagetrace::stage_trace("csidecar", "prepare_source_done",

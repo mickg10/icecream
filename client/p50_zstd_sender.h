@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cache/p50_endpoint.h"
+#include "cache/p50_source_view.h"
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/awaitable.hpp>
@@ -201,7 +202,7 @@ public:
     boost::asio::awaitable<ZstdSourceTransferResult> transfer_route(
         ConnectedFdFactory connection, PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
-        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::shared_ptr<const p50::P50SourceView> source,
         std::optional<Digest128> raw_digest = std::nullopt,
         std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
         std::function<void()> write_complete = nullptr);
@@ -225,7 +226,7 @@ private:
         PrepareRequestKey request,
         std::chrono::steady_clock::time_point deadline,
         bool explicit_route,
-        std::shared_ptr<const std::vector<uint8_t>> source,
+        std::shared_ptr<const p50::P50SourceView> source,
         std::optional<Digest128> raw_digest = std::nullopt,
         std::shared_ptr<std::atomic<ClientStallStage>> stall_stage = nullptr,
         std::function<void()> write_complete = nullptr);

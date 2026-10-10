@@ -334,6 +334,18 @@ public:
         std::shared_ptr<const std::vector<uint8_t>> exact_input,
         Digest128 raw_digest,
         PrepareSourceTiming* timing = nullptr);
+    // The same preparation over a read-only view of the input (the
+    // sidecar's mapped source read, cache/p50_source_view.h).
+    // keepalive owns exact_input's bytes for the whole request lifetime
+    // (the vector overload above delegates here with itself as the
+    // keepalive); every internal reader of the raw bytes uses the span, so
+    // a mapped and a copied input are indistinguishable.
+    std::shared_ptr<const PreparedSource> prepare_source(
+        PrepareRequestKey request,
+        std::span<const uint8_t> exact_input,
+        std::shared_ptr<const void> keepalive,
+        Digest128 raw_digest,
+        PrepareSourceTiming* timing = nullptr);
     void install_source(PrepareRequestKey request,
                         std::shared_ptr<const PreparedSource> prepared);
     void release_source(PrepareRequestKey request) noexcept;

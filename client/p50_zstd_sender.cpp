@@ -466,8 +466,7 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
         return transfer_bytes(ConnectionTarget{remote}, request,
                               impl_->config.deadline, false, {});
     return transfer_bytes(ConnectionTarget{remote}, request, impl_->config.deadline,
-                          false,
-                          std::make_shared<const std::vector<uint8_t>>(*bytes));
+                          false, p50::P50SourceView::own(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -478,9 +477,8 @@ P50ZstdSourceSender::transfer(boost::asio::ip::tcp::endpoint remote,
         return transfer_bytes(ConnectionTarget{remote}, request,
                               impl_->config.deadline, false, {});
     return transfer_bytes(ConnectionTarget{remote}, request, impl_->config.deadline,
-                          false,
-                          std::make_shared<const std::vector<uint8_t>>(source.begin(),
-                                                                         source.end()));
+                          false, p50::P50SourceView::own(
+                              std::vector<uint8_t>(source.begin(), source.end())));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -494,8 +492,7 @@ P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
                               impl_->config.deadline, false, {});
     return transfer_bytes(
         ConnectionTarget{std::move(connection)}, request, impl_->config.deadline,
-        false,
-        std::make_shared<const std::vector<uint8_t>>(*bytes));
+        false, p50::P50SourceView::own(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -507,8 +504,8 @@ P50ZstdSourceSender::transfer(ConnectedFdFactory connection,
                               impl_->config.deadline, false, {});
     return transfer_bytes(
         ConnectionTarget{std::move(connection)}, request, impl_->config.deadline,
-        false,
-        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+        false, p50::P50SourceView::own(
+            std::vector<uint8_t>(source.begin(), source.end())));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -521,7 +518,7 @@ P50ZstdSourceSender::transfer_route(boost::asio::ip::tcp::endpoint remote,
     if (!bytes)
         return transfer_bytes(ConnectionTarget{remote}, request, deadline, true, {});
     return transfer_bytes(ConnectionTarget{remote}, request, deadline, true,
-                          std::make_shared<const std::vector<uint8_t>>(*bytes));
+                          p50::P50SourceView::own(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -532,8 +529,8 @@ P50ZstdSourceSender::transfer_route(boost::asio::ip::tcp::endpoint remote,
     if (source.size() > impl_->config.endpoint_caps.zstd.max_raw_bytes)
         return transfer_bytes(ConnectionTarget{remote}, request, deadline, true, {});
     return transfer_bytes(ConnectionTarget{remote}, request, deadline, true,
-                          std::make_shared<const std::vector<uint8_t>>(source.begin(),
-                                                                         source.end()));
+                          p50::P50SourceView::own(std::vector<uint8_t>(
+                              source.begin(), source.end())));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -548,7 +545,7 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                               deadline, true, {});
     return transfer_bytes(
         ConnectionTarget{std::move(connection)}, request, deadline, true,
-        std::make_shared<const std::vector<uint8_t>>(*bytes));
+        p50::P50SourceView::own(*bytes));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
@@ -561,14 +558,14 @@ P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                               deadline, true, {});
     return transfer_bytes(
         ConnectionTarget{std::move(connection)}, request, deadline, true,
-        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+        p50::P50SourceView::own(std::vector<uint8_t>(source.begin(), source.end())));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult>
 P50ZstdSourceSender::transfer_route(ConnectedFdFactory connection,
                                     PrepareRequestKey request,
                                     Clock::time_point deadline,
-                                    std::shared_ptr<const std::vector<uint8_t>> source,
+                                    std::shared_ptr<const p50::P50SourceView> source,
                                     std::optional<Digest128> raw_digest,
                                     std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
                                     std::function<void()> write_complete) {
@@ -585,7 +582,7 @@ P50ZstdSourceSender::transfer_bytes(
     PrepareRequestKey request,
     Clock::time_point deadline,
     bool explicit_route,
-    std::shared_ptr<const std::vector<uint8_t>> source,
+    std::shared_ptr<const p50::P50SourceView> source,
     std::optional<Digest128> known_digest,
     std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
     std::function<void()> write_complete) {
@@ -606,9 +603,13 @@ P50ZstdSourceSender::transfer_bytes(
     if (!source)
         co_return impl_->invalid(ZstdSourceTransferStatus::SourceError);
 
-    const Digest128 raw_digest = known_digest ? *known_digest : digest128(*source);
+    // The view's digest was fused into its read (P50SourceView); a caller
+    // that did not pass one (tests use this path) reuses it instead of
+    // re-hashing the whole input.
+    const Digest128 raw_digest =
+        known_digest ? *known_digest : source->digest();
     try {
-        if (const auto completed = impl_->completed_for(request, *source, raw_digest))
+        if (const auto completed = impl_->completed_for(request, source->span(), raw_digest))
             co_return *completed;
     } catch (const std::invalid_argument&) {
         co_return impl_->invalid(ZstdSourceTransferStatus::InvalidRequest);
@@ -658,8 +659,8 @@ P50ZstdSourceSender::transfer_bytes(
             impl_->config.before_prepare_for_route_for_test();
         const auto prepare_start = Clock::now();
         prepared = impl_->route_bound
-            ? impl_->authority->prepare_for_route(impl_->route, request, *source)
-            : impl_->authority->prepare(request, *source);
+            ? impl_->authority->prepare_for_route(impl_->route, request, source->span())
+            : impl_->authority->prepare(request, source->span());
         prepare_route_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 Clock::now() - prepare_start)
@@ -816,7 +817,7 @@ P50ZstdSourceSender::transfer_bytes(
                 co_return result;
             }
             try {
-                impl_->remember_completed(request, *source, raw_digest, result);
+                impl_->remember_completed(request, source->span(), raw_digest, result);
             } catch (const std::length_error&) {
                 co_return impl_->replacement(
                     ZstdSourceTransferStatus::Unavailable, explicit_route);

@@ -954,11 +954,16 @@ struct P50PreparationAuthority::Impl {
 
     // One request/input record is C-wide.  A route view below carries only
     // relationship cursor state and its own prepared envelope.
+    // raw is a VIEW; raw_keepalive owns its bytes (a std::vector<uint8_t>
+    // from the owned read, or the P50SourceView mapping).  Every reader of
+    // the input bytes goes through the span, so a mapped input and a copied
+    // one are indistinguishable to the whole preparation path.
     struct Shared {
         PrepareRequestKey request{};
         uint64_t raw_bytes = 0;
         Digest128 raw_digest{};
-        std::shared_ptr<const std::vector<uint8_t>> raw;
+        std::span<const uint8_t> raw;
+        std::shared_ptr<const void> raw_keepalive;
         TuSeq tu_seq{};
         PreparedTUPtr p29_source;
         std::map<PreparationRouteKey, uint64_t> entries;
@@ -1144,8 +1149,8 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         shared = request_position->second;
         if (shared->raw_bytes != exact_input.size())
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
-        if (shared->raw->data() != exact_input.data() &&
-            !std::equal(shared->raw->begin(), shared->raw->end(), exact_input.begin()))
+        if (shared->raw.data() != exact_input.data() &&
+            !std::equal(shared->raw.begin(), shared->raw.end(), exact_input.begin()))
             throw std::invalid_argument("PrepareRequestKey was reused for different input");
         if (const auto route_entry = shared->entries.find(route_key);
             route_entry != shared->entries.end())
@@ -1183,8 +1188,10 @@ PreparedTuHandle P50PreparationAuthority::prepare_for_route(
         shared->request = request;
         shared->raw_bytes = exact_input.size();
         shared->raw_digest = raw_digest;
-        shared->raw = std::make_shared<const std::vector<uint8_t>>(
+        shared->raw_keepalive = std::make_shared<const std::vector<uint8_t>>(
             exact_input.begin(), exact_input.end());
+        shared->raw = *std::static_pointer_cast<const std::vector<uint8_t>>(
+            shared->raw_keepalive);
         // Reserve exactly once at C-wide request admission.  The reservation
         // is committed only after encoding and all retained-entry bookkeeping
         // succeeds, so a failed attempt leaves the same TU_SEQ for retry.
@@ -1341,8 +1348,22 @@ P50PreparationAuthority::prepare_source(
     std::shared_ptr<const std::vector<uint8_t>> exact_input,
     Digest128 raw_digest,
     PrepareSourceTiming* timing) {
-    if (!exact_input || request.producer_session == 0 || request.request_token == 0 ||
-        exact_input->size() > impl_->zstd_limits.max_raw_bytes)
+    if (!exact_input)
+        return nullptr;
+    return prepare_source(request, std::span<const uint8_t>(*exact_input),
+                          std::static_pointer_cast<const void>(std::move(exact_input)),
+                          raw_digest, timing);
+}
+
+std::shared_ptr<const P50PreparationAuthority::PreparedSource>
+P50PreparationAuthority::prepare_source(
+    PrepareRequestKey request,
+    std::span<const uint8_t> exact_input,
+    std::shared_ptr<const void> keepalive,
+    Digest128 raw_digest,
+    PrepareSourceTiming* timing) {
+    if (!keepalive || request.producer_session == 0 || request.request_token == 0 ||
+        exact_input.size() > impl_->zstd_limits.max_raw_bytes)
         return nullptr;
     const auto clock_now = [] {
         return std::chrono::steady_clock::now();
@@ -1357,9 +1378,10 @@ P50PreparationAuthority::prepare_source(
     uint64_t mutex_hold_ns = 0;
     auto shared = std::make_shared<Impl::Shared>();
     shared->request = request;
-    shared->raw_bytes = exact_input->size();
+    shared->raw_bytes = exact_input.size();
     shared->raw_digest = raw_digest;
-    shared->raw = std::move(exact_input);
+    shared->raw = exact_input;
+    shared->raw_keepalive = std::move(keepalive);
     // Only the interner's WRITE half is serialized C-wide (single writer).
     // The O(raw) work -- the canonical split plus the hash probes -- runs
     // OUTSIDE source_mutex (plan_p29v1, a lock-free read over published
@@ -1383,7 +1405,7 @@ P50PreparationAuthority::prepare_source(
     // content-validated against an immutable published record.
     const auto plan_begin = clock_now();
     const std::vector<codec::P29RegionPlanEntry> plan =
-        impl_->p29_authority->plan_p29v1(*shared->raw);
+        impl_->p29_authority->plan_p29v1(shared->raw);
     const uint64_t plan_ns = elapsed_ns(plan_begin, clock_now());
     {
         const auto wait_begin = clock_now();
@@ -1404,7 +1426,7 @@ P50PreparationAuthority::prepare_source(
         // TU can use the hole).
         shared->p29_source =
             impl_->p29_authority->intern_p29v1_locked_planned(
-                *shared->raw, plan, tu_seq, raw_digest);
+                shared->raw, plan, tu_seq, raw_digest);
         impl_->p29_authority->commit_tu_seq(tu_seq);
         mutex_hold_ns += elapsed_ns(held_begin, clock_now());
     }
@@ -1414,7 +1436,7 @@ P50PreparationAuthority::prepare_source(
     // comes from verify_p29v1_materialization and is unchanged).
     try {
         impl_->p29_authority->verify_p29v1_materialization(
-            shared->p29_source->dense_regions, *shared->raw);
+            shared->p29_source->dense_regions, shared->raw);
     } catch (const std::exception& error) {
         std::lock_guard lock(impl_->source_mutex);
         impl_->p29_authority->mark_p29v1_nonrunnable(error);
@@ -1707,7 +1729,7 @@ void P50PreparationAuthority::commit(PreparedTuHandle handle) {
         const size_t limit = static_cast<size_t>(std::min<uint64_t>(
             impl_->zstd_limits.max_history_bytes,
             uint64_t{1} << impl_->zstd_limits.max_window_log));
-        const std::vector<uint8_t>& raw = *entry.shared->raw;
+        const std::span<const uint8_t> raw = entry.shared->raw;
         if (raw.size() >= limit) {
             route.committed_route_history.assign(
                 raw.end() - static_cast<std::ptrdiff_t>(limit), raw.end());

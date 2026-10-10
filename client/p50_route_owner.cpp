@@ -160,14 +160,14 @@ boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     std::span<const uint8_t> source) {
     co_return co_await transfer(
         relationship, request, std::move(connection), deadline,
-        std::make_shared<const std::vector<uint8_t>>(source.begin(), source.end()));
+        p50::P50SourceView::own(std::vector<uint8_t>(source.begin(), source.end())));
 }
 
 boost::asio::awaitable<ZstdSourceTransferResult> P50CRouteOwner::transfer(
     P50RouteRelationship relationship, PrepareRequestKey request,
     ConnectedFdFactory connection,
     std::chrono::steady_clock::time_point deadline,
-    std::shared_ptr<const std::vector<uint8_t>> source,
+    std::shared_ptr<const p50::P50SourceView> source,
     std::optional<Digest128> raw_digest,
     std::shared_ptr<std::atomic<ClientStallStage>> stall_stage,
     std::function<void()> write_complete) {
