@@ -43,6 +43,7 @@
 // No real hostnames appear anywhere in this harness.
 
 #include "cache/p50_endpoint.h"
+#include "cache/p50_source_view.h"
 #include "cache/p50_zstd.h"
 #include "cache/protocol50.h"
 #include "cache/p50_slice0.h"
@@ -51,6 +52,8 @@
 #include <boost/asio.hpp>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -120,41 +123,15 @@ struct StageSplit {
 };
 
 // ---------------------------------------------------------------------------
-// read_source_fd: the sidecar's file->vector copy.  The production function
-// is internal linkage in cache/p50_cache_service.cpp; this is a verbatim
-// copy of its body so the benchmark times the same code, and any change to
-// the product function is mirrored here (the unit matrix keeps the product
-// one covered; this copy exists so the benchmark can link standalone).
+// read_source_fd: the sidecar's source read.  The production function is
+// internal linkage in cache/p50_cache_service.cpp and delegates to
+// P50SourceView::map_fd (cache/p50_source_view.h); the bench calls the same
+// product factory so the benchmark times exactly the product read.
 // ---------------------------------------------------------------------------
 
-std::optional<std::shared_ptr<const std::vector<uint8_t>>> read_source_fd(
+std::optional<std::shared_ptr<const P50SourceView>> read_source_fd(
     int fd, uint64_t limit) noexcept {
-    if (fd < 0 || limit > SIZE_MAX)
-        return std::nullopt;
-    struct stat info {};
-    if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
-        static_cast<uint64_t>(info.st_size) > limit)
-        return std::nullopt;
-    try {
-        auto result = std::make_shared<std::vector<uint8_t>>(
-            static_cast<size_t>(info.st_size));
-        size_t offset = 0;
-        while (offset != result->size()) {
-            const ssize_t count = ::pread(fd, result->data() + offset,
-                                          result->size() - offset,
-                                          static_cast<off_t>(offset));
-            if (count > 0) {
-                offset += static_cast<size_t>(count);
-                continue;
-            }
-            if (count < 0 && errno == EINTR)
-                continue;
-            return std::nullopt;
-        }
-        return std::const_pointer_cast<const std::vector<uint8_t>>(result);
-    } catch (...) {
-        return std::nullopt;
-    }
+    return P50SourceView::map_fd(fd, limit);
 }
 
 // ---------------------------------------------------------------------------
@@ -180,8 +157,15 @@ struct Rng {
 
 std::string synthetic_cxx_body(Rng& rng, uint32_t lines) {
     // Deterministic pseudo-C++ lines.  Nothing here copies real source: it
-    // only needs to be line-shaped and textually repetitive.
-    static const char* kinds[] = {
+    // only needs to be line-shaped and textually repetitive.  Every random
+    // value is drawn into a named local BEFORE the snprintf call: the draws
+    // feeding one printf must not sit in its argument list, because the
+    // evaluation order of function arguments is unspecified and differs
+    // across compilations, which would make the corpus bytes depend on the
+    // binary rather than only on the seed.  (The wire-identity receipts are
+    // compared across separately compiled binaries, so the corpus has to be
+    // compilation-stable, not merely process-stable.)
+    static constexpr const char* kinds[] = {
         "namespace synthetic_%u { namespace inner_%u { struct Shape_%u { "
         "unsigned width_%u = %u; unsigned height_%u = %u; }; } }\n",
         "template <class T_%u> struct Wrapper_%u { T_%u value_%u{}; "
@@ -195,20 +179,57 @@ std::string synthetic_cxx_body(Rng& rng, uint32_t lines) {
         "class Visitor_%u { public: virtual void visit_%u(unsigned stage, "
         "const char* region) = 0; virtual ~Visitor_%u() = default; };\n",
     };
+    // Argument counts per kind, in placeholder order.
+    static constexpr uint32_t kind_args[] = {7, 8, 3, 8, 10, 3};
     std::string out;
     out.reserve(static_cast<size_t>(lines) * 110);
     char buffer[640];
     for (uint32_t line = 0; line < lines; ++line) {
-        const char* kind = kinds[rng.below(std::size(kinds))];
-        const int written = std::snprintf(
-            buffer, sizeof(buffer), kind, rng.below(4096), rng.below(4096),
-            rng.below(4096), rng.below(9999), rng.below(9999),
-            rng.below(9999), rng.below(4096),
-            rng.below(2) ? "true" : "false", rng.below(65535),
-            rng.below(65535), rng.below(4096), rng.below(4096),
-            rng.below(4096), rng.below(256), rng.below(256), rng.below(256),
-            rng.below(256), rng.below(256), rng.below(256), rng.below(256),
-            rng.below(256), rng.below(256), rng.below(256), rng.below(256));
+        const uint32_t kind = static_cast<uint32_t>(rng.below(std::size(kinds)));
+        uint32_t args[10] = {};
+        bool pinned = false;
+        for (uint32_t draw = 0; draw < kind_args[kind]; ++draw) {
+            if (kind == 1 && draw == 7)
+                pinned = rng.below(2) != 0;
+            else if (kind == 4)
+                args[draw] = rng.below32(draw == 0 ? 4096 : 9999);
+            else if (kind == 3 && draw >= 4)
+                args[draw] = rng.below32(9999);
+            else
+                args[draw] = rng.below32(4096);
+        }
+        int written = 0;
+        switch (kind) {
+        case 0:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[0], args[0],
+                                    args[1], args[2], args[3], args[4],
+                                    args[5], args[6]);
+            break;
+        case 1:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[1], args[0],
+                                    args[1], args[2], args[3], args[4],
+                                    args[5], args[6], pinned ? "true" : "false");
+            break;
+        case 2:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[2], args[0],
+                                    args[1], args[2]);
+            break;
+        case 3:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[3], args[0],
+                                    args[1], args[2], args[3], args[4],
+                                    args[5], args[6], args[7]);
+            break;
+        case 4:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[4], args[0],
+                                    args[1], args[2], args[3], args[4],
+                                    args[5], args[6], args[7], args[8],
+                                    args[9]);
+            break;
+        default:
+            written = std::snprintf(buffer, sizeof(buffer), kinds[5], args[0],
+                                    args[1], args[2]);
+            break;
+        }
         if (written > 0)
             out.append(buffer, static_cast<size_t>(written));
     }
@@ -229,11 +250,13 @@ struct HeaderPool {
         while (total_bytes < pool_target_bytes) {
             std::string text;
             const std::string& path = paths[rng.below(paths.size())];
+            const uint32_t marker_line = rng.below32(100000);
+            const uint32_t marker_flag = 1u + rng.below32(3);
             char marker[256];
             const int written = std::snprintf(marker, sizeof(marker),
                                               "# %u \"%s\" %u\n",
-                                              rng.below32(100000), path.c_str(),
-                                              1u + rng.below32(3));
+                                              marker_line, path.c_str(),
+                                              marker_flag);
             text.append(marker, static_cast<size_t>(written > 0 ? written : 0));
             text += synthetic_cxx_body(rng, 60 + rng.below(240));
             total_bytes += text.size();
@@ -322,6 +345,11 @@ struct DriveConfig {
     size_t tus = 50;
     size_t tu_mb = 36;
     double shared_fraction = 0.995;
+    // Pool oversize over the per-TU shared budget: the fraction of the
+    // shuffled pool each TU leaves out (and a later TU's route then has as
+    // its per-TX missing set).  1.01 keeps the warm-route FILL at the
+    // ~10-20 KB wire size the farm legs record per transfer.
+    double pool_oversize = 1.01;
     uint64_t seed = 20261009;
     size_t repeats = 1;
     bool json = false;
@@ -337,12 +365,14 @@ struct PreparedCorpus {
 
 PreparedCorpus stage_corpus(const DriveConfig& config) {
     PreparedCorpus corpus;
+    const bool corpus_debug = std::getenv("P29CCPUBENCH_CORPUS_DIGEST") != nullptr;
     // The pool must hold at least a full shared budget of header content so
     // each TU's shuffled prefix can fill its 98% shared budget from a
     // ~1.02x oversized pool (the leftover ~2% is what a warm route is
     // missing each TX).
     const size_t pool_target_bytes =
-        size_t(double(config.tu_mb << 20) / std::max(0.5, config.shared_fraction) * 1.04);
+        size_t(double(config.tu_mb << 20) / std::max(0.5, config.shared_fraction) *
+               config.pool_oversize);
     HeaderPool pool(pool_target_bytes, config.seed);
     corpus.files.reserve(config.tus);
     for (size_t t = 0; t < config.tus; ++t) {
@@ -374,6 +404,17 @@ PreparedCorpus stage_corpus(const DriveConfig& config) {
         (void)read_source_fd(file->fd, uint64_t{64} << 20);  // fault the pages in
         corpus.files.push_back(std::move(file));
         corpus.sizes.push_back(bytes.size());
+        if (corpus_debug) {
+            const Digest128 staged = icecc::digest128(bytes);
+            static const char* digits = "0123456789abcdef";
+            std::string hex;
+            for (uint8_t b : staged.bytes) {
+                hex += digits[b >> 4];
+                hex += digits[b & 15];
+            }
+            std::fprintf(stdout, "corpus %zu digest=%s size=%zu\n", t,
+                          hex.c_str(), bytes.size());
+        }
     }
     return corpus;
 }
@@ -431,23 +472,25 @@ void drive_leg(P50PreparationAuthority& authority,
     for (size_t t = 0; t < corpus.files.size(); ++t) {
         StageClock mark;
         const PrepareRequestKey request{1, ++request_token};
-        std::optional<std::shared_ptr<const std::vector<uint8_t>>> source =
+        std::optional<std::shared_ptr<const P50SourceView>> source =
             read_source_fd(corpus.files[t]->fd, uint64_t{64} << 20);
         StageClock after_read;
         if (timed)
-            split.add("read_source_fd", mark, after_read);
+            split.add("read_source_fd(+fused digest)", mark, after_read);
         if (!source.has_value())
             throw std::runtime_error("read_source_fd refused a staged synthetic TU");
         mark = after_read;
-        const Digest128 raw_digest = icecc::digest128(**source);
+        // The digest is fused into the read (P50SourceView); the historical
+        // separate whole-input hash pass is gone.
+        const Digest128 raw_digest = (*source)->digest();
         StageClock after_digest;
         if (timed)
             split.add("digest128", mark, after_digest);
         mark = after_digest;
         P50PreparationAuthority::PrepareSourceTiming prepare_timing{};
         std::shared_ptr<const P50PreparationAuthority::PreparedSource> prepared =
-            authority.prepare_source(request, *source, raw_digest,
-                                     timed ? &prepare_timing : nullptr);
+            authority.prepare_source(request, (*source)->span(), *source,
+                                     raw_digest, timed ? &prepare_timing : nullptr);
         StageClock after_prepare;
         if (timed) {
             split.add("prepare_source", mark, after_prepare);
@@ -464,7 +507,7 @@ void drive_leg(P50PreparationAuthority& authority,
             split.add("install_source", mark, after_install);
         mark = after_install;
         const PreparedTuHandle handle =
-            authority.prepare_for_route(route, request, **source);
+            authority.prepare_for_route(route, request, (*source)->span());
         StageClock after_route;
         if (timed)
             split.add("prepare_for_route", mark, after_route);
@@ -598,17 +641,18 @@ std::string loopback_identity(const DriveConfig& config,
     const tcp::endpoint endpoint = acceptor.local_endpoint();
     for (size_t t = 0; t < corpus.files.size(); ++t) {
         const PrepareRequestKey request{1, ++request_token};
-        std::optional<std::shared_ptr<const std::vector<uint8_t>>> source =
+        std::optional<std::shared_ptr<const P50SourceView>> source =
             read_source_fd(corpus.files[t]->fd, uint64_t{64} << 20);
         if (!source.has_value())
             throw std::runtime_error("read_source_fd refused a staged synthetic TU");
-        const Digest128 raw_digest = icecc::digest128(**source);
-        auto prepared_source = authority->prepare_source(request, *source, raw_digest);
+        const Digest128 raw_digest = (*source)->digest();
+        auto prepared_source = authority->prepare_source(request, (*source)->span(),
+                                                         *source, raw_digest);
         if (!prepared_source)
             throw std::runtime_error("prepare_source refused a synthetic TU");
         authority->install_source(request, prepared_source);
         const PreparedTuHandle handle =
-            authority->prepare_for_route(route, request, **source);
+            authority->prepare_for_route(route, request, (*source)->span());
         if (!handle)
             throw std::runtime_error("prepare_for_route refused a synthetic TU");
         // The endpoint run consumes the handle: it encodes BEGIN/BODY,
@@ -665,7 +709,32 @@ std::string loopback_identity(const DriveConfig& config,
     return receipts;
 }
 
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+// Accumulates the product's own per-stage timers (see
+// cache/codec/p29_wire.h P29StageTimerEntry) so a measurement build of this
+// bench (-DICECC_P50SIM_STAGE_TIMERS on the bench AND libprotocol50) can
+// attribute the per-TX CPU to the product's named stages.
+std::array<std::atomic<std::uint64_t>, 16> g_stage_ns{};
+const char* k_stage_names[16] = {
+    "ReceiverReceiveFill",      "ReceiverTakeMaterialized",
+    "ReceiverMaterializedDigest", "ReceiverTransactionDigest",
+    "ReceiverPendingSegmentDigest", "SenderInternAndMatch",
+    "SenderEncode",             "ReceiverMaterializeCopyback",
+    "SenderPrepareReserve",      "SenderMatchPrepare",
+    "SenderBuildRoot",           "SenderEncodeRoot",
+    "SenderEncodeBlocks",        "", "", "",
+};
+#endif
+
 }  // namespace
+
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+extern "C" void icecc_p50sim_p29_stage_timer_add(
+    unsigned entry, std::uint64_t nanoseconds) noexcept {
+    if (entry < 16)
+        g_stage_ns[entry].fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+#endif
 
 int main(int argc, char** argv) {
     try {
@@ -685,6 +754,8 @@ int main(int argc, char** argv) {
                 config.shared_fraction = std::stod(std::string(value()));
             else if (argument == "--seed")
                 config.seed = std::stoull(std::string(value()));
+            else if (argument == "--pool-oversize")
+                config.pool_oversize = std::stod(std::string(value()));
             else if (argument == "--repeats")
                 config.repeats = std::stoul(std::string(value()));
             else if (argument == "--json")
@@ -810,16 +881,26 @@ int main(int argc, char** argv) {
             std::printf("}}\n");
         } else {
             std::printf(
-                "p29ccpubench: %zu transfers x %zu MB (shared %.0f%%), "
-                "%zu repeat(s): %.3f ms CPU per TX (mean), %.3f (last)\n",
+                "p29ccpubench: %zu transfers x %zu MB (shared %.1f%%, "
+                "pool %.3fx), %zu repeat(s): %.3f ms CPU per TX (mean), "
+                "%.3f (last)\n",
                 corpus.files.size(), config.tu_mb,
-                config.shared_fraction * 100.0, legs.size(),
-                mean_per_tx_ms, report.per_tx_ms);
+                config.shared_fraction * 100.0, config.pool_oversize,
+                legs.size(), mean_per_tx_ms, report.per_tx_ms);
             std::printf("  %-44s %14s %10s\n", "stage", "ms/TX", "share");
             for (const auto& [name, ms] : report.stages)
                 std::printf("  %-44s %14.4f %9.2f%%\n", name, ms,
                             100.0 * ms / report.per_tx_ms);
         }
+#if defined(ICECC_P50SIM_STAGE_TIMERS)
+        for (size_t i = 0; i < 16; ++i)
+            if (k_stage_names[i][0] != '\0' && g_stage_ns[i].load() != 0)
+                std::fprintf(stdout, "  product-stage %-30s %10.3f ms/TX\n",
+                             k_stage_names[i],
+                             double(g_stage_ns[i].load()) / 1e6 /
+                                 double(corpus.files.size()) /
+                                 double(std::max<size_t>(1, config.repeats)));
+#endif
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "p29ccpubench: %s\n", error.what());
