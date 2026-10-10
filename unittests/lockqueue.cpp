@@ -101,6 +101,16 @@ static pid_t spawn(bool queued, const char *dir, int report_fd, int release_fd)
     } else {
         unsetenv("ICECC_LOCAL_LOCK_QUEUE");
     }
+    // Forked children inherit every pipe end still open in the parent at
+    // fork time: a later holder keeps the write end of an earlier holder's
+    // release pipe, so closing that pipe in the parent never EOFs it and
+    // the earlier holder never exits.  Holders must be released by their
+    // OWN write end only: close every inherited fd that is not ours.
+    for (int fd = 3; fd < 32; ++fd) {
+        if (fd != report_fd && fd != release_fd) {
+            close(fd);
+        }
+    }
     if (!dcc_lock_host_at(dir, 4)) {
         _exit(3);
     }
