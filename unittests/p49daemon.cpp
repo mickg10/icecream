@@ -334,6 +334,11 @@ int main(int argc, char **argv)
         setenv("ICECC_TESTS", "1", 1);
         setenv("ICECC_TEST_SOCKET", socket_path.c_str(), 1);
         setenv("ICECC_TEST_ASSIGNMENT_TABLE_LIMIT", "8", 1);
+        /* Retention below the hard admission limit: the terminal table is
+           a bounded FIFO (k415), so inserts evict the oldest retained
+           terminal instead of exhausting the epoch.  4 makes the eviction
+           observable within this test's handful of terminals. */
+        setenv("ICECC_TEST_ASSIGNMENT_TERMINAL_RETENTION", "4", 1);
         std::vector<std::string> arguments {
             argv[1], "--no-remote", "-m", "1", "-p", "10245", "-s",
             scheduler_spec, "-n", "p49-worker", "-N", "p49-daemon", "-b",
@@ -622,9 +627,13 @@ int main(int argc, char **argv)
                 ConfCSMsg(epoch, ConfCSMsg::EnforcingCompat)),
             "same-epoch enforcing mode rebinds retained state");
 
-    /* Three terminals already exist.  Fill the eight-entry test bound, then
-       prove that the next identity closes the session and the same exhausted
-       epoch cannot be reactivated. */
+    /* Three terminals already exist.  Fill past the four-entry test
+       RETENTION bound (the hard admission limit stays 8): the terminal
+       table is a bounded FIFO (k415), so every insert beyond the bound
+       evicts the OLDEST retained terminal instead of exhausting the
+       epoch.  A late duplicate for an evicted identity re-derives its
+       own deterministic outcome (Revoked, since no live record exists)
+       rather than replaying a row that was evicted. */
     for (uint32_t i = 0; i != 5; ++i) {
         const uint32_t id = 1000 + i;
         const uint64_t nonce = UINT64_C(0x7000000000000000) + i;
@@ -638,34 +647,85 @@ int main(int argc, char **argv)
                 "bounded terminal-table slot retained deterministically");
         delete terminal_wire;
     }
-    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(
-                epoch, 1005, UINT64_C(0x7000000000000005))),
-            "identity beyond the epoch bound delivered");
-    no_type(scheduler, Msg::REVOKE_RESULT, 1000);
-    REQUIRE(scheduler->at_eof(),
-            "terminal-table exhaustion closes the scheduler session");
+    usleep(300 * 1000);
+    const std::string bounded = request_internals(socket_path);
+    REQUIRE(bounded.find("retained=4") != std::string::npos
+                && bounded.find("exhausted=0") != std::string::npos,
+            "terminal retention stays bounded without exhaustion");
+
+    /* The identity that must have been EVICTED by the five inserts above
+       (the first revoked terminal): its duplicate is answered with a
+       fresh deterministic Revoked, never a replay of the evicted row,
+       and the channel stays open the whole time. */
+    REQUIRE(scheduler->send_msg(
+                RevokeBeforeStartMsg(epoch, 701, revoked_nonce)),
+            "duplicate revoke for the evicted identity delivered");
+    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+    terminal = dynamic_cast<RevokeResultMsg *>(terminal_wire);
+    REQUIRE(terminal && terminal->wire_id == 701
+                && terminal->nonce() == revoked_nonce
+                && terminal->result == RevokeResultMsg::Revoked,
+            "evicted identity re-derives its deterministic outcome");
+    delete terminal_wire;
+    REQUIRE(!scheduler->at_eof(),
+            "terminal-table retention never closes the scheduler session");
+
+    /* Admission through a full-but-bounded table: a fresh PREPARE evicts
+       as needed and reaches READY instead of being refused. */
+    const uint32_t fresh_id = 1005;
+    const uint64_t fresh_nonce = UINT64_C(0x7000000000000005);
+    REQUIRE(scheduler->send_msg(
+                AssignPrepareMsg(epoch, fresh_id, fresh_nonce, 3)),
+            "fresh PREPARE delivered past the retention bound");
+    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
+    REQUIRE(ready && ready->wire_id == fresh_id
+                && ready->nonce() == fresh_nonce,
+            "admission still works past the terminal retention bound");
+    delete ready_wire;
+
+    /* Scheduler-session loss with a full-but-bounded table, then the
+       same-epoch EnforcingCompat re-login: the k415 flap shape.  The
+       ConfCS must be ACCEPTED (an unchanged epoch+fence is not a
+       configuration change, and a full table is a bounded service
+       condition), the session must activate, and a further assignment
+       must still work. */
     delete scheduler;
     scheduler = nullptr;
-    usleep(300 * 1000);
-    const std::string exhausted = request_internals(socket_path);
-    REQUIRE(exhausted.find("retained=8") != std::string::npos
-                && exhausted.find("exhausted=1") != std::string::npos,
-            "bounded epoch state remains observable and fail-closed");
-
     scheduler = accept_channel(listener, 8000);
     login = wait_type(scheduler, Msg::LOGIN, 5000);
-    REQUIRE(scheduler && login, "daemon retries the exhausted epoch");
+    REQUIRE(scheduler && login, "daemon reconnects with a bounded table");
     delete login;
     REQUIRE(scheduler && scheduler->send_msg(
                 ConfCSMsg(epoch, ConfCSMsg::EnforcingCompat)),
-            "same exhausted epoch configuration delivered");
-    no_type(scheduler, Msg::STATUS_TEXT, 1000);
-    REQUIRE(scheduler->at_eof(),
-            "same exhausted epoch is deterministically refused");
-    delete scheduler;
-    scheduler = nullptr;
+            "same epoch and mode delivered with a bounded full table");
+    REQUIRE(!scheduler->at_eof(),
+            "same-epoch ConfCS is not refused while the table is full");
+    const uint32_t reload_id = 1006;
+    const uint64_t reload_nonce = UINT64_C(0x7000000000000006);
+    REQUIRE(scheduler->send_msg(
+                AssignPrepareMsg(epoch, reload_id, reload_nonce, 3)),
+            "post-reconnect PREPARE delivered");
+    ready_wire = wait_type(scheduler, Msg::ASSIGN_READY, 3000);
+    ready = dynamic_cast<AssignReadyMsg *>(ready_wire);
+    REQUIRE(ready && ready->wire_id == reload_id
+                && ready->nonce() == reload_nonce,
+            "post-reconnect admission works on the same bounded epoch");
+    delete ready_wire;
+    /* Close the fresh live rows so the reopened-epoch assertions below
+       start from a clean live set. */
+    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(epoch, fresh_id, fresh_nonce)),
+            "fresh live row revoked before epoch reopen");
+    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+    delete terminal_wire;
+    REQUIRE(scheduler->send_msg(RevokeBeforeStartMsg(epoch, reload_id, reload_nonce)),
+            "reloaded live row revoked before epoch reopen");
+    terminal_wire = wait_type(scheduler, Msg::REVOKE_RESULT, 3000);
+    delete terminal_wire;
 
     const uint64_t reopened_epoch = epoch + 1;
+    delete scheduler;
+    scheduler = nullptr;
     scheduler = accept_channel(listener, 8000);
     login = wait_type(scheduler, Msg::LOGIN, 5000);
     REQUIRE(scheduler && login, "daemon reconnects for a fresh epoch");

@@ -5008,6 +5008,69 @@ static size_t assignment_terminal_limit()
     }();
     return limit;
 }
+/* Retained-terminal retention (k415, 2026-10-09): the terminal table is a
+   bounded FIFO, not an append-only ledger.  A terminal exists so a late
+   duplicate PREPARE/REVOKE for its exact (epoch, wire_id, nonce) gets the
+   same deterministic replay answer instead of re-admitting dead authority
+   (handle_assign_prepare / handle_revoke_before_start).  Retaining the
+   most recent terminals preserves that replay window; a duplicate older
+   than the window simply re-derives its own deterministic outcome (a
+   REVOKE without a live record is Revoked; a PREPARE without one is a
+   fresh admission).  Unbounded retention exhausted the table at the
+   production limit after ~65k jobs on ONE scheduler epoch -- a farm
+   scheduler that stays up for days never changes its epoch -- and the
+   exhaustion flags then refused every same-epoch ConfCS and closed the
+   channel on the next PREPARE, permanently flapping the daemon off the
+   farm (and with the session down, the cache-sidecar replacement mint
+   can never run: the sidecar stays dead).  Default retention 4096 is
+   ~7 orders of latency beyond any real late-duplicate window (a client
+   claims its UseCS immediately; the scheduler replays a revoke within a
+   turn), and far below the 65536 hard admission limit. */
+static std::deque<AssignmentKey> assignment_terminal_order;
+static size_t assignment_terminal_retention()
+{
+    static const size_t retention = [] {
+        size_t value = 4096;
+        if (getenv("ICECC_TESTS") != nullptr) {
+            const char *text =
+                getenv("ICECC_TEST_ASSIGNMENT_TERMINAL_RETENTION");
+            if (text != nullptr && *text != '\0') {
+                char *end = nullptr;
+                const unsigned long parsed = strtoul(text, &end, 10);
+                if (end != text && *end == '\0' && parsed > 0
+                        && parsed <= 65536) {
+                    value = static_cast<size_t>(parsed);
+                }
+            }
+        }
+        const size_t limit = assignment_terminal_limit();
+        return value > limit ? limit : value;
+    }();
+    return retention;
+}
+/* Evict oldest retained terminals until the table is below its retention
+   bound.  Called before every terminal insert and before live-admission
+   capacity accounting, so table-full is a bounded, service-preserving
+   condition rather than a protocol violation.  The closed-wire-id row for
+   an evicted key is dropped with it: it exists to reject nonce-less claims
+   for exactly that terminal identity, and a fresh PREPARE reusing the wire
+   id already erases the stale row on its own (handle_assign_prepare). */
+static void prune_assignment_terminals()
+{
+    const size_t retention = assignment_terminal_retention();
+    while (assignment_terminals.size() >= retention
+               && !assignment_terminal_order.empty()) {
+        const AssignmentKey oldest = assignment_terminal_order.front();
+        assignment_terminal_order.pop_front();
+        const auto terminal = assignment_terminals.find(oldest);
+        if (terminal == assignment_terminals.end())
+            continue;
+        assignment_terminals.erase(terminal);
+        const auto closed = closed_wire_ids.find(oldest.wire_id);
+        if (closed != closed_wire_ids.end() && closed->second == oldest)
+            closed_wire_ids.erase(closed);
+    }
+}
 static bool assignment_table_exhausted = false;
 static bool assignment_epoch_history_exhausted = false;
 /* Wire value 1 was Advisory, retired by virtu2 (see ConfCSMsg::FenceMode in
@@ -5053,6 +5116,7 @@ static bool replace_assignment_epoch()
     }
     live_assignments.clear();
     assignment_terminals.clear();
+    assignment_terminal_order.clear();
     closed_wire_ids.clear();
     assignment_scheduler_epoch = 0;
     assignment_fence_mode = ConfCSMsg::Legacy;
@@ -5086,11 +5150,18 @@ static bool retain_assignment_terminal(const AssignmentKey &key,
             return false;
         }
     } else {
+        /* Bounded FIFO retention, not exhaustion: evict the oldest
+           retained terminal so this one fits (k415).  Capacity is only
+           unreachable after the prune when live rows alone saturate the
+           admission limit, which keeps the fail-closed flag meaning
+           "invariant violated", never "table merely full". */
+        prune_assignment_terminals();
         if (!assignment_capacity_available(key)) {
             log_error() << "protocol-49 epoch terminal table exhausted" << endl;
             return false;
         }
         assignment_terminals.emplace(key, AssignmentTerminal { result });
+        assignment_terminal_order.push_back(key);
     }
     if (blocks_compat_claim) {
         closed_wire_ids.insert_or_assign(key.wire_id, key);
@@ -9644,6 +9715,11 @@ int Daemon::handle_assign_prepare(AssignPrepareMsg *msg)
             return 1;
         }
     } else {
+        /* Make room first: the retained-terminal table is a bounded FIFO
+           (k415), so a full table never refuses admission.  Only a live-row
+           saturation above the hard limit -- unreachable in production,
+           where live is bounded by in-flight jobs -- stays fail-closed. */
+        prune_assignment_terminals();
         if (live_assignments.size() + assignment_terminals.size()
                 >= assignment_terminal_limit()) {
             assignment_table_exhausted = true;
@@ -9801,9 +9877,21 @@ int Daemon::handle_cs_conf(ConfCSMsg *msg)
                 }
                 if (assignment_scheduler_epoch != 0
                         && assignment_scheduler_epoch == msg->epoch()
-                        && (assignment_fence_mode != requested
-                            || assignment_table_exhausted)) {
-                    log_error() << "refusing changed or exhausted protocol-49 epoch configuration" << endl;
+                        && assignment_fence_mode != requested) {
+                    /* Same epoch, same fence mode: accept regardless of
+                       terminal-table state.  A full table is a bounded
+                       service condition (prune_assignment_terminals keeps
+                       every insert servable), never an epoch-configuration
+                       violation.  Refusing the ConfCS here closed the
+                       channel right after login, and the scheduler-side
+                       "remove daemon" plus the 20+rand(31)s reconnect then
+                       flapped the daemon off the farm forever while the
+                       sidecar replacement mint waited for a session that
+                       never activated again (k415: one worker lost its
+                       cache sidecar and never respawned it after ~62k
+                       jobs on one epoch).  Only a genuine configuration
+                       change on a live epoch stays fail-closed. */
+                    log_error() << "refusing changed protocol-49 epoch configuration" << endl;
                     return 1;
                 }
                 if (assignment_scheduler_epoch != msg->epoch()) {
