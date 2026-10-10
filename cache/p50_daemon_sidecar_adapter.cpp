@@ -3365,19 +3365,24 @@ bool DaemonSidecarAdapter::outer_advance_input(
             return false;
         const InputLifecycleRequest request = pending_input_lifecycle_.front();
         trace_lifecycle_mark_first_attempt(request.operation_id);
-        const auto request_deadline =
-            request.deadline == std::chrono::steady_clock::time_point{}
-                ? now + config_.input_lifecycle_timeout
-                : request.deadline;
-        if (now >= request_deadline) {
-            pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
-            outer_last_input_lifecycle_result_ = InputLifecycleResult{
-                InputLifecycleStatus::Timeout, request};
-            trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
-            retire_input_lifecycle_relationship(AdapterError::InputLifecycleProtocol);
-            outer_action_taken_ = true;
-            return true;
-        }
+        /* (k415) The service budget is measured from PICKUP, never from
+           enqueue.  A leg-end drain enqueues one CancelAttempt per client
+           in a single burst; the queue is served strictly one operation at
+           a time, so the LAST operations of a large burst are picked up
+           many turns after their enqueue deadline was minted.  Expiring a
+           still-queued (never-started) operation on that stale enqueue
+           deadline retired a healthy, authenticated, IDLE sidecar for
+           nothing -- the op had consumed none of its own budget -- and the
+           retirement then killed the sidecar mid-farm-leg (h2w, K4-13b:
+           status=13 CancelAttempt ~30s after the drain burst).  The
+           enqueue deadline stays on the request only as a wakeup hint
+           (outer_next_deadline) and replay-identity field; the operation's
+           real absolute budget starts here, fresh, at pickup.  Queue
+           staleness is bounded structurally instead: the enqueue gate
+           rejects already-expired requests, the pending queue is
+           capacity-bounded (max_pending_input_lifecycle), and teardown
+           clears it wholesale. */
+        const auto request_deadline = now + config_.input_lifecycle_timeout;
         if (request.identity !=
             local::Identity{config_.generation, outer_ready_lease_->identity.attempt}) {
             pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());

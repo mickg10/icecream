@@ -13,6 +13,7 @@
 #include <poll.h>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -540,6 +541,102 @@ bool run_replacement_deferred_diag_test(
     return true;
 }
 
+// k415 (a)(i): the input-lifecycle service budget must be measured from
+// PICKUP, never from enqueue.  A drain burst enqueues many CancelAttempt
+// ops at once; the queue serves one op at a time; the last ops are picked
+// up well after their enqueue deadline was minted.  Expiring a
+// never-started op on that stale deadline retired a healthy, idle,
+// authenticated sidecar for nothing (h2w, K4-13b: status=13 retirement
+// ~30s after the drain burst, sidecar dead for the rest of the leg).
+// What is asserted: an op that sits in the queue PAST its enqueue deadline
+// and is then picked up is SERVED with its full fresh budget -- it reaches
+// a real terminal result, the relationship stays authenticated, and no
+// input-lifecycle retirement occurs.
+bool run_input_lifecycle_pickup_deadline_test(
+    const std::string& temp_root, CentralChildReaperRegistry& reaper,
+    const DaemonSidecarAdapter::Config& base_config)
+{
+    const std::string pattern = temp_root + "/p50pd-XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr || ::chmod(buffer.data(), 0700) != 0)
+        return false;
+    const std::string root(buffer.data());
+
+    auto config = base_config;
+    config.runtime_directory = root;
+    // A tiny service budget makes the enqueue deadline expire while the op
+    // still sits in the queue; the pickup grant must not inherit it.
+    config.input_lifecycle_timeout = std::chrono::milliseconds(150);
+    if (!DaemonSidecarAdapter::valid_config(config))
+        return false;
+    DaemonSidecarAdapter adapter(config);
+    adapter.observe_public_listener(true, config.public_listener_port);
+    adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update update;
+    if (!drive_until(adapter, reaper, update, std::chrono::seconds(15), [&] {
+            return adapter.authenticated() &&
+                   adapter.advertisement_snapshot().present();
+        }))
+        return false;
+
+    // Enqueue one CancelAttempt for an identity that was never published:
+    // the sidecar will answer UnknownRecord, which is the benign idempotency
+    // outcome for this action (never a relationship retirement).
+    const icecc::p50::local::Identity identity{config.generation, adapter.attempt()};
+    const icecc::p50::InputRecordKey key{
+        icecc::p50::Id128::from_u64(0x7069636b55ULL), icecc::p50::TuSeq{7}};
+    const icecc::p50::InputLeaseOwner owner{103, 1, 1};
+    const icecc::p50::InputFdRequest lease{identity, key, owner, 9001};
+    const auto enqueued = adapter.apply_input_lifecycle(
+        lease, icecc::p50::InputLifecycleAction::CancelAttempt);
+    if (enqueued.status == icecc::p50::InputLifecycleStatus::InvalidArgument ||
+        enqueued.status == icecc::p50::InputLifecycleStatus::StoreReplaced) {
+        std::fprintf(stderr,
+                     "pickup deadline test: apply_input_lifecycle rejected"
+                     " immediately (status=%u)\n",
+                     static_cast<unsigned>(enqueued.status));
+        return false;
+    }
+    // Let the enqueue deadline (150ms) pass WITHOUT driving any outer turn:
+    // the op must now be far past its enqueue deadline while still queued.
+    std::this_thread::sleep_for(std::chrono::milliseconds(450));
+    if (adapter.pending_input_lifecycle_count() != 1)
+        return false;
+
+    // Pickup on the next driven turn: the op is served with a fresh budget
+    // and reaches a real terminal result; nothing retires.
+    if (!drive_until(adapter, reaper, update, std::chrono::seconds(15), [&] {
+            return adapter.pending_input_lifecycle_count() == 0;
+        })) {
+        std::fprintf(stderr,
+                     "pickup deadline test: queued op never reached a"
+                     " terminal result after pickup\n");
+        return false;
+    }
+    const auto result = adapter.take_outer_input_lifecycle_result();
+    if (!result.has_value())
+        return false;
+    if (result->status == icecc::p50::InputLifecycleStatus::Timeout) {
+        std::fprintf(stderr,
+                     "pickup deadline test: op expired on its stale enqueue"
+                     " deadline instead of a fresh pickup budget"
+                     " (status=%u)\n",
+                     static_cast<unsigned>(result->status));
+        return false;
+    }
+    // The relationship survives: still authenticated, still advertised.
+    if (!adapter.authenticated() ||
+        !adapter.advertisement_snapshot().present())
+        return false;
+
+    if (!drive_shutdown(adapter, reaper, update))
+        return false;
+    if (!remove_p29_fingerprint_cache(root) || ::rmdir(root.c_str()) != 0)
+        return false;
+    return true;
+}
+
 bool run_kill_domain_release_bound_test(
     const std::string& temp_root, CentralChildReaperRegistry& reaper,
     const DaemonSidecarAdapter::Config& base_config)
@@ -1005,6 +1102,11 @@ int main()
     if (!run_replacement_deferred_diag_test(std::string(temp_root), reaper,
                                             config))
         return 33;
+
+    // k415 (a)(i): the input-lifecycle service budget starts at pickup.
+    if (!run_input_lifecycle_pickup_deadline_test(std::string(temp_root),
+                                                  reaper, config))
+        return 34;
 
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
