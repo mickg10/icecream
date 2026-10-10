@@ -195,6 +195,135 @@ bool dcc_lock_keep_across_exec()
     return true;
 }
 
+/* ICECC_LOCAL_LOCK_QUEUE (default off): a work-conserving wait for a slot.
+
+   The historical wait blocks on ONE slot, chosen as getpid() % slots.  A
+   build tool spawns its compiler wrappers with a fixed pid stride, so the
+   blocked waiters pile onto a fraction of the slots while the others are
+   released into a void: on a 24-CPU client under a -j600 build, /proc/locks
+   showed ~125 waiters spread over only 12-14 of the 24 slots, and slots
+   sat free while waiters existed in 30-60% of the busy samples -- the local
+   preprocessor running at roughly half its slot capacity exactly when the
+   farm was starved for preprocessed sources.
+
+   Queued mode keeps the same slot files (a legacy waiter and a queued one
+   contend for the same pool) and the same release-on-exit semantics, but a
+   waiter never commits to one slot:
+     1. scan every slot non-blocking from a well-mixed starting offset;
+     2. if all are busy, block on the pool's queue lock (`local_lock_queue`,
+        an fcntl lock like the slots, so a dead waiter frees it);
+     3. the queue holder alone rescans every slot each millisecond until
+        one is free, takes it, and releases the queue lock to the next
+        waiter.
+   One poller per pool keeps the cost to ~24 fcntl calls per millisecond
+   while any freed slot is reused within about a millisecond.  New arrivals
+   may take a free slot in step 1 ahead of the queue; that only keeps the
+   pool busier.  */
+static bool dcc_lock_queue_enabled()
+{
+    const char *env = getenv("ICECC_LOCAL_LOCK_QUEUE");
+    return env != nullptr && *env != '\0' && strcmp(env, "0") != 0;
+}
+
+static unsigned dcc_lock_spread_offset()
+{
+    struct timespec now = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t x = (static_cast<uint64_t>(getpid()) << 32) ^
+                 static_cast<uint64_t>(now.tv_nsec) ^
+                 static_cast<uint64_t>(now.tv_sec);
+    // splitmix64 finalizer: every input bit reaches the low bits the modulo
+    // keeps, so a pid stride no longer pins the offset to a residue class.
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return static_cast<unsigned>(x >> 32);
+}
+
+static string dcc_lock_slot_name(const string &fname, int lock)
+{
+    if (lock == 0) { // 1st keep without the 0 for backwards compatibility
+        return fname;
+    }
+    char num[20];
+    sprintf(num, "%d", lock);
+    return fname + num;
+}
+
+static bool dcc_lock_try_slots(vector<int> &fds, unsigned start)
+{
+    const size_t count = fds.size();
+    for (size_t k = 0; k < count; ++k) {
+        const size_t slot = (start + k) % count;
+        if (fds[slot] == -1) {
+            continue;
+        }
+        if (sys_lock(fds[slot], false) == 0) {
+            lock_fd = fds[slot];
+            fds[slot] = -1;
+            return true;
+        }
+        if (errno != EAGAIN && errno != EACCES
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+            && errno != EWOULDBLOCK
+#endif
+           ) {
+            log_error() << "lock slot " << slot << " failed: " << strerror(errno) << endl;
+        }
+    }
+    return false;
+}
+
+static bool dcc_lock_host_queued(const string &fname, int max_cpu)
+{
+    vector<int> fds(max_cpu, -1);
+    bool opened = false;
+    for (int lock = 0; lock < max_cpu; ++lock) {
+        int fd = -1;
+        if (dcc_open_lockfile(dcc_lock_slot_name(fname, lock), fd) && fd != -1) {
+            fds[lock] = fd;
+            opened = true;
+        }
+    }
+    auto close_rest = [&fds]() {
+        for (int &fd : fds) {
+            if (fd != -1) {
+                ::close(fd);
+                fd = -1;
+            }
+        }
+    };
+    if (!opened) {
+        return false;
+    }
+
+    unsigned start = dcc_lock_spread_offset();
+    if (dcc_lock_try_slots(fds, start)) {
+        close_rest();
+        return true;
+    }
+
+    int queue_fd = -1;
+    if (!dcc_open_lockfile(fname + "_queue", queue_fd) || queue_fd == -1 ||
+        sys_lock(queue_fd, true) != 0) {
+        // No queue: fall back to the historical wait on one slot.
+        if (queue_fd != -1) {
+            ::close(queue_fd);
+        }
+        close_rest();
+        return dcc_lock_host_slot(fname, static_cast<int>(start % max_cpu), true);
+    }
+    bool got = false;
+    while (!(got = dcc_lock_try_slots(fds, ++start))) {
+        struct timespec pause = {0, 1000000};
+        nanosleep(&pause, nullptr);
+    }
+    ::close(queue_fd); // releases the queue to the next waiter
+    close_rest();
+    return got;
+}
+
 /* The slot pool, with the directory and size as explicit arguments: the
    production wrapper supplies the shared per-user directory and one slot
    per online CPU, and the lock-lifetime regression test supplies a private
@@ -216,6 +345,9 @@ bool dcc_lock_host_at(const string &lockdir, int max_cpu)
        sentinel.  */
     if (max_cpu < 1) {
         max_cpu = 1;
+    }
+    if (dcc_lock_queue_enabled()) {
+        return dcc_lock_host_queued(fname, max_cpu);
     }
     // To ensure better distribution, select a "random" starting slot.
     int lock_offset = getpid();
