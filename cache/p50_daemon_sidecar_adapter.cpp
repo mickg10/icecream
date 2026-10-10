@@ -3963,6 +3963,63 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         return state_ == AdapterState::Ready;
     }
 
+    /* Diagnostic only (k415): a replacement request parked at RetryEligible
+       can be blocked indefinitely by exactly one guard here -- the scheduler
+       ownership fence -- and a sidecar that never returns is otherwise
+       silent: every turn takes the fall-through below, the lifecycle stays
+       RetryEligible, and nothing names the blocker.  Record the blocking
+       guard at most once per kReplacementSkipDiagInterval (and always to the
+       ICECC_P50_REPLACEMENT_DEFERRED_TRACE file when set, mirroring the
+       ICECC_P50_DAEMON_LIFECYCLE_TRACE pattern) so a down-for-hours worker
+       leaves a readable trail instead of one line per poll turn.  Never
+       gates behavior; stderr keeps one throttled line for the farm logs. */
+    if (outer_replacement_requested_ && !outer_shutdown_requested_ &&
+        !reaper_delivery_pending &&
+        outer_lifecycle_ != nullptr &&
+        outer_lifecycle_->state() == sidecar::LifecycleState::RetryEligible) {
+        static constexpr auto kReplacementSkipDiagInterval =
+            std::chrono::seconds(30);
+        const std::chrono::steady_clock::time_point now_steady =
+            std::chrono::steady_clock::now();
+        if (!outer_replacement_skip_diag_ ||
+            now_steady - *outer_replacement_skip_diag_ >=
+                kReplacementSkipDiagInterval) {
+            outer_replacement_skip_diag_ = now_steady;
+            const char owner = outer_scheduler_owner_active_ ? '1' : '0';
+            const char reaper = reaper_delivery_pending ? '1' : '0';
+            char line[192];
+            const int length = std::snprintf(
+                line, sizeof(line),
+                "{\"schema\":\"icecream-p50-replacement-deferred-v1\","
+                "\"scheduler_owner\":%c,\"reaper_pending\":%c,"
+                "\"wall_clock_ns\":%llu}\n",
+                owner, reaper,
+                static_cast<unsigned long long>(wall_clock_ns_now()));
+            const char *trace_path =
+                std::getenv("ICECC_P50_REPLACEMENT_DEFERRED_TRACE");
+            bool traced = false;
+            if (trace_path != nullptr && *trace_path != '\0' && length > 0) {
+                const int fd = ::open(trace_path,
+                                      O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                                      0600);
+                if (fd >= 0) {
+                    traced = ::write(fd, line,
+                                    static_cast<size_t>(length)) == length;
+                    ::close(fd);
+                }
+            }
+            if (!traced) {
+                std::fprintf(stderr,
+                             "cache sidecar replacement deferred"
+                             " (scheduler_owner=%c reaper_pending=%c)"
+                             " wall_clock_ns=%llu\n",
+                             owner, reaper,
+                             static_cast<unsigned long long>(
+                                 wall_clock_ns_now()));
+            }
+        }
+    }
+
     sidecar::LifecycleObservation observation;
     if (outer_shutdown_requested_)
         observation.request_legacy = true;

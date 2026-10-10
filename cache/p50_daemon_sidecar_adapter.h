@@ -473,6 +473,10 @@ private:
     bool outer_shutdown_requested_ = false;
     bool outer_replacement_requested_ = false;
     bool outer_scheduler_owner_active_ = false;
+    // Diagnostic-only throttle sample for the deferred-replacement line in
+    // outer_advance_turn (k415): last wall moment that guard named itself.
+    std::optional<std::chrono::steady_clock::time_point>
+        outer_replacement_skip_diag_{};
     bool outer_replacement_input_close_pending_ = false;
     bool outer_shutdown_input_close_pending_ = false;
     // Set only when the central registry delivered an immutable exact-PID

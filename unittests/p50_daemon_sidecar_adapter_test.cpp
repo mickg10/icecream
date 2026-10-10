@@ -396,6 +396,150 @@ int open_pidfd_count()
     return count;
 }
 
+// k415 diagnostic coverage: a replacement request parked at RetryEligible
+// with the scheduler ownership fence closed is the "sidecar never comes
+// back" state a farm worker can sit in for hours.  The adapter must record
+// the blocking guard (throttled to at most one record per 30s) under
+// ICECC_P50_REPLACEMENT_DEFERRED_TRACE -- the same diagnostic-file pattern
+// as ICECC_P50_DAEMON_LIFECYCLE_TRACE -- so a dead worker leaves a readable
+// trail; the farm incident this test guards against was diagnosed entirely
+// from the ABSENCE of any such record.  What is asserted: (1) at least one
+// deferred record names scheduler_owner=0 while the fence is closed and the
+// lifecycle is RetryEligible; (2) the record is throttled -- driving many
+// turns inside the interval produces exactly one; (3) nothing is recorded
+// once the fence reopens and the mint runs (the "replacement launched" line
+// is what must appear on stderr there instead).
+bool run_replacement_deferred_diag_test(
+    const std::string& temp_root, CentralChildReaperRegistry& reaper,
+    const DaemonSidecarAdapter::Config& base_config)
+{
+    const std::string pattern = temp_root + "/p50rd-XXXXXX";
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (::mkdtemp(buffer.data()) == nullptr || ::chmod(buffer.data(), 0700) != 0)
+        return false;
+    const std::string root(buffer.data());
+
+    auto config = base_config;
+    config.runtime_directory = root;
+    DaemonSidecarAdapter adapter(config);
+    adapter.observe_public_listener(true, config.public_listener_port);
+    adapter.outer_set_scheduler_owner(true);
+    icecc::p50::advertisement::Update update;
+    if (!drive_until(adapter, reaper, update, std::chrono::seconds(15), [&] {
+            return adapter.authenticated() &&
+                   adapter.advertisement_snapshot().present();
+        })) {
+        std::fprintf(stderr,
+                     "replacement deferred diag: initial READY lease never"
+                     " authenticated within 15s\n");
+        return false;
+    }
+    const uint64_t parked_attempt = adapter.attempt();
+
+    // Close the ownership fence and request a replacement: the exact
+    // outer_advance_turn guard combination that deferred indefinitely on
+    // the farm.  The deferred record goes to a trace file so the diagnostic
+    // is asserted rather than merely observed on stderr.
+    const std::string trace_path = root + "/deferred.jsonl";
+    const int trace_fd = ::open(
+        trace_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (trace_fd < 0)
+        return false;
+    ::close(trace_fd);
+    char trace_env[4096];
+    if (std::snprintf(trace_env, sizeof(trace_env), "%s", trace_path.c_str())
+            >= static_cast<int>(sizeof(trace_env)))
+        return false;
+    const char *saved_trace_env = std::getenv("ICECC_P50_REPLACEMENT_DEFERRED_TRACE");
+    const int trace_env_rc = setenv("ICECC_P50_REPLACEMENT_DEFERRED_TRACE",
+                                    trace_env, 1);
+
+    adapter.outer_set_scheduler_owner(false);
+    adapter.outer_request_replacement();
+    bool parked = drive_until(adapter, reaper, update, std::chrono::seconds(15), [&] {
+            return adapter.outer_lifecycle_state() ==
+                       icecc::p50::sidecar::LifecycleState::RetryEligible &&
+                   !adapter.outer_immediate_turn_required();
+        });
+    // Many more turns inside the 30s throttle interval: the deferred record
+    // must not repeat, and no launch must happen while fenced.
+    for (int turn = 0; parked && turn < 32; ++turn) {
+        if (!outer_turn(adapter, reaper, update,
+                        std::chrono::steady_clock::now() + std::chrono::seconds(5)))
+            break;
+    }
+
+    const std::uint64_t parked_attempt_after =
+        static_cast<std::uint64_t>(adapter.attempt());
+    char diag[4096];
+    ssize_t diag_size = 0;
+    {
+        const int fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            diag_size = ::read(fd, diag, sizeof(diag) - 1);
+            ::close(fd);
+        }
+        if (diag_size < 0)
+            diag_size = 0;
+        diag[diag_size] = '\0';
+    }
+    if (trace_env_rc == 0 && saved_trace_env == nullptr) {
+        // The env var did not exist before: drop it so later tests (and any
+        // other scenario in this process) never inherit this trace path.
+        unsetenv("ICECC_P50_REPLACEMENT_DEFERRED_TRACE");
+    }
+    const char *deferred_key = "\"scheduler_owner\":0";
+    int deferred_count = 0;
+    for (const char *cursor = diag;
+         (cursor = std::strstr(cursor, deferred_key)) != nullptr; cursor += 1)
+        ++deferred_count;
+    if (!parked || parked_attempt_after != parked_attempt ||
+        deferred_count != 1) {
+        std::fprintf(stderr,
+                     "replacement deferred diag: parked=%d attempt=%llu"
+                     " (was %llu) deferred_records=%d\n",
+                     parked ? 1 : 0,
+                     static_cast<unsigned long long>(parked_attempt_after),
+                     static_cast<unsigned long long>(parked_attempt),
+                     deferred_count);
+        return false;
+    }
+
+    // Reopening the fence releases exactly one successor launch; no further
+    // deferred record may appear while the mint runs.
+    adapter.outer_set_scheduler_owner(true);
+    const bool resumed = drive_until(adapter, reaper, update,
+                                      std::chrono::seconds(15), [&] {
+            return adapter.attempt() > parked_attempt &&
+                   adapter.authenticated() &&
+                   adapter.advertisement_snapshot().present();
+        });
+    {
+        const int fd = ::open(trace_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            diag_size = ::read(fd, diag, sizeof(diag) - 1);
+            ::close(fd);
+        }
+        if (diag_size < 0)
+            diag_size = 0;
+        diag[diag_size] = '\0';
+        deferred_count = 0;
+        for (const char *cursor = diag;
+             (cursor = std::strstr(cursor, deferred_key)) != nullptr; cursor += 1)
+            ++deferred_count;
+    }
+    if (!resumed || deferred_count != 1)
+        return false;
+
+    if (!drive_shutdown(adapter, reaper, update))
+        return false;
+    ::unlink(trace_path.c_str());
+    if (!remove_p29_fingerprint_cache(root) || ::rmdir(root.c_str()) != 0)
+        return false;
+    return true;
+}
+
 bool run_kill_domain_release_bound_test(
     const std::string& temp_root, CentralChildReaperRegistry& reaper,
     const DaemonSidecarAdapter::Config& base_config)
@@ -854,6 +998,13 @@ int main()
     if (!run_daemon_lifecycle_trace_test(std::string(temp_root), reaper,
                                          config))
         return 32;
+
+    // k415: the deferred-replacement diagnostic must name the blocking guard
+    // while a sidecar sits parked at RetryEligible behind the scheduler
+    // ownership fence (see the function's comment).
+    if (!run_replacement_deferred_diag_test(std::string(temp_root), reaper,
+                                            config))
+        return 33;
 
     std::puts("p50 daemon sidecar adapter outer lifecycle: ok");
     return 0;
