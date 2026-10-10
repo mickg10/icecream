@@ -375,6 +375,21 @@ public:
                                        HistoryNonce history_nonce);
     uint64_t retain(PreparedTuHandle handle);
     uint64_t release(PreparedTuHandle handle);
+    // Release-isolated query (k415 item 5): true when release(handle) would
+    // abandon NO other outstanding successor -- the entry is already absent
+    // from its route's uncommitted deque (a uniform abandonment from another
+    // member's path consumed it) or it is that deque's sole member.  A
+    // zero-wire attempt-2 retirement may release route-locally ONLY in that
+    // shape: with a live sibling outstanding, release() clears the deque
+    // and marks every sibling chain_abandoned, so the sibling's own healthy
+    // TX_COMMIT accept ("is not its prepared successor") escapes its run to
+    // the sender catch-all and one dead transfer becomes a sticky whole-C
+    // replacement -- and NOT releasing is no better, because an
+    // uncommittable junior left in the FIFO blocks every later commit the
+    // same way.  The isolated shapes are the only ones where the route stays
+    // healthy through the release.
+    [[nodiscard]] bool prepared_route_release_isolated(
+        PreparedTuHandle handle) const;
     void commit(PreparedTuHandle handle);
     [[nodiscard]] CStoreGuid c_store_guid() const;
     [[nodiscard]] ZstdTuLimits zstd_limits() const;
@@ -768,6 +783,18 @@ public:
     // Throws std::logic_error if called without an outstanding pipeline
     // poison.
     void reset_after_pipeline_poison();
+
+    // Local abandon of a route-local zero-wire retirement whose prepared
+    // handle is NOT release-isolated (a live sibling is outstanding on the
+    // same route).  Thin wrapper over Impl::poison_pipeline(): closes every
+    // outstanding successor socket and wakes both waiter populations so the
+    // sibling coroutines observe their own teardown -- the exact same first
+    // half the mid-write has_pipeline_poison() flow performs before
+    // authority abandon_route + reset_after_pipeline_poison().  The caller
+    // MUST follow with abandon_route(prepared) and
+    // reset_after_pipeline_poison(); neither release() nor
+    // discard_retained_route_work() alone can free this shape's slot.
+    void poison_pipeline_for_local_abandon();
 
     // Discards this endpoint's retained retry bookkeeping (the active
     // transaction or the queued successor) when it references exactly this

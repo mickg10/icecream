@@ -926,13 +926,39 @@ P50ZstdSourceSender::transfer_bytes(
                 impl_->quarantine_transport(result, explicit_route);
                 co_return result;
             }
-            // Nothing on the wire: drop the endpoint's retained retry
-            // bookkeeping for this handle (a later attempt's dispatch would
-            // otherwise identify against it and throw) and release the
-            // authority entry, freeing the route's admission slot. Both are
-            // best-effort against typed throws: the handle's structures were
-            // marked abandoned uniformly by release()'s own non-tail path if
-            // any sibling was outstanding.
+            // Nothing on the wire. Whether this handle's slot can be
+            // freed WITHOUT collateral is the release-isolated question
+            // (k415 item 5): release() abandons the AUTHORITY chain of an
+            // uncommitted route entry while leaving the ENDPOINT window
+            // (active/successors) intact, so with a live sibling outstanding
+            // the sibling's own TX_COMMIT accept reaches preparation->commit
+            // on a cleared deque and throws "is not its prepared successor"
+            // out of its healthy run -- one dead transfer becoming a sticky
+            // whole-C replacement.  NOT releasing is no better: the route's
+            // commit order is FIFO, so the uncommittable junior blocks every
+            // later commit the same way.
+            //   * isolated (sole member, chain already abandoned, committed,
+            //     or a non-route profile): discard + release, byte-identical
+            //     to today -- the uniform teardown frees the route cleanly
+            //     and the fresh assignment re-prepares from the cursor F
+            //     still holds.
+            //   * NOT isolated (a live sibling outstanding): the slot can
+            //     only be freed by the ROUTE-LOCAL cold reset -- the exact
+            //     same Step 4d teardown the mid-write poison face performs
+            //     (poison closes the sibling sockets and wakes the waiters;
+            //     abandon_route tears the authority chain; the reset mints a
+            //     fresh nonce/rel cursor and bumps the epoch so the woken
+            //     sibling coroutines re-check into a mismatch and retire
+            //     through their own status paths, and the next head takes
+            //     the existing RouteHistoryReset wire branch).  NO
+            //     quarantine, NO replacement: the route recovers locally.
+            if (!impl_->authority->prepared_route_release_isolated(prepared)) {
+                impl_->endpoint->poison_pipeline_for_local_abandon();
+                impl_->authority->abandon_route(prepared);
+                impl_->endpoint->reset_after_pipeline_poison();
+                result.route_local_failure = true;
+                co_return result;
+            }
             try {
                 impl_->endpoint->discard_retained_route_work(prepared);
             } catch (...) {

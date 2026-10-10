@@ -1648,6 +1648,33 @@ uint64_t P50PreparationAuthority::release(PreparedTuHandle handle) {
     return 0;
 }
 
+bool P50PreparationAuthority::prepared_route_release_isolated(
+    PreparedTuHandle handle) const {
+    // See the header comment: true when release() would abandon nothing but
+    // this handle itself.
+    if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
+        return false;
+    const auto position = impl_->entries.find(handle.entry_id_);
+    if (position == impl_->entries.end())
+        return false;
+    const Impl::Entry& entry = position->second;
+    // Committed entries and non-route profiles have no chain to tear:
+    // release() is always isolated for them.
+    if (entry.committed ||
+        (entry.route.profile != ProfileId::ZSTD_ROUTE &&
+         entry.route.profile != ProfileId::P29V1))
+        return true;
+    const Impl::RouteState& route = impl_->route_state(entry.route);
+    const std::deque<uint64_t>& outstanding = route.uncommitted_route_entries;
+    const auto member = std::find(outstanding.begin(), outstanding.end(),
+                                  handle.entry_id_);
+    // Already removed by a uniform chain abandonment: nothing to tear.
+    if (member == outstanding.end())
+        return true;
+    // Exactly this handle outstanding: releasing it abandons nothing else.
+    return outstanding.size() == 1;
+}
+
 void P50PreparationAuthority::commit(PreparedTuHandle handle) {
     impl_->owner.require();
     if (handle.authority_.lock() != impl_->identity || handle.entry_id_ == 0)
@@ -5298,6 +5325,17 @@ Digest128 P50ClientEndpoint::state_digest() const {
 bool P50ClientEndpoint::has_pipeline_poison() const noexcept {
     impl_->owner.check();
     return impl_->poisoned;
+}
+
+void P50ClientEndpoint::poison_pipeline_for_local_abandon() {
+    impl_->owner.require();
+    // Thin wrapper over the Impl-level first half of the Step 4d teardown:
+    // closes every outstanding successor socket and wakes both waiter
+    // populations.  The caller follows with authority abandon_route() and
+    // reset_after_pipeline_poison() (which requires the poison flag this
+    // sets).  Never quarantine/replacement: this is a ROUTE-LOCAL cold
+    // reset for a zero-wire retirement with a live sibling outstanding.
+    impl_->poison_pipeline();
 }
 
 void P50ClientEndpoint::reset_after_pipeline_poison() {

@@ -395,6 +395,88 @@ void test_zstd_route_authority_bounded_history() {
     }
 }
 
+// k415 item 5: prepared_route_release_isolated() decides whether the
+// sender's attempt-2 zero-wire retirement may release its prepared handle
+// route-locally.  Semantics under test (see the P50PreparationAuthority
+// declaration): TRUE for a sole outstanding member, TRUE for an entry
+// already consumed by a uniform chain abandonment, TRUE for committed
+// entries and non-route profiles (no chain to tear), FALSE exactly when
+// another live successor is outstanding on the same route.
+void test_prepared_route_release_isolated_query() {
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 2U << 20;
+    caps.zstd.max_encoded_body_bytes = 2U << 20;
+    caps.zstd.max_window_log = 12;
+    caps.zstd.max_history_bytes = 4U << 10;
+    PreparationAuthorityLimits authority_limits;
+    authority_limits.max_live_entries = 8;
+    authority_limits.max_retained_encoded_bytes = 8U << 20;
+    authority_limits.route_pipeline_depth = 2;
+    P50PreparationAuthority authority(Id128::from_u64(19001), caps.zstd,
+                                      authority_limits, 3, ProfileId::P29V1);
+    const PreparationRouteKey route{Id128::from_u64(19001), Id128::from_u64(19002),
+                                    7, ProfileId::P29V1};
+    const std::vector<uint8_t> input = bytes("isolated-query\n");
+
+    // Sole member: isolated.
+    const PreparedTuHandle sole =
+        authority.prepare_for_route(route, PrepareRequestKey{190, 1}, input);
+    require(authority.prepared_route_release_isolated(sole),
+            "sole outstanding member must be release-isolated");
+
+    // The endpoint predict-commits its head before beginning the junior
+    // (CRoute::begin_v1 refuses a second un-predict-committed ACTIVE_TX),
+    // so mirror that interleave here exactly as the successor path runs
+    // it: pin the system-source reuse decision, stage the eager FILL (the
+    // serializer snapshots its NEED expectation only after a FILL), then
+    // run the local predict-commit.
+    authority.pin_p29v1_system_source_reuse(sole, Digest128{});
+    const std::optional<std::span<const uint8_t>> eager_fill =
+        authority.fill_p29v1_before_need(sole);
+    require(eager_fill.has_value(), "eager FILL must stage for predict-commit");
+    authority.commit_predicted_p29v1(sole);
+
+    // Two outstanding on the same route: NEITHER is isolated.
+    const PreparedTuHandle junior =
+        authority.prepare_for_route(route, PrepareRequestKey{190, 2}, input);
+    require(!authority.prepared_route_release_isolated(sole),
+            "head with a live junior outstanding must NOT be release-isolated");
+    require(!authority.prepared_route_release_isolated(junior),
+            "junior with a live head outstanding must NOT be release-isolated");
+
+    // A uniform chain abandonment consumes the outstanding member: what
+    // remains is isolated again ("done, not unknown").  (The committed
+    // case -- entry.committed short-circuits to isolated in the query --
+    // is one reviewed line and is deliberately not driven here: commit()
+    // on a predict-committed P29V1 head needs its NEED confirmed first,
+    // which is the live endpoint dialogue's job, exercised end to end by
+    // the K2 pipeline suites below.)
+    authority.abandon_route(junior);
+    require(authority.prepared_route_release_isolated(junior),
+            "chain-abandoned entry must be release-isolated");
+
+    // A non-route profile (ZSTD_TU) has no route chain: always isolated.
+    EndpointCaps tu_caps;
+    tu_caps.profile = ProfileId::ZSTD_TU;
+    tu_caps.zstd = caps.zstd;
+    P50PreparationAuthority tu_authority(Id128::from_u64(19003), tu_caps.zstd,
+                                         authority_limits, 3, ProfileId::ZSTD_TU);
+    const PreparedTuHandle tu =
+        tu_authority.prepare(PrepareRequestKey{190, 3}, input);
+    require(tu_authority.prepared_route_release_isolated(tu),
+            "non-route profile must be release-isolated");
+
+    // Released handles and foreign handles report NOT isolated (nothing to
+    // release -- the caller keeps today's swallow semantics).
+    require(authority.release(junior) == 0, "junior release after abandonment");
+    require(!authority.prepared_route_release_isolated(junior),
+            "already-released handle must report not isolated");
+    require(!authority.prepared_route_release_isolated(PreparedTuHandle{}),
+            "null handle must report not isolated");
+    require(authority.release(sole) == 0, "sole release");
+}
+
 void test_server_routes_are_isolated_by_profile() {
     const P5coStoreGuids guids = p5co_store_guids(212);
     EndpointCaps server_caps;
@@ -9789,6 +9871,7 @@ int main(int argc, char** argv) {
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();
+    test_prepared_route_release_isolated_query();
     test_server_routes_are_isolated_by_profile();
     test_p29v1_endpoint_route_dialogue_lifetime();
     test_p29v1_pipelined_begin();

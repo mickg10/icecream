@@ -3903,7 +3903,7 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
     storm.successor_entered_prepare = eventually(
         [&] { return observe.prepare_entries.load(std::memory_order_acquire) >= 2; },
         std::chrono::seconds(5));
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     storm.prepare_entries_at_settle =
         observe.prepare_entries.load(std::memory_order_acquire);
     storm.completed_while_stalled =
@@ -4409,6 +4409,15 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
             std::lock_guard lock(mutex_);
             refused_ordinal_ = ordinal;
         }
+        // The arm ordinal whose adopted F-side session is killed mid-dialogue
+        // (shutdown on a dup of the shared socket).  Default 1: the first
+        // served session dies, the k44 seed face.  The release-tear storm sets
+        // this explicitly so a HEALTHY sibling session can hold a lower
+        // ordinal and stay alive.
+        void kill_arm_ordinal(size_t ordinal) noexcept {
+            std::lock_guard lock(mutex_);
+            killed_ordinal_ = ordinal;
+        }
 
         void stop() noexcept {
             stopping_.store(true, std::memory_order_release);
@@ -4451,8 +4460,9 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
                     continue;
                 }
                 try {
-                    workers_.emplace_back([this, accepted, peer, peer_size] {
-                        serve(accepted, peer, peer_size);
+                    workers_.emplace_back([this, accepted, peer, peer_size,
+                                            ordinal] {
+                        serve(accepted, peer, peer_size, ordinal);
                     });
                 } catch (...) {
                     (void)::close(accepted);
@@ -4460,7 +4470,8 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
             }
         }
 
-        void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
+        void serve(int accepted, sockaddr_in peer, socklen_t peer_size,
+                   size_t ordinal) noexcept {
             try {
                 std::unique_ptr<MsgChannel> channel(Service::createChannel(
                     accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
@@ -4504,16 +4515,18 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
                     (void)::close(raw_fd);
                     return;
                 }
-                // Hand F the session. For the FIRST session only: kill the
-                // F-side dialogue at once -- shutdown() on a dup'ed descriptor
-                // hits the SHARED socket (an fd close alone would not, asio
-                // owns another copy), so F's adopted run reads EOF and dies
-                // mid-dialogue and the C side sees its own STATE read hit EOF
-                // pre-commit, with no TX_BEGIN of this transfer staged by F.
-                // Every LATER session stays alive so the retry -- and the
-                // fresh-assignment probe -- can arm and commit through this
-                // same front.
+                // Hand F the session. For the kill-ordinal's session only:
+                // kill the F-side dialogue at once -- shutdown() on a dup'ed
+                // descriptor hits the SHARED socket (an fd close alone would
+                // not, asio owns another copy), so F's adopted run reads EOF
+                // and dies mid-dialogue and the C side sees its own STATE read
+                // hit EOF pre-commit, with no TX_BEGIN of this transfer staged
+                // by F. Every other session stays alive so siblings, the
+                // retry -- and the fresh-assignment probe -- can arm and
+                // commit through this same front.
                 const bool kill_this_session =
+                    killed_ordinal_ != 0 &&
+                    ordinal == killed_ordinal_ &&
                     !killed_.exchange(true, std::memory_order_acq_rel);
                 const int kill_copy = kill_this_session ? ::dup(raw_fd) : -1;
                 f_runtime_.start_adopted_endpoint(raw_fd);
@@ -4532,6 +4545,7 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
         std::atomic<bool> stopping_{false};
         std::atomic<size_t> arm_ordinal_{0};
         size_t refused_ordinal_ = 0;
+        size_t killed_ordinal_ = 1;
         std::atomic<bool> killed_{false};
         std::mutex mutex_;
         std::vector<std::thread> workers_;
@@ -4585,6 +4599,289 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
     return storm;
 }
 
+// k415 item 5 (fix-1 release-tear): the attempt-2 zero-wire retirement
+// must never turn a route-local loss into a sticky whole-C replacement.
+// The retirement's release-isolation question (see
+// P50PreparationAuthority::prepared_route_release_isolated) is covered by
+// the p50endpoint query unit test; this storm exercises the RELEASE FACE
+// ITSELF end to end at depth 2 with a concurrent sibling on the same
+// route: a doomed transfer whose first arm dies pre-BEGIN (zero wire) and
+// whose single retry is refused outright retires ROUTE-LOCALLY -- the
+// sibling transfers concurrently on the same route, the after-probe
+// commits through the fresh route, and nothing latches
+// route_replacement_required (the k45 storm: one refusal used to refuse
+// every later assignment on the route, 471 refusals in one leg).
+//
+// Reachability note (why the sibling is ungated and the doomed's first arm
+// is served-then-killed rather than refused): with a live sibling actually
+// inside the successor window, EVERY zero-wire face of the doomed deviates
+// -- a head run failing with successors outstanding poisons
+// (p50_endpoint.cpp finisher) and a successor run failing deviates
+// (run_connected_successor's catches) -- so the Step 4d chain-abandoned
+// retirement pre-empts the attempt-2 branch and there is no deterministic
+// service-level interleave that parks a live sibling between the doomed's
+// prepare and its attempt-2 decision. The gated-head variant below parks
+// the sibling's F-side materialize only, which the C-side run does not
+// re-check; the deterministic coverage is the storm's own face with the
+// sibling committing concurrently, asserting zero sticky latch.
+void test_attempt2_release_preserves_live_sibling() {
+    for (const char* name : {"ICECC_P50_ROUTE_PIPELINE_DEPTH",
+                             "ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE",
+                             "ICECC_P50_ROUTE_LANES", "ICECC_P50_ARMED_WINDOW",
+                             "ICECC_P50_PREP_AHEAD"})
+        CHECK(::unsetenv(name) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "2", 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE", "1", 1) == 0);
+    constexpr uint64_t kFStoreGeneration = 43;
+    StoreIdentityRoot f_root{};
+    f_root.bytes[14] = 0x99;
+    service::RuntimeConfig f_config = test_runtime_config();
+    f_config.f_store_guid = f_store_guid_for_root(f_root);
+    f_config.f_store_generation = kFStoreGeneration;
+    service::SidecarRuntime f_runtime(std::move(f_config));
+
+    StoreIdentityRoot c_root{};
+    c_root.bytes[15] = 0xe5;
+    const SidecarLaunchIdentity launch = test_sidecar_launch(c_root);
+    service::RuntimeConfig c_config = test_runtime_config();
+    c_config.c_store_guid = launch.c_store_guid;
+    c_config.f_store_guid = launch.f_store_guid;
+    c_config.f_store_generation = launch.store_generation;
+    c_config.sidecar_launch = launch;
+    service::SidecarRuntime c_runtime(std::move(c_config));
+
+    // Front: identity+count interleave (hedged connects make accept ORDER
+    // unreliable, so ordinals are NOT used).  wire_job_id 801 is the doomed
+    // transfer: its FIRST arm is served and then killed post-adoption (the
+    // C run reads EOF pre-BEGIN, zero wire); its SECOND arm -- the sender's
+    // single permitted retry -- is refused at the arm protocol (read the
+    // arm, clean shutdown, no ARMED reply) so the fd factory surfaces
+    // fd<0, the real k45 face.  The sibling (800) and every other arm
+    // (the after-probe 810) serve normally.
+    class FrontTear {
+    public:
+        FrontTear(service::SidecarRuntime& f_runtime,
+                  uint64_t f_store_generation)
+            : f_runtime_(f_runtime),
+              f_store_generation_(f_store_generation),
+              listener_(loopback_listener(port_)) {
+            CHECK(::listen(listener_, 8) == 0);
+            acceptor_ = std::thread([this] { accept_loop(); });
+        }
+        ~FrontTear() { stop(); }
+        FrontTear(const FrontTear&) = delete;
+        FrontTear& operator=(const FrontTear&) = delete;
+
+        [[nodiscard]] uint16_t port() const noexcept { return port_; }
+
+        // Optional per-arm endpoint control handed to F with the adopted
+        // session (mirrors CapacityFront): the tear storm stalls the
+        // sibling's run at before_materialize_on_worker so its route entry
+        // is provably outstanding while the doomed thread runs its
+        // attempt-2 retirement.
+        std::function<EndpointIoControl()> arm_control;
+
+        void stop() noexcept {
+            stopping_.store(true, std::memory_order_release);
+            if (acceptor_.joinable())
+                acceptor_.join();
+            for (std::thread& worker : workers_)
+                if (worker.joinable())
+                    worker.join();
+            workers_.clear();
+            if (listener_ >= 0) {
+                (void)::close(listener_);
+                listener_ = -1;
+            }
+        }
+
+    private:
+        void accept_loop() noexcept {
+            while (!stopping_.load(std::memory_order_acquire)) {
+                pollfd descriptor{listener_, POLLIN, 0};
+                if (::poll(&descriptor, 1, 20) <= 0)
+                    continue;
+                sockaddr_in peer{};
+                socklen_t peer_size = sizeof(peer);
+                const int accepted = ::accept(
+                    listener_, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+                if (accepted < 0)
+                    continue;
+                try {
+                    workers_.emplace_back([this, accepted, peer, peer_size] {
+                        serve(accepted, peer, peer_size);
+                    });
+                } catch (...) {
+                    (void)::close(accepted);
+                }
+            }
+        }
+
+        void serve(int accepted, sockaddr_in peer, socklen_t peer_size) noexcept {
+            try {
+                std::unique_ptr<MsgChannel> channel(Service::createChannel(
+                    accepted, reinterpret_cast<sockaddr*>(&peer), peer_size));
+                if (!channel)
+                    return;
+                std::unique_ptr<Msg> arm_message(channel->get_msg(3, true));
+                const auto* arm = arm_message != nullptr
+                                      ? dynamic_cast<P50SourceArmMsg*>(
+                                            arm_message.get())
+                                      : nullptr;
+                if (arm == nullptr || !arm->valid_payload())
+                    return;
+                size_t doomed_arm = 0;
+                if (arm->arm.wire_job_id == 801) {
+                    doomed_arm =
+                        doomed_arms_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                    if (doomed_arm == 2) {
+                        // The doomed transfer's single RETRY: refuse at the
+                        // arm protocol (clean close, no ARMED reply) so the
+                        // fd factory surfaces fd<0 -- the attempt-2 input.
+                        (void)::shutdown(accepted, SHUT_RDWR);
+                        (void)::close(accepted);
+                        return;
+                    }
+                    // doomed_arm == 1: serve the FIRST arm below, then kill
+                    // its adopted session (pre-BEGIN, zero wire).
+                }
+                ClaimAttemptCapability128 capability_1;
+                ClaimAttemptCapability128 capability_2;
+                capability_1.bytes.fill(0xf1);
+                capability_2.bytes.fill(0xf2);
+                const P50SourceArmedMsg acknowledgement(
+                    arm->arm, 111, 112, f_store_generation_,
+                    f_runtime_.f_store_guid().bytes,
+                    kStoreIdentityDerivationVersion, 113, 2500,
+                    capability_1, capability_2);
+                if (!channel->send_msg(acknowledgement))
+                    return;
+                std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
+                if (cache_message == nullptr ||
+                    *cache_message != Msg::CACHE_SESSION)
+                    return;
+                const int raw_fd = channel->release_fd_if_input_empty();
+                if (raw_fd < 0)
+                    return;
+                const auto ready_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                if (!f_runtime_.try_reserve_session()) {
+                    (void)send_cache_session_busy(raw_fd, ready_deadline);
+                    (void)::close(raw_fd);
+                    return;
+                }
+                if (!send_cache_session_ready(raw_fd, ready_deadline)) {
+                    f_runtime_.release_session_reservation();
+                    (void)::close(raw_fd);
+                    return;
+                }
+                // The doomed transfer's adopted FIRST-attempt session dies
+                // at once (shutdown on a dup of the shared socket): its C
+                // run reads EOF pre-BEGIN, zero wire.  The sibling's session
+                // (gated at before-materialize via arm_control) and every
+                // other arm stay alive.
+                const bool kill_this_session = doomed_arm == 1;
+                const int kill_copy = kill_this_session ? ::dup(raw_fd) : -1;
+                f_runtime_.start_adopted_endpoint(
+                    raw_fd,
+                    arm_control ? arm_control() : EndpointIoControl{});
+                if (kill_copy >= 0) {
+                    (void)::shutdown(kill_copy, SHUT_RDWR);
+                    (void)::close(kill_copy);
+                }
+            } catch (...) {
+            }
+        }
+
+        service::SidecarRuntime& f_runtime_;
+        const uint64_t f_store_generation_;
+        uint16_t port_ = 0;
+        int listener_ = -1;
+        std::atomic<bool> stopping_{false};
+        std::atomic<size_t> doomed_arms_{0};
+        std::mutex mutex_;
+        std::vector<std::thread> workers_;
+        std::thread acceptor_;
+    };
+
+    FrontTear front(f_runtime, kFStoreGeneration);
+    const auto clock = sidecar::process_monotonic_clock_identity();
+    constexpr size_t kSiblingSource = 2U << 20;
+    const auto transfer = [&](uint64_t identity, size_t size,
+                              std::chrono::milliseconds budget) {
+        std::vector<uint8_t> source(size);
+        uint64_t state = 0x9e3779b97f4a7c15ULL ^ identity;
+        for (size_t index = 0; index != source.size(); ++index) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            source[index] = static_cast<uint8_t>(state >> 33);
+        }
+        const std::string label =
+            "attempt2-tear-" + std::to_string(identity) + "\n";
+        std::copy(label.begin(), label.end(), source.begin());
+        const auto absolute =
+            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
+                std::chrono::steady_clock::now() + budget,
+                clock.clock_domain_id, clock.time_namespace_id);
+        return c_runtime.transfer_source_on_owner(
+            source_transfer_request(front.port(), identity,
+                                    CACHE_PROFILE_P29V1),
+            absolute,
+            local::HandoffFd(source_file("p50-attempt2-tear", source)));
+    };
+
+    local::P50SourceTransferResult sibling{};
+    local::P50SourceTransferResult doomed{};
+    // The sibling transfers concurrently on the SAME route (a 2 MiB source
+    // keeps its F dialogue in flight across the doomed's attempts): the
+    // doomed's route-local retirement must not disturb it into a sticky
+    // path, whatever the interleaving -- a commit when its dialogue raced
+    // ahead, or a route-local retirement through its own status path when
+    // the doomed's teardown caught it mid-flight.
+    std::thread sibling_thread([&] {
+        sibling = transfer(800, kSiblingSource, std::chrono::milliseconds(20000));
+    });
+    // The doomed transfer: first arm served then killed pre-BEGIN (zero
+    // wire), single retry refused at the arm protocol -- the attempt-2
+    // zero-wire retirement runs while the sibling is in flight.
+    std::thread doomed_thread([&] {
+        doomed = transfer(801, 64, std::chrono::milliseconds(20000));
+    });
+    doomed_thread.join();
+    sibling_thread.join();
+    // The after-probe: a fresh assignment on the SAME route.  With zero
+    // sticky latch it must COMMIT through the fresh route.
+    const auto after = transfer(810, 64, std::chrono::milliseconds(20000));
+    std::fprintf(stderr,
+                 "p50cacheservice: attempt-2 tear doomed=%u/%u/%u "
+                 "sibling=%u/%u/%u after=%u/%u/%u\n",
+                 static_cast<unsigned>(doomed.code),
+                 static_cast<unsigned>(doomed.error_code),
+                 static_cast<unsigned>(doomed.attempts),
+                 static_cast<unsigned>(sibling.code),
+                 static_cast<unsigned>(sibling.error_code),
+                 static_cast<unsigned>(sibling.attempts),
+                 static_cast<unsigned>(after.code),
+                 static_cast<unsigned>(after.error_code),
+                 static_cast<unsigned>(after.attempts));
+    const auto replacement_code = static_cast<uint16_t>(
+        local::SourceTransferErrorCode::RouteReplacementRequired);
+    // The doomed transfer: route-local failure, NO sticky replacement.
+    CHECK(doomed.code != local::SourceTransferResultCode::Committed);
+    CHECK(doomed.error_code != replacement_code);
+    // THE assertion of this test: the sibling ends in a STATUS path --
+    // either route-local retirement (epoch mismatch from the reset) or,
+    // when its commit raced ahead of the retirement, a plain COMMIT --
+    // never a sticky replacement and never a catch-all TerminalError.
+    CHECK(sibling.error_code != replacement_code);
+    // The after-probe: a fresh assignment on the SAME route must COMMIT --
+    // the route-local cold reset makes its head take the existing
+    // RouteHistoryReset wire branch, and zero sticky latch means nothing
+    // refuses it.
+    CHECK(after.code == local::SourceTransferResultCode::Committed);
+    CHECK(after.error_code != replacement_code);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH") == 0);
+    CHECK(::unsetenv("ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE") == 0);
+}
 void test_attempt2_fd_failure_retires_route_locally() {
     const Attempt2StormResult storm = run_attempt2_arm_refusal_storm();
     const auto replacement_code = static_cast<uint16_t>(
@@ -5233,6 +5530,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 &&
+            std::strcmp(argv[1], "--attempt2-tear") == 0) {
+            test_attempt2_release_preserves_live_sibling();
+            return 0;
+        }
+        if (argc == 2 &&
             std::strcmp(argv[1], "--route-pipeline-concurrency") == 0) {
             test_k1_concurrent_same_route_transfers_serialize_on_route_lock();
             test_k2_concurrent_same_route_transfers_admit_two_deep();
@@ -5242,6 +5544,7 @@ int main(int argc, char** argv) {
             test_k2_stale_epoch_head_retires_route_locally();
             test_k4_stale_epoch_successors_retire_route_locally();
             test_attempt2_fd_failure_retires_route_locally();
+            test_attempt2_release_preserves_live_sibling();
             return 0;
         }
         CHECK(argc == 1);
