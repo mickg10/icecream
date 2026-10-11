@@ -4305,6 +4305,35 @@ int run(const Options& options) noexcept {
                              .max_retained_input_bytes));
         std::fflush(stderr);
     }
+    // ICECC_P50_ROUTE_HISTORY_IDLE_MS (default 120000): how long an idle
+    // F-side namespace retains its P29V1 route history (region segments,
+    // occurrence streams, path tables -- see P50ServerEndpointConfig::
+    // route_history_idle_grace_ms) before collect_input_garbage drops it
+    // through the same invalidate path input-payload eviction uses. A C
+    // store that went away otherwise keeps its whole compressed dictionary
+    // resident for the sidecar process's life; a fresh C store per build
+    // makes that one unbounded dictionary per build. 0 disables the sweep
+    // (today's retention); otherwise accepted range 1000..3600000. Local
+    // resource bound only -- nothing on the wire changes.
+    if (const char* raw = ::getenv("ICECC_P50_ROUTE_HISTORY_IDLE_MS");
+        raw != nullptr && *raw != '\0') {
+        char* end = nullptr;
+        const unsigned long long ms = std::strtoull(raw, &end, 10);
+        if (end == raw || *end != '\0' || ms > 3600000ULL ||
+            (ms != 0 && ms < 1000ULL)) {
+            std::fprintf(stderr,
+                         "ICECC_P50_ROUTE_HISTORY_IDLE_MS must be 0 or "
+                         "1000..3600000\n");
+            cleanup_listener(listener, effective_options.socket_path, identity,
+                             prebound);
+            return 2;
+        }
+        runtime_config.endpoint_config.route_history_idle_grace_ms =
+            static_cast<uint32_t>(ms);
+        std::fprintf(stderr, "P50_ROUTE_HISTORY_IDLE_MS effective=%llu\n",
+                     ms);
+        std::fflush(stderr);
+    }
     const char* p29_fault = ::getenv("ICECC_P50_FAULT_INJECTION");
     if (!parse_p29_interner_fault_injection(
             p29_fault, runtime_config.p29_interner_fault_injection)) {

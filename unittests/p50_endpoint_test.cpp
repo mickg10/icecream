@@ -1092,6 +1092,128 @@ void test_s3_resource_storm_product_path() {
     report_resource_checkpoint("storm-final", storm_server.owner_usage());
 }
 
+size_t count_global_actions(const GlobalResourceTrace& trace,
+                            GlobalActionType action, ObjectType type) {
+    size_t result = 0;
+    for (const GlobalActionRecord& record : trace.records())
+        if (record.action == action && record.key.valid() &&
+            record.key.type() == type)
+            ++result;
+    return result;
+}
+
+size_t retained_global_actions(const GlobalResourceTrace& trace,
+                                ObjectType type) {
+    return count_global_actions(trace, GlobalActionType::ARENA_PRESENT,
+                                 type) -
+           count_global_actions(trace, GlobalActionType::ARENA_RELEASED,
+                                 type);
+}
+
+// 2026-10-10 F-side retained route-history bound. A C store that went away
+// leaves its namespace's persistent P29V1 dialogue (region segments,
+// occurrence streams, path tables) behind; nothing bounded that state while
+// the namespace sat idle. The idle sweep in collect_input_garbage drops a
+// dead store's codec history after
+// P50ServerEndpointConfig::route_history_idle_grace_ms, so many successive
+// fresh C stores against one F service retain at most the live store's
+// history instead of one per store for the process's life.
+void test_idle_p29v1_route_history_is_dropped_for_dead_stores() {
+    const P5coStoreGuids guids = p5co_store_guids(236);
+    EndpointCaps caps;
+    caps.profile = ProfileId::P29V1;
+    caps.zstd.max_raw_bytes = 1U << 20;
+    caps.zstd.max_encoded_body_bytes = 1U << 20;
+    const std::vector<uint8_t> input = bytes(
+        "# 1 \"/tmp/p29v1-idle-history.cc\"\n"
+        "same-line\nsame-line\nsame-line\nsame-line\ntail\n");
+    constexpr uint64_t kStores = 4;
+
+    // Retention with the sweep disabled (grace 0) is today's behaviour: every
+    // dead store keeps its route-history segments for the process's life.
+    GlobalResourceTrace legacy_trace;
+    P50ServerEndpointConfig legacy_config;
+    legacy_config.global_resource_trace = &legacy_trace;
+    legacy_config.route_history_idle_grace_ms = 0;
+    P50ServerEndpoint legacy(guids.f, caps, nullptr, nullptr,
+                             std::move(legacy_config));
+    for (uint64_t seed = 0; seed != kStores; ++seed) {
+        TestClient client(Id128::from_u64(23600 + seed), caps);
+        const PairResult result = run_pair(client, legacy, admit(client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    result.server.committed_input.has_value(),
+                "route-history legacy fixture store did not commit");
+        legacy.close_input_job(*result.server.committed_input);
+        legacy.collect_input_garbage();
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        legacy.collect_input_garbage();
+    }
+    require(count_global_actions(legacy_trace,
+                                 GlobalActionType::ARENA_RELEASED,
+                                 ObjectType::P29Segment) == 0 &&
+                retained_global_actions(legacy_trace, ObjectType::P29Segment) >=
+                    kStores,
+            "grace-disabled F did not retain every dead store's route "
+            "history (the unbounded retention this sweep bounds)");
+
+    // Bounded: each idle store's history is dropped, so retained route
+    // segments never exceed the live store's own.
+    GlobalResourceTrace bounded_trace;
+    P50ServerEndpointConfig bounded_config;
+    bounded_config.global_resource_trace = &bounded_trace;
+    bounded_config.route_history_idle_grace_ms = 20;
+    P50ServerEndpoint bounded(guids.f, caps, nullptr, nullptr,
+                              std::move(bounded_config));
+    std::vector<std::unique_ptr<TestClient>> clients;
+    for (uint64_t seed = 0; seed != kStores; ++seed) {
+        auto client =
+            std::make_unique<TestClient>(Id128::from_u64(23700 + seed), caps);
+        const PairResult result =
+            run_pair(*client, bounded, admit(*client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    result.server.committed_input.has_value(),
+                "route-history bounded fixture store did not commit");
+        bounded.close_input_job(*result.server.committed_input);
+        bounded.collect_input_garbage();
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+        bounded.collect_input_garbage();
+        require(retained_global_actions(bounded_trace,
+                                        ObjectType::P29Segment) <= 1,
+                "an idle F namespace's P29V1 route history was not dropped "
+                "after its grace bound");
+        clients.push_back(std::move(client));
+    }
+
+    // A store reconnecting after its idle-history drop reconciles through
+    // HISTORY_RESET and commits again -- the same recovery the existing
+    // input-payload eviction path exercises.
+    const PairResult recovered =
+        run_pair(*clients[0], bounded, admit(*clients[0], input));
+    if (recovered.client.status != ClientRunStatus::Committed ||
+        recovered.server.status != ServerRunStatus::Completed)
+        std::cerr << "idle-history recovery diagnostic: client_status="
+                  << static_cast<unsigned>(recovered.client.status)
+                  << " reconnect="
+                  << static_cast<unsigned>(recovered.client.reconnect)
+                  << " server_status="
+                  << static_cast<unsigned>(recovered.server.status);
+    if (recovered.client.terminal_error)
+        std::cerr << " client_error=" << recovered.client.terminal_error->detail;
+    if (recovered.server.terminal_error)
+        std::cerr << " server_error=" << recovered.server.terminal_error->detail;
+    std::cerr << '\n';
+    require(recovered.client.status == ClientRunStatus::Committed &&
+                recovered.server.status == ServerRunStatus::Completed &&
+                recovered.server.committed_input.has_value() &&
+                copy_input(bounded, clients[0]->c_store_guid()) == input,
+            "a store reconnecting after its idle-history drop did not "
+            "recover by HISTORY_RESET");
+    bounded.close_input_job(*recovered.server.committed_input);
+    bounded.collect_input_garbage();
+}
+
 void test_live_global_resource_trace() {
     GlobalResourceTrace trace;
     P50ServerEndpointConfig config;
@@ -9698,6 +9820,7 @@ int main(int argc, char** argv) {
     test_route_pipeline_prepark_k3_s2_begin_during_s1_stage_gap();
     test_p29v1_committed_sender_abandons_chain_under_foreign_poison();
     test_p29v1_k2_real_three_tx_dispatch_across_promotion_gap();
+    test_idle_p29v1_route_history_is_dropped_for_dead_stores();
     test_live_global_resource_trace();
     test_automatic_action_trace_is_complete_past_1024_records();
     if (s3_resource_storm_requested())

@@ -649,6 +649,24 @@ struct P50ServerEndpointConfig {
     // deterministically (a shorter bound does not change which frames are
     // sent, only when the fall-through happens).
     uint32_t prepark_grace_bound_ms = 2000;
+    // 2026-10-10 F-side retained route-history bound, in milliseconds of
+    // namespace idleness. A C store that goes away leaves its namespace's
+    // persistent P29V1 dialogue behind: that dialogue owns the route codec
+    // whose P29ReceiverRouteState (cache/codec/p29_wire.h) appends one
+    // region segment, one occurrence-stream run, and path/region index
+    // entries per committed TU for the whole route life, and nothing else
+    // bounds it -- namespace LRU eviction fires only under max_namespaces
+    // or InputRecordStore byte pressure, and both require job-lease closure
+    // this endpoint cannot force for a store that is gone.  After this much
+    // continuous idleness (no live session, no active or interrupted
+    // transaction, no parked waiter) collect_input_garbage() drops the
+    // idle namespaces' codec history through the same
+    // invalidate_p29v1_codec() path input-payload eviction already uses:
+    // the authenticated Protocol-50 cursor and every retained InputRecord
+    // survive untouched, and a reconnecting C of the same store reconciles
+    // through HISTORY_RESET exactly as after an input eviction.  Zero
+    // disables the sweep and keeps today's retention byte-for-byte.
+    uint32_t route_history_idle_grace_ms = 120000;
 };
 
 // Outbound-admission law shared by the client's production send path and its

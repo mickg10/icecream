@@ -2532,6 +2532,14 @@ struct P50ServerEndpoint::Impl {
         bool established = false;
         uint64_t active_session = 0;
         uint64_t last_touch = 0;
+        // Owner-affine wall clock of the last activity that could still
+        // name this namespace (session activate, route commit, session
+        // disconnect).  Unlike last_touch (a dense LRU ordinal shared with
+        // GlobalResourceModel), this is comparable against a steady-clock
+        // grace bound, so collect_input_garbage()'s idle-route-history
+        // sweep can ask "has this namespace been untouched long enough that
+        // its C store is gone?" without changing any LRU ordering.
+        std::chrono::steady_clock::time_point last_active{};
         // A codec is part of route identity.  Histories and persistent
         // dialogues for one C/F pair therefore remain disjoint by profile.
         std::map<ProfileId, HistoryNonce> nonce_high_water;
@@ -2753,6 +2761,7 @@ struct P50ServerEndpoint::Impl {
         if (namespace_touch_exhausted)
             return;
         space.last_touch = next_namespace_touch;
+        space.last_active = std::chrono::steady_clock::now();
         if (next_namespace_touch == std::numeric_limits<uint64_t>::max())
             namespace_touch_exhausted = true;
         else
@@ -2782,6 +2791,66 @@ struct P50ServerEndpoint::Impl {
                !namespace_has_live_session(c_guid) &&
                routes_quiescent &&
                input_records.namespace_evictable(c_guid);
+    }
+
+    // 2026-10-10 F-side retained route-history bound. A C store that goes
+    // away (fresh C store per build; the client wipes its attempt state)
+    // leaves this namespace's persistent P29V1 dialogue behind: the
+    // dialogue owns the route codec whose P29ReceiverRouteState appends one
+    // region segment, one occurrence-stream run, and path/region index
+    // entries per committed TU for the whole route life, and nothing bounded
+    // it while the namespace sat idle -- namespace LRU eviction fires only
+    // under max_namespaces or InputRecordStore byte pressure, and both
+    // require job-lease closure this endpoint cannot force for a store that
+    // is gone. After route_history_idle_grace_ms of continuous idleness the
+    // codec history is dropped through the same invalidate_p29v1_codec()
+    // path input-payload eviction already uses. The authenticated
+    // Protocol-50 cursor (nonce, next_rel, state), the nonce high-water
+    // mark, and every retained InputRecord survive untouched; only the
+    // reconstructable dictionary is dropped, and a reconnecting C of the
+    // same store reconciles through HISTORY_RESET exactly as after an input
+    // eviction. Zero grace disables the sweep (today's retention).
+    void drop_idle_route_histories() {
+        const auto grace = std::chrono::milliseconds(
+            config.route_history_idle_grace_ms);
+        if (grace <= std::chrono::milliseconds::zero())
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        for (auto& [c_guid, space] : namespaces) {
+            if (space.last_active == std::chrono::steady_clock::time_point{} ||
+                now - space.last_active < grace)
+                continue;
+            if (space.active_session != 0 ||
+                namespace_has_live_session(c_guid))
+                continue;
+            bool quiescent = true;
+            bool has_codec = false;
+            for (const auto& [profile, route] : space.routes) {
+                (void)profile;
+                if (route.pending || route.interrupted ||
+                    !route.parked.empty()) {
+                    quiescent = false;
+                    break;
+                }
+                if (route.dialogue_profile == ProfileId::P29V1 &&
+                    route.dialogue)
+                    has_codec = true;
+            }
+            if (!quiescent || !has_codec)
+                continue;
+            const size_t segments = space.p29v1_segments.size();
+            invalidate_p29v1_codec(c_guid, space);
+            std::fprintf(
+                stderr,
+                "P50_ROUTE_HISTORY_DROPPED segments=%zu grace_ms=%u "
+                "wall_clock_ns=%lld\n",
+                segments, config.route_history_idle_grace_ms,
+                static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count()));
+            std::fflush(stderr);
+        }
     }
 
     std::vector<CStoreGuid> lru_evictable_namespaces(
@@ -3270,6 +3339,7 @@ struct P50ServerEndpoint::Impl {
         }
         space.active_session = session.serial;
         space.last_touch = touch;
+        space.last_active = std::chrono::steady_clock::now();
         global_resources->touch(*session.c_guid);
         session.activated = true;
         live.activated = true;
@@ -3817,6 +3887,7 @@ struct P50ServerEndpoint::Impl {
         release_pending(pending);
         route.pending.reset();
         space.last_touch = touch;
+        space.last_active = std::chrono::steady_clock::now();
         record(ActionType::INPUT_COMMITTED, session, &materialized.begin,
                materialized.commit.post_state_digest);
         return materialized.commit;
@@ -6492,6 +6563,11 @@ void P50ServerEndpoint::collect_input_garbage() {
                      static_cast<unsigned long long>(freed_bytes),
                      deferred ? 1 : 0);
     }
+    // After the collection accounting (and its timing diagnostic) above:
+    // the idle-route-history sweep is a separate bound with its own stderr
+    // line, so a slow history drop never masquerades as a slow garbage
+    // collection in the elapsed_ms diagnostic.
+    impl_->drop_idle_route_histories();
 }
 
 P50ServerOwnerUsage P50ServerEndpoint::owner_usage() const {
