@@ -3304,7 +3304,7 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
 // unless ICECC_P50_ROUTE_PIPELINE_DEPTH_TEST_UNSAFE is also set to a
 // nonempty value other than "0" (this is the only state reachable outside
 // this step's own tests, since step 5's F-side sequencer does not exist
-// yet); (c) once unsafe-allowed, the hard kMaxPipelineDepth=4 ceiling;
+// yet); (c) once unsafe-allowed, the hard kMaxPipelineDepth=8 ceiling;
 // (d) the armed_window_slots() ceiling, probed through
 // ICECC_P50_ARMED_WINDOW; (e) the P29V1-only profile gate -- any other
 // cache_profile bitmask unconditionally forces 1 even when unsafe-allowed
@@ -3333,9 +3333,13 @@ void test_route_pipeline_depth_env_parsing_and_clamps() {
     CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
               CACHE_PROFILE_P29V1) == 2);
 
-    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "9", 1) == 0);
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "8", 1) == 0);
     CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
-              CACHE_PROFILE_P29V1) == 4);
+              CACHE_PROFILE_P29V1) == 8);
+
+    CHECK(::setenv("ICECC_P50_ROUTE_PIPELINE_DEPTH", "17", 1) == 0);
+    CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(
+              CACHE_PROFILE_P29V1) == 8);
 
     CHECK(::setenv("ICECC_P50_ARMED_WINDOW", "2", 1) == 0);
     CHECK(service::SidecarRuntime::route_pipeline_depth_for_test(

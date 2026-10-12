@@ -45,7 +45,7 @@ struct TxIdentity {
 // (SidecarRuntime::RouteGate::kMaxPipelineDepth, cache/p50_cache_service.h)
 // so a trace can never claim a deeper route than the admission gate can
 // ever produce.
-constexpr uint32_t kMaxTraceQueueDepth = 4;
+constexpr uint32_t kMaxTraceQueueDepth = 8;
 
 TxIdentity tx_identity(const ActionRecord& record) {
     return {record.history_nonce, record.rel_seq, record.tu_seq,

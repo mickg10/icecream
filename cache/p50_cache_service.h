@@ -339,7 +339,15 @@ private:
         // nonempty value other than "0" -- that escape is for this step's
         // own tests, to exercise the C-side plumbing ahead of F's half
         // landing, and must never be set outside a test process.
-        static constexpr uint32_t kMaxPipelineDepth = 4;
+        //
+        // The ceiling was 4 (design doc §7(2)); it is 8 since the farm
+        // measurement that a K=4 route over a 22.8 ms RTT tops out near 60
+        // TX/s (arming ~115 ms, lock hold 12-18 ms, then 40-70 ms to the
+        // result), which holds the 192-slot worker below capacity for the
+        // first 30 s of a clean build.  F has no per-route bound of its own:
+        // parked successors queue by rel_seq, and armed_window_slots() still
+        // caps K for the lane.
+        static constexpr uint32_t kMaxPipelineDepth = 8;
         static uint32_t route_pipeline_depth(uint32_t cache_profile) noexcept;
 
         // One lane's armed-window admission and transfer serialization. Each
