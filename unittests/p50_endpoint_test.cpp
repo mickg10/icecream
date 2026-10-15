@@ -1601,6 +1601,131 @@ void test_adopted_cross_executor_releases_registration() {
     require_closed_fd(accepted_fd, "cross-executor adopted fd was not closed");
 }
 
+void test_adopted_codec_runs_off_the_owner_thread() {
+    const P5coStoreGuids guids = p5co_store_guids(241);
+    P50ServerEndpoint server(guids.f);
+    TestClient client(guids.c);
+    const PreparedTuHandle prepared =
+        admit(client, bytes("codec pool placement input\n"));
+    // Codec work must run on the bounded pool, never on the endpoint owner
+    // thread: an owner-executor post serializes every connection behind
+    // materialization and gives a codec failure owner-state authority.
+    const std::thread::id owner_thread = std::this_thread::get_id();
+    std::atomic<bool> codec_job_ran{false};
+    bool codec_job_on_owner_thread = false;
+    EndpointIoControl server_control;
+    server_control.before_materialize_on_worker = [&] {
+        codec_job_on_owner_thread = std::this_thread::get_id() == owner_thread;
+        codec_job_ran.store(true, std::memory_order_release);
+    };
+    const PairResult result =
+        run_pair(client, server, prepared, {}, std::move(server_control));
+    require(codec_job_ran.load(std::memory_order_acquire) &&
+                !codec_job_on_owner_thread &&
+                result.client.status == ClientRunStatus::Committed &&
+                result.server.status == ServerRunStatus::Completed &&
+                copy_input(server, guids.c) ==
+                    bytes("codec pool placement input\n"),
+            "adopted-socket codec materialization ran on the owner thread");
+}
+
+void test_adopted_codec_slots_release_per_job() {
+    // The codec pool bounds concurrent jobs at eight.  Nine sequential
+    // materializing runs must each find a free admission slot: a per-job
+    // release that never ran strands the counter and rejects the ninth
+    // admission with a full queue.
+    const P5coStoreGuids guids = p5co_store_guids(242);
+    P50ServerEndpoint server(guids.f);
+    TestClient client(guids.c);
+    for (size_t index = 0; index != 9; ++index) {
+        const std::vector<uint8_t> input = pseudo_random_bytes(1024 + index);
+        const PairResult result =
+            run_pair(client, server, admit(client, input));
+        require(result.client.status == ClientRunStatus::Committed &&
+                    result.server.status == ServerRunStatus::Completed &&
+                    copy_input(server, guids.c) == input,
+                "adopted-socket codec admission slot was not released");
+        // The worker releases its slot after the eventfd write that ends
+        // this run; give it a moment before the next admission.
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    require(server.live_session_count() == 0,
+            "adopted-socket codec slot runs stranded a live session");
+}
+
+void test_adopted_selector_cancel_fences_publication() {
+    const P5coStoreGuids guids = p5co_store_guids(243);
+    ActionTrace actions;
+    P50ServerEndpoint* server_slot = nullptr;
+    P50ServerEndpointConfig config;
+    size_t selector_calls = 0;
+    config.input_job_state =
+        [&](CStoreGuid, const TxBegin&, const TxCommit&, std::span<const uint8_t>) {
+            ++selector_calls;
+            server_slot->request_cancel_for_test();
+            return InputJobState::Open;
+        };
+    P50ServerEndpoint server(guids.f, {}, nullptr, &actions, std::move(config));
+    server_slot = &server;
+    TestClient client(guids.c);
+    const std::vector<uint8_t> input = pseudo_random_bytes(4096);
+    const PreparedTuHandle prepared = admit(client, input);
+    const PairResult result = run_pair(client, server, prepared);
+    require(selector_calls == 1 &&
+                result.server.status == ServerRunStatus::Disconnected &&
+                result.client.status == ClientRunStatus::Disconnected &&
+                !server.last_committed_input(guids.c).has_value() &&
+                server.owner_usage().retained_input_records == 0 &&
+                server.live_session_count() == 0 &&
+                std::none_of(actions.records().begin(), actions.records().end(),
+                             [](const ActionRecord& record) {
+                                 return record.action ==
+                                        ActionType::INPUT_COMMITTED;
+                             }),
+                "cancellation requested by the job-state selector published input");
+}
+
+void test_adopted_completion_cancel_is_rechecked() {
+    const P5coStoreGuids guids = p5co_store_guids(244);
+    ActionTrace actions;
+    P50ServerEndpoint server(guids.f, {}, nullptr, &actions);
+    TestClient client(guids.c);
+    const std::vector<uint8_t> input = pseudo_random_bytes(2048);
+    const PreparedTuHandle prepared = admit(client, input);
+    size_t unbound_payload_completions = 0;
+    bool cancelled_in_callback = false;
+    EndpointIoControl server_control;
+    server_control.before_live_identity_check =
+        [&](const CompletionStamp& expected, CompletionLiveIdentity&) {
+            if (expected.actor != ActorSide::F ||
+                expected.operation != AsyncOperationKind::ReadPayload ||
+                expected.transaction_bound)
+                return;
+            ++unbound_payload_completions;
+            // Fresh-pair wire order: hello payload(1), HISTORY_RESET
+            // payload(2), BEGIN payload(3). Cancelling on the BEGIN read
+            // makes the final recheck fence that install.
+            if (unbound_payload_completions != 3)
+                return;
+            cancelled_in_callback = true;
+            server.request_cancel_for_test();
+        };
+    const PairResult result =
+        run_pair(client, server, prepared, {}, std::move(server_control));
+    require(cancelled_in_callback && unbound_payload_completions == 3 &&
+                result.server.status == ServerRunStatus::Disconnected &&
+                result.client.status == ClientRunStatus::Disconnected &&
+                !server.last_committed_input(guids.c).has_value() &&
+                server.owner_usage().retained_input_records == 0 &&
+                server.live_session_count() == 0 &&
+                std::none_of(actions.records().begin(), actions.records().end(),
+                             [](const ActionRecord& record) {
+                                 return record.action == ActionType::TX_BEGIN &&
+                                        record.actor == ActorSide::F;
+                             }),
+                "cancellation inside a completion callback installed the begin");
+}
+
 CompetingPairResult run_competing_pair(P50ServerEndpointConfig config,
                                         uint64_t identity_base,
                                         size_t first_raw_bytes,
@@ -9453,6 +9578,10 @@ int main(int argc, char** argv) {
         test_adopted_endpoint_exact_zstd_and_ownership();
         test_adopted_endpoint_disconnect_and_invalid_rows();
         test_adopted_cross_executor_releases_registration();
+        test_adopted_codec_runs_off_the_owner_thread();
+        test_adopted_codec_slots_release_per_job();
+        test_adopted_selector_cancel_fences_publication();
+        test_adopted_completion_cancel_is_rechecked();
         std::cout << "p50_endpoint_test: focused adopted-socket PASS\n";
         return 0;
     }
@@ -9531,6 +9660,10 @@ int main(int argc, char** argv) {
     test_adopted_endpoint_exact_zstd_and_ownership();
     test_adopted_endpoint_disconnect_and_invalid_rows();
     test_adopted_cross_executor_releases_registration();
+    test_adopted_codec_runs_off_the_owner_thread();
+    test_adopted_codec_slots_release_per_job();
+    test_adopted_selector_cancel_fences_publication();
+    test_adopted_completion_cancel_is_rechecked();
     test_two_client_one_server_isolation();
     test_zstd_route_endpoint_continuation_and_retry();
     test_zstd_route_authority_bounded_history();

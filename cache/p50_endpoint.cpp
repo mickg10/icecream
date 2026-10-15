@@ -5493,10 +5493,10 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
         if (control.before_live_identity_check)
             control.before_live_identity_check(expected, live);
         require_live_completion(expected, live);
-        // Both completion hooks are arbitrary owner-affine product callbacks.
-        // They may cross the absolute deadline or synchronously request
-        // cancellation, so their identity observation is not the final
-        // operation/deadline observation for this completion.
+        // Both completion hooks are arbitrary owner-affine product
+        // callbacks and may synchronously request cancellation, so the
+        // identity observation above is never the final cancellation
+        // observation for this completion.
         require_operation();
     };
     std::optional<ErrorMessage> terminal_error;
@@ -6242,9 +6242,9 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_connected(
             materialized.f_apply_materialize_ns;
         const InputJobState job_state =
             impl_->select_materialized_job_state(session, materialized);
-        // The selector is a product callback and may run for arbitrarily long.
-        // Sample the original absolute deadline again after it returns and
-        // immediately before the allocation-free owner publication seam.
+        // The selector is a product callback and may run for arbitrarily
+        // long. Observe cancellation again after it returns, immediately
+        // before the allocation-free owner publication seam.
         require_operation();
         const TxBegin committed_begin = materialized.begin;
         result.f_rel_seq = committed_begin.rel_seq;

@@ -1,10 +1,12 @@
 #!/bin/sh
 # Compiled behavioral mutants for the adopted-socket endpoint seam.
 # Each mutant below is killed by the kept endpoint tests in the
-# ICECC_P50_ENDPOINT_MUTANT_FOCUS block.  Mutants whose witnesses were the
-# retired typed-handoff tests (operation/deadline binding, claim echo,
-# selector recheck, codec slot accounting) were dropped with that design:
-# their targets are unreachable or unwitnessed on the adopted-socket path.
+# ICECC_P50_ENDPOINT_MUTANT_FOCUS block.  Mutants whose targets existed only
+# in the retired typed-handoff design (typed operation binding, claim echo,
+# transfer fence, absolute timer arm) were dropped with that design; the four
+# mutants whose targets remain live adopted-socket production code (codec
+# pool placement and slot accounting, post-selector cancellation, completion
+# recheck) are re-covered by the kept tests below.
 set -eu
 
 src=${ICECC_TEST_TOP_SRCDIR:?ICECC_TEST_TOP_SRCDIR is required}
@@ -33,9 +35,9 @@ ICECC_P50_ENDPOINT_MUTANT_FOCUS=1 timeout 30s "$baseline" \
     >"$work/baseline.log" 2>&1
 
 # The endpoint delegates run cancellation to a separate production
-# translation unit, and its deadline sampling lives in p50_sidecar_identity.
-# Mutants replace only p50_endpoint.cpp, so compile the unchanged companions
-# once and link them into every witness.
+# translation unit, and its run/cancel identities build on the sidecar
+# launch identity type. Mutants replace only p50_endpoint.cpp, so compile
+# the unchanged companions once and link them into every witness.
 # shellcheck disable=SC2086
 "$cxx" "$standard" -O0 -g -Wall -Wextra -Wpedantic \
     -Wno-mismatched-new-delete -DHAVE_CONFIG_H \
@@ -67,6 +69,26 @@ mutate() {
     client-completion-deadline)
         perl -0pi -e \
             's/(        require_live_completion\(expected, live\);\n)        require_deadline\(\);\n/$1/' \
+            "$output"
+        ;;
+    owner-thread-codec)
+        sed -i \
+            's/asio::post(codec_pool.executor(),/asio::post(owner_executor,/' \
+            "$output"
+        ;;
+    codec-slot-release)
+        sed -i \
+            's/EndpointCodecSlotGuard slot{codec_pool_owner};/(void)codec_pool_owner;/' \
+            "$output"
+        ;;
+    post-selector-cancel)
+        perl -0pi -e \
+            's/(            impl_->select_materialized_job_state\(session, materialized\);\n        \/\/ The selector is a product callback and may run for arbitrarily\n        \/\/ long\. Observe cancellation again after it returns, immediately\n        \/\/ before the allocation-free owner publication seam\.\n)        require_operation\(\);\n/$1/' \
+            "$output"
+        ;;
+    server-completion-final-recheck)
+        perl -0pi -e \
+            's/(        require_live_completion\(expected, live\);\n        \/\/ Both completion hooks are arbitrary owner-affine product\n        \/\/ callbacks and may synchronously request cancellation, so the\n        \/\/ identity observation above is never the final cancellation\n        \/\/ observation for this completion\.\n)        require_operation\(\);\n/$1/' \
             "$output"
         ;;
     *)
@@ -108,7 +130,9 @@ compile_mutant() {
 
 count=0
 for name in worker-completion-wakeup codec-queue-bound \
-    client-completion-deadline; do
+    client-completion-deadline owner-thread-codec \
+    codec-slot-release post-selector-cancel \
+    server-completion-final-recheck; do
     count=$((count + 1))
     source="$work/$name.cpp"
     object="$work/$name.o"
@@ -127,5 +151,5 @@ for name in worker-completion-wakeup codec-queue-bound \
     echo "ok - endpoint semantic mutant red: $name"
 done
 
-test "$count" -eq 3
-echo 'PASS: all 3 compiled adopted-socket endpoint semantic mutants red'
+test "$count" -eq 7
+echo 'PASS: all 7 compiled adopted-socket endpoint semantic mutants red'

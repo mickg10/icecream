@@ -17,10 +17,8 @@ std::optional<EndpointRunHandle> EndpointRunRegistry::admit(
     EndpointRunIdentity identity,
     std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<EndpointSocketTarget> socket, uint64_t timer_identity) {
-    // The deadline is admission criteria only (an epoch value means the
-    // caller never armed a timer): it is not stored, since cancellation is
-    // driven by the caller's own timer and permit identity, never by a
-    // registry-side deadline comparison.
+    // Admission criteria only: the deadline is never stored or compared
+    // here; cancellation follows the caller's own timer and permit identity.
     if (!identity.valid() ||
         deadline == std::chrono::steady_clock::time_point{} || !socket)
         return std::nullopt;
