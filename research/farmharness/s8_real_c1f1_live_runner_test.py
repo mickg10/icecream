@@ -925,7 +925,6 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     assert "observed_f_service_identity=%s" in shell
     assert "assignment=%s relationship=%s f_slot=%s service_identity=" not in shell
     assert "grep -oE 'p50-f-[0-9]+' | sort -u | wc -l" in shell
-    assert "fsession_owner_(64, config_.f_store_generation)" in cache_service
     assert "::listen(outer_launch_listener_fd_, 64)" in sidecar_adapter
 
 

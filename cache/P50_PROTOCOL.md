@@ -457,9 +457,6 @@ late workers finish without referring to a destroyed Asio executor.
 EndpointRunRegistry binds callbacks and cancellation to complete launch,
 store, operation, session and socket-generation identity. A permit targets
 only that run; stale events cannot act on a reused descriptor number.
-An endpoint observation such as disconnect or a parsed commit is not, by
-itself, a distributed settlement for a separate FSession owner. That owner
-must settle its exact operation before uncertain retained work can be replaced.
 
 ## Additional tested components
 

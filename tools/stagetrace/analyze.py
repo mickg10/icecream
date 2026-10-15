@@ -13,12 +13,11 @@ wire_job_id), plus logical_job/attempt for retries. These exist at the
 scheduler / cdaemon / fdaemon / iceccclient / csidecar layers and are
 grouped into one timeline per job below.
 
-Two components stamp a few stages with NO wire identity, by design, because
+The F store stamps two stages with NO wire identity, by design, because
 the correlation key genuinely is not available at that point in the code
-without a protocol change (see p50-stagetrace commits perf/st-cache and
-perf/st-fstore for the exact call sites and reasoning):
+without a protocol change (see p50-stagetrace commit perf/st-fstore for the
+exact call sites and reasoning):
 
-  - fsidecar session_accepted   -- raw socket accept, wire protocol unparsed
   - fsidecar input_committed    -- keyed by (c_store_guid, tu_seq) only
   - fsidecar input_materialized -- keyed by (c_store_guid, tu_seq) only
 
@@ -1226,8 +1225,8 @@ def summarize(jobs: Dict[Tuple[int, int], List[Record]],
 # handoff partner on another host (it is F-local cleanup after object_sent
 # returns), so pairing it with any C-side stage would encode an empirical
 # ordering, not a true causal one, and could false-positive under normal
-# network jitter. The three fsidecar stages (session_accepted,
-# input_committed, input_materialized) are deliberately excluded too: per
+# network jitter. The two fsidecar stages (input_committed,
+# input_materialized) are deliberately excluded too: per
 # this file's module docstring they carry no wire identity and cannot be
 # keyed to a job_key, so group_uncorrelated() -- not this table -- is where
 # they belong.

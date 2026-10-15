@@ -27,7 +27,6 @@
 #include "p50_endpoint.h"
 #include "p50_armed_admission.h"
 #include "p50_control_operation.h"
-#include "p50_fsession_service_owner.h"
 #include "p50_fd_handoff.h"
 #include "p50_input_fd_attachment.h"
 #include "p50_input_lifecycle.h"
@@ -179,13 +178,6 @@ public:
         local::P50SourceTransferRequest request,
         std::chrono::steady_clock::time_point deadline,
         local::HandoffFd source) noexcept;
-
-    // Route an authenticated dedicated F-session control connection (first
-    // post-handshake bytes carry the P5FS envelope magic) onto the endpoint
-    // owner executor. Takes ownership of connection_fd. No per-connection
-    // thread: the owner-affine FSessionServiceOwner drives it incrementally.
-    void route_fsession_connection(int connection_fd) noexcept;
-    [[nodiscard]] size_t live_fsession_operations() const noexcept;
 
     // Start one already-authenticated public CacheWire socket on the endpoint
     // owner.  The control worker transfers ownership here after the
@@ -471,15 +463,6 @@ private:
     // the owner thread exits.
     std::unique_ptr<diag::OwnerWatchdog> owner_watchdog_;
 
-    // --- dedicated F-session control connections (owner-affine) -----------
-    struct FSessionPump;
-    void fsession_arm_read(std::shared_ptr<FSessionPump> pump) noexcept;
-    void fsession_drain(std::shared_ptr<FSessionPump> pump) noexcept;
-    void fsession_close(std::shared_ptr<FSessionPump> pump) noexcept;
-    // Accessed only on the endpoint owner executor.
-    fsession::FSessionServiceOwner fsession_owner_{4};
-    std::vector<std::shared_ptr<FSessionPump>> fsession_pumps_;
-    std::atomic<size_t> fsession_live_{0};
     // Blocking reopens (a transfer's second open, and reopens after BUSY) run
     // here, not on the owner: two at a time, with at most kReopenLimit queued
     // or running; one more fails at once.  Declared last so it joins first on

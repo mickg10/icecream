@@ -48,18 +48,6 @@ libprotocol50_a_SOURCES = \
 	p50_input_wait.cpp \
 	p50_input_wait.h \
 	p50_incarnation_identity.h \
-	p50_fsession_control.cpp \
-	p50_fsession_control.h \
-	p50_fsession_route.cpp \
-	p50_fsession_route.h \
-	p50_fsession_sidecar_op.cpp \
-	p50_fsession_sidecar_op.h \
-	p50_fsession_daemon_op.cpp \
-	p50_fsession_daemon_op.h \
-	p50_fsession_service_owner.cpp \
-	p50_fsession_service_owner.h \
-	p50_fsession_payloads.cpp \
-	p50_fsession_payloads.h \
 	p50_source_view.cpp \
 	p50_source_view.h
 
