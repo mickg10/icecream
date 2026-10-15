@@ -157,7 +157,7 @@ def test_p50_reference_components_are_not_product_dependencies() -> None:
     references = (
         "p50_role_owner", "p50_cache_session_join", "p50_input_attachment",
         "p50_source_ingress", "p50_reverse_fd_retry",
-        "p50_adopted_socket_lease", "p50_sidecar_supervisor",
+        "p50_sidecar_supervisor",
     )
     tests = (ROOT / "unittests/Makefile.am").read_text()
     assert "check_LIBRARIES = libp50reference.a" in tests

@@ -231,4 +231,37 @@ struct Counters {
     uint64_t forced_kills = 0;
 };
 
+// A sampled CLOCK_MONOTONIC reading together with the identity of the clock it
+// came from.  Observations are taken fresh at every decision point; a stored
+// observation is never renewed or extrapolated.
+struct MonotonicObservation {
+    int64_t now_ns = 0;
+    MonotonicClockIdentity clock{};
+
+    [[nodiscard]] bool valid() const noexcept {
+        return now_ns >= 0 && clock.valid();
+    }
+};
+
+// The source is move-only by ownership.  A production instance samples
+// CLOCK_MONOTONIC; tests inject a deterministic source with one fresh sample
+// per observation call.
+class MonotonicObservationSource {
+public:
+    virtual ~MonotonicObservationSource() = default;
+    MonotonicObservationSource(const MonotonicObservationSource&) = delete;
+    MonotonicObservationSource& operator=(const MonotonicObservationSource&) = delete;
+
+    [[nodiscard]] virtual std::optional<MonotonicObservation>
+    observe() noexcept = 0;
+
+protected:
+    MonotonicObservationSource() = default;
+};
+
+class SystemMonotonicObservationSource final : public MonotonicObservationSource {
+public:
+    [[nodiscard]] std::optional<MonotonicObservation> observe() noexcept override;
+};
+
 } // namespace icecc::p50::sidecar

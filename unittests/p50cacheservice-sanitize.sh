@@ -55,7 +55,6 @@ fi
     "$test_srcdir/../client/p50_zstd_sender.cpp" \
     "$build_dir/../cache/libp50endpointtesthooks.a" \
     "$build_dir/../cache/libp50endpoint.a" \
-    "$build_dir/../cache/libp50adoptedoutcomewriter.a" \
     "$build_dir/../cache/libp50input.a" \
     "$build_dir/../cache/libprotocol50.a" \
     "$build_dir/../cache/libp50localtransport.a" \

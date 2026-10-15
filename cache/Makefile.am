@@ -1,6 +1,6 @@
 noinst_LIBRARIES = libprotocol50.a libp50endpoint.a libp50localtransport.a \
 	libp50sidecar.a libp50daemonsidecaradapter.a libp50input.a \
-	libp50adoptedoutcomewriter.a libp50ownerwatchdog.a
+	libp50ownerwatchdog.a
 check_LIBRARIES = libp50endpointtesthooks.a
 
 sbin_PROGRAMS = icecc-cache-service
@@ -10,7 +10,7 @@ icecc_cache_service_SOURCES = p50_cache_service.cpp p50_cache_service.h \
 	p50_sidecar_lifecycle_apply_override.cpp p50_sidecar_lifecycle_apply_override.h \
 	../client/p50_route_owner.cpp ../client/p50_route_owner.h \
 	../client/p50_zstd_sender.cpp ../client/p50_zstd_sender.h
-icecc_cache_service_LDADD = libp50endpoint.a libp50adoptedoutcomewriter.a \
+icecc_cache_service_LDADD = libp50endpoint.a \
 	libp50input.a \
 	libprotocol50.a \
 	libp50ownerwatchdog.a \
@@ -63,7 +63,8 @@ libp50ownerwatchdog_a_SOURCES = p50_owner_watchdog.cpp p50_owner_watchdog.h
 libp50ownerwatchdog_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
-	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
+	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h \
+	p50_sidecar_identity.cpp p50_sidecar_identity.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 # Unit-only compatibility object for the pre-existing endpoint behavioral
@@ -88,9 +89,6 @@ libp50sidecar_a_CPPFLAGS = $(AM_CPPFLAGS)
 libp50daemonsidecaradapter_a_SOURCES = p50_daemon_sidecar_adapter.cpp \
 	p50_daemon_sidecar_adapter.h
 libp50daemonsidecaradapter_a_CPPFLAGS = $(AM_CPPFLAGS)
-libp50adoptedoutcomewriter_a_SOURCES = p50_adopted_outcome_writer.cpp \
-	p50_adopted_outcome_writer.h
-libp50adoptedoutcomewriter_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 EXTRA_DIST = \
 	codec/FORMAT.md \
@@ -224,8 +222,6 @@ EXTRA_DIST = \
 	formal/run_global_tlc.sh \
 	formal/run_global_formal_gate.sh \
 	p50_daemon_cache_dispatch.h \
-	p50_adopted_outcome_writer.cpp \
-	p50_adopted_outcome_writer.h \
 	formal/README.md
 
 # Historical GRZ/libbsc generators stay under research/ in Git, not the product

@@ -2,7 +2,6 @@
 #include "p50_input_backing_reaper.h"
 #include "p50_slice0.h"
 
-#include "p50_adopted_outcome_writer.h"
 #include "codec/p29_wire.h"
 
 #include <boost/asio/buffer.hpp>
@@ -5532,82 +5531,6 @@ boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
     co_return co_await run_connected(std::move(socket), std::move(registration),
                                      std::move(control), nullptr, std::nullopt,
                                      std::nullopt);
-}
-
-boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::run_adopted(
-    sidecar::P5coEndpointHandoff handoff, EndpointIoControl control) {
-    impl_->owner.require();
-    ServerRunResult invalid;
-    if (!handoff.valid() ||
-        handoff.outcome().kind !=
-            daemon::P50CacheSessionOutcomeKind::Adopted ||
-        handoff.outcome().f_store_guid != impl_->f_guid.bytes) {
-        co_return invalid;
-    }
-
-    const daemon::P50CacheSessionOutcome exact_outcome = handoff.outcome();
-    const std::optional<daemon::P50CacheSessionWireClaim> exact_claim =
-        daemon::decode_cache_session_wire_claim(
-            exact_outcome.canonical_claim);
-    if (!exact_claim.has_value())
-        co_return invalid;
-    const CStoreGuid expected_c_store_guid{
-        exact_claim->binding.arm.c_store_guid};
-    const sidecar::AbsoluteMonotonicDeadline exact_deadline =
-        handoff.deadline();
-    sidecar::SystemMonotonicObservationSource observations;
-    const std::optional<sidecar::MonotonicObservation> observed =
-        observations.observe();
-    if (!observed.has_value() || !observed->valid() ||
-        !exact_deadline.matches_clock(observed->clock) ||
-        observed->now_ns >= exact_deadline.expires_at_ns) {
-        invalid.status = ServerRunStatus::DeadlineExceeded;
-        co_return invalid;
-    }
-
-    std::unique_ptr<sidecar::P5coAdoptedSocketLease> lease =
-        handoff.take_lease_for_endpoint();
-    if (!lease)
-        co_return invalid;
-    struct LeaseFailureFence {
-        sidecar::P5coAdoptedSocketLease* lease = nullptr;
-        ~LeaseFailureFence() {
-            if (lease != nullptr)
-                lease->fence();
-        }
-        void dismiss() noexcept { lease = nullptr; }
-    } lease_failure_fence{lease.get()};
-    if (!lease->revalidate(exact_outcome, exact_deadline)) {
-        co_return invalid;
-    }
-    const int adopted_fd =
-        lease->release_native_fd_for_endpoint(exact_outcome, exact_deadline);
-    if (adopted_fd < 0) {
-        co_return invalid;
-    }
-
-    const auto executor = co_await asio::this_coro::executor;
-    boost::system::error_code adoption_error;
-    std::optional<tcp::socket> socket =
-        adopt_connected_fd(executor, adopted_fd, adoption_error);
-    if (!socket) {
-        // The endpoint adoption path consumed/closed adopted_fd.  Fence the
-        // exact detached operation as well; descriptor cleanup alone is not an
-        // operation-level terminal witness.
-        co_return invalid;
-    }
-
-    const Impl::Session session =
-        impl_->allocate_session(exact_outcome.operation, exact_deadline);
-    SessionRegistration registration(*impl_, session);
-    // From here the exact typed session registration and connected reducer own
-    // terminal settlement.  Before this point every exception or early return
-    // fences the consumed post-P5CO authority exactly once.
-    lease_failure_fence.dismiss();
-    co_return co_await run_connected(
-        std::move(*socket), std::move(registration), std::move(control),
-        nullptr, exact_deadline,
-        expected_c_store_guid);
 }
 
 boost::asio::awaitable<ServerRunResult> P50ServerEndpoint::accept_one(tcp::acceptor& acceptor,

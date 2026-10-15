@@ -73,10 +73,7 @@ TESTS += p50cacheservice-routepipe-run.sh
 # source, cpp-failure parity, and the scheduler-local selection row.
 TESTS += p50ppfirst-run.sh
 TESTS += assignment_identity_test
-TESTS += p50_adopted_outcome_writer-run.sh \
-	p50_adopted_outcome_writer-source.sh \
-	p50_adopted_outcome_writer-sanitize.sh \
-	p50_adopted_socket_lease-run.sh \
+TESTS += \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 TESTS += codec_parity codec_provider codec_intern codec_wire
@@ -93,7 +90,6 @@ libp50reference_a_SOURCES = \
 	support/p50_input_attachment.cpp support/p50_input_attachment.h \
 	support/p50_source_ingress.cpp support/p50_source_ingress.h \
 	support/p50_reverse_fd_retry.cpp support/p50_reverse_fd_retry.h \
-	support/p50_adopted_socket_lease.cpp support/p50_adopted_socket_lease.h \
 	support/p50_sidecar_supervisor.cpp support/p50_sidecar_supervisor.h
 LOG_COMPILER = sh "$(abs_top_srcdir)/dev/python.sh" --exec
 AM_TESTS_ENVIRONMENT = \
@@ -136,7 +132,6 @@ AM_CPPFLAGS = -I$(top_srcdir)/client -I$(top_srcdir)/services -I$(top_srcdir)/ \
 	$(LIBZSTD_CFLAGS)
 P50_CLIENT_LINK_LIBS = ../client/libp50zstdsender.a \
 	../cache/libp50localtransport.a ../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 testargs_LDFLAGS = $(BOOST_LDFLAGS) -pthread
@@ -172,7 +167,6 @@ p50endpoint_CXXFLAGS = -pthread
 p50endpoint_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50endpoint_LDADD = libp50reference.a ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libp50localtransport.a ../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
@@ -301,7 +295,7 @@ p50s3realprocess_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50s3realprocess_CXXFLAGS = -pthread
 p50s3realprocess_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50s3realprocess_LDADD = ../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(BOOST_LIBS)
 p50zstd_SOURCES = p50_zstd_test.cpp
@@ -357,14 +351,14 @@ p50zstdsender_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50zstdsender_CXXFLAGS = -pthread
 p50zstdsender_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50zstdsender_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50compilebinding_SOURCES = p50_compile_binding_test.cpp
 p50compilebinding_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 p50compilebinding_CXXFLAGS = -pthread
 p50compilebinding_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50compilebinding_LDADD = ../client/libp50zstdsender.a ../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50routeowner_SOURCES = p50_route_owner_test.cpp \
 	../client/p50_route_owner.cpp ../client/p50_zstd_sender.cpp
@@ -374,7 +368,7 @@ p50routeowner_CXXFLAGS = -pthread
 p50routeowner_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50routeowner_LDADD = ../cache/libp50localtransport.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libprotocol50.a \
+	../cache/libprotocol50.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
 p50resultdisposition_SOURCES = p50_result_disposition_test.cpp
 p50resultdisposition_CXXFLAGS = -pthread
@@ -599,7 +593,7 @@ p50cacheservice_CXXFLAGS = -pthread
 p50cacheservice_LDFLAGS = $(BOOST_LDFLAGS) -pthread
 p50cacheservice_LDADD = ../cache/libp50endpointtesthooks.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a ../cache/libp50input.a \
+	../cache/libp50input.a \
 	../cache/libp50ownerwatchdog.a \
 	../cache/libprotocol50.a ../cache/libp50localtransport.a \
 	../services/libicecc.la $(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
@@ -686,12 +680,6 @@ EXTRA_DIST += p50cacheservice-fcapacity-run.sh
 EXTRA_DIST += p50cacheservice-routepipe-run.sh
 EXTRA_DIST += p50ppfirst-run.sh
 EXTRA_DIST += p50endpointcancel-run.sh \
-	p50_adopted_outcome_writer-run.sh \
-	p50_adopted_outcome_writer-source.sh \
-	p50_adopted_outcome_writer-sanitize.sh \
-	p50_adopted_outcome_writer_test.cpp \
-	p50_adopted_socket_lease-run.sh \
-	p50_adopted_socket_lease_test.cpp \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
 # Make the tests also print the test log if they fail.

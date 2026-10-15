@@ -27,7 +27,6 @@ icecc_LDADD = \
 	../cache/libp50localtransport.a \
 	libp50zstdsender.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)
@@ -45,7 +44,6 @@ icecc_p50_completion_test_LDADD = \
 	../cache/libp50localtransport.a \
 	libp50zstdsender.a \
 	../cache/libp50endpoint.a \
-	../cache/libp50adoptedoutcomewriter.a \
 	../cache/libprotocol50.a \
 	../services/libicecc.la \
 	$(LIBZSTD_LIBS) $(XXHASH_LIBS) $(BOOST_LIBS)

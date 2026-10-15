@@ -475,11 +475,9 @@ that equivalent behavior is wired into the live path.
 | Synchronous Supervisor | Retained test implementation only. The live daemon uses SidecarLifecycle and CentralChildReaperRegistry through its adapter; the adapter supplies the process-domain observations used for replacement. |
 | ClientRoleOwner / ServerRoleOwner | Typed pre-adoption role owners; not complete C/F CompileFile wiring. |
 | InputAttachmentCore | Reference ready/ACK/replay reducer; the live path uses InputFdAttachment and InputLifecycleRegistry. |
-| Typed P5coEndpointHandoff overload | Consumes an exact retained socket lease and operation deadline; the service uses the socket overload instead. |
 
-PhaseOpen helpers and the typed endpoint overload remain separately tested
-interfaces, not additional live protocol exchanges. The concrete retained
-socket used by the typed-overload tests lives in test support.
+PhaseOpen helpers remain separately tested interfaces, not additional live
+protocol exchanges.
 
 The service validates OP_CANCEL shape and bounds, but its zero binding
 placeholder does not provide a complete session claim. Daemon OP_CANCEL and

@@ -81,7 +81,7 @@ if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]
     services_cxxflags=$(sanitize_cxxflags "$build_root/services/Makefile")
     make -C "$build_root/cache" $make_force \
         CXX="$cxx" CXXFLAGS="$cache_cxxflags" CPPFLAGS="$cxxflags" \
-        libprotocol50.a libp50endpoint.a libp50adoptedoutcomewriter.a
+        libprotocol50.a libp50endpoint.a
     make -C "$build_root/services" $make_force \
         CXX="$cxx" CXXFLAGS="$services_cxxflags" CPPFLAGS="$cxxflags" \
         libicecc.la
@@ -89,7 +89,6 @@ if [ -f "$build_root/cache/Makefile" ] && [ -f "$build_root/services/Makefile" ]
         -I"$root" -I"$build_root" -I"$dep_root/include" $config_cppflags \
         "$sim_dir/p50sim.cpp" \
         "$build_root/cache/libp50endpoint.a" \
-        "$build_root/cache/libp50adoptedoutcomewriter.a" \
         "$build_root/cache/libprotocol50.a" \
         "$build_root/services/.libs/libicecc.a" \
         -L"$dep_root/lib/x86_64-linux-gnu" \
@@ -102,7 +101,7 @@ else
         "$root/cache/p50_endpoint.cpp" "$root/cache/p50_input_record.cpp" \
         "$root/cache/p50_slice0.cpp" "$root/cache/p50_profile.cpp" \
         "$root/cache/p50_endpoint_run_cancel.cpp" \
-        "$root/cache/p50_adopted_outcome_writer.cpp" \
+        "$root/cache/p50_sidecar_identity.cpp" \
         "$root/services/digest128.cpp" "$root/services/p50_cache_session_wire.cpp" \
         -L"$dep_root/lib/x86_64-linux-gnu" \
         -lzstd -lxxhash -pthread -o "$temporary"

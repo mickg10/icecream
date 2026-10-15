@@ -12,7 +12,6 @@ baseline=${ICECC_TEST_ENDPOINT_BINARY:-$top_build/unittests/p50endpoint}
 reference_archive=${ICECC_TEST_REFERENCE_ARCHIVE:-$top_build/unittests/libp50reference.a}
 endpoint_hooks=${ICECC_TEST_ENDPOINT_HOOKS_ARCHIVE:-$top_build/cache/libp50endpointtesthooks.a}
 endpoint_archive=${ICECC_TEST_ENDPOINT_ARCHIVE:-$top_build/cache/libp50endpoint.a}
-adopted_archive=${ICECC_TEST_ADOPTED_WRITER_ARCHIVE:-$top_build/cache/libp50adoptedoutcomewriter.a}
 local_archive=${ICECC_TEST_LOCAL_TRANSPORT_ARCHIVE:-$top_build/cache/libp50localtransport.a}
 protocol_archive=${ICECC_TEST_PROTOCOL50_ARCHIVE:-$top_build/cache/libprotocol50.a}
 services_la=${ICECC_TEST_SERVICES_LA:-$top_build/services/libicecc.la}
@@ -21,7 +20,7 @@ trap 'rm -rf "$work"' EXIT HUP INT TERM
 
 for required in "$libtool" "$test_object" "$baseline" "$reference_archive" \
     "$endpoint_hooks" \
-    "$endpoint_archive" "$adopted_archive" "$local_archive" \
+    "$endpoint_archive" "$local_archive" \
     "$protocol_archive" "$services_la"; do
     test -f "$required"
 done
@@ -80,7 +79,7 @@ compile_mutant() {
     "$libtool" --tag=CXX --mode=link "$cxx" "$standard" -O0 -g \
         ${ICECC_TEST_LDFLAGS:-} ${ICECC_TEST_BOOST_LDFLAGS:-} \
         -pthread -o "$output" "$test_object" "$object" \
-        "$reference_archive" "$endpoint_hooks" "$endpoint_archive" "$adopted_archive" \
+        "$reference_archive" "$endpoint_hooks" "$endpoint_archive" \
         "$local_archive" "$protocol_archive" "$services_la" \
         ${ICECC_TEST_LIBZSTD_LIBS:-} ${ICECC_TEST_XXHASH_LIBS:-} \
         ${ICECC_TEST_LIBCAP_NG_LIBS:-} ${ICECC_TEST_BOOST_LIBS:-} \

@@ -42,8 +42,7 @@ compile "$work/p50endpoint" \
     "$src/cache/p50_endpoint.cpp" \
     "$src/cache/p50_endpoint_run_cancel.cpp" \
     "$src/cache/p50_input_record.cpp" \
-    "$src/cache/p50_adopted_outcome_writer.cpp" \
-    "$src/unittests/support/p50_adopted_socket_lease.cpp"
+    "$src/cache/p50_sidecar_identity.cpp"
 
 compile "$work/p50inputrecord" \
     "$src/unittests/p50_input_record_test.cpp" \

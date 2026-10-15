@@ -42,10 +42,6 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-namespace sidecar {
-class P5coEndpointHandoff;
-}
-
 struct EndpointCaps {
     SessionLimits wire{};
     ZstdTuLimits zstd{uint64_t{64} << 20, uint64_t{2} << 30};
@@ -841,13 +837,6 @@ public:
     // occurs before ownership reaches the shared server transaction reducer.
     boost::asio::awaitable<ServerRunResult> run_adopted(
         boost::asio::ip::tcp::socket socket, EndpointIoControl control = {});
-
-    // Consumes the complete post-P5CO authority bundle.  The retained socket
-    // descriptor is endpoint-private and cannot be detached independently of
-    // the exact adopted outcome and original absolute deadline.
-    boost::asio::awaitable<ServerRunResult> run_adopted(
-        sidecar::P5coEndpointHandoff handoff,
-        EndpointIoControl control = {});
 
     // Cancels the active socket on the endpoint's owner executor. The caller
     // must arrange that affinity (SidecarRuntime posts this method); it never
