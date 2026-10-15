@@ -16,7 +16,6 @@ test -x "$service" || {
     exit 1
 }
 grep -F 'outer_current_ready_lease()' "$src" >/dev/null
-grep -F 'outer_prepare_attempt_retirement' "$src" >/dev/null
 grep -F 'launch_identities' "$src" >/dev/null
 grep -F 'runtime_directory' "$src" >/dev/null
 grep -F 'cumulative_post_ready_exits_' "$src" >/dev/null
@@ -32,10 +31,6 @@ grep -F 'outer_begin_turn' "$header" >/dev/null
 grep -F 'outer_advance_turn' "$header" >/dev/null
 grep -F 'outer_append_pollfds' "$header" >/dev/null
 grep -F 'outer_immediate_turn_required' "$header" >/dev/null
-grep -F 'outer_prepare_attempt_retirement' "$header" >/dev/null
-grep -F 'outer_commit_attempt_replacement' "$header" >/dev/null
-grep -F 'outer_close_logical_input_lease' "$header" >/dev/null
-grep -F 'AttemptLeafRetirementJoin' "$header" >/dev/null
 
 # Robustness fix (1): outer_append_pollfds() must stop polling the exact
 # pidfd once the lifecycle has latched FailedClosed -- a pidfd whose process

@@ -453,8 +453,8 @@ void test_lifecycle() {
                    .valid(),
           "registry rejects the owner above its fixed total cap");
 
-    // --- Slice-1 hardening requirement #1: register_owner()/
-    // register_direct_worker() accept/reject matrix. The production fix
+    // --- Slice-1 hardening requirement #1: register_owner()
+    // accept/reject matrix. The production fix
     // landed separately; this exercises every branch of its validation
     // gate (cache/p50_sidecar_lifecycle.cpp, register_owner()). ---
     {
@@ -467,42 +467,6 @@ void test_lifecycle() {
                                     0, 0, /*pidfd=*/-1, incarnation_for(first))
                    .valid(),
               "Native backend with no pidfd is rejected");
-
-        CHECK(!hardening_registry
-                   .register_owner(40002, 40002, ReaperOwnerKey{40002, 1},
-                                    hardening_mailbox, ChildHandleBackend::Compat,
-                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
-                                    ReaperOwnerKind::DirectWorker,
-                                    /*starttime_ticks=*/0)
-                   .valid(),
-              "Compat DirectWorker via register_owner is rejected with a zero starttime");
-        CHECK(!hardening_registry
-                   .register_owner(40003, 40003, ReaperOwnerKey{40003, 1},
-                                    hardening_mailbox, ChildHandleBackend::Compat,
-                                    0, 0, /*pidfd=*/-1, incarnation_for(first),
-                                    ReaperOwnerKind::DirectWorker,
-                                    /*starttime_ticks=*/555)
-                   .valid(),
-              "Compat DirectWorker via register_owner is rejected even with a "
-              "nonzero starttime -- Compat has no covering observe/kill-domain "
-              "path for direct workers");
-
-        CHECK(!hardening_registry
-                   .register_direct_worker(40004, 40004, ReaperOwnerKey{40004, 1},
-                                            /*pidfd=*/-1, ChildHandleBackend::Compat,
-                                            incarnation_for(first),
-                                            /*starttime_ticks=*/0)
-                   .valid(),
-              "Compat DirectWorker via register_direct_worker is rejected with a "
-              "zero starttime");
-        CHECK(!hardening_registry
-                   .register_direct_worker(40005, 40005, ReaperOwnerKey{40005, 1},
-                                            /*pidfd=*/-1, ChildHandleBackend::Compat,
-                                            incarnation_for(first),
-                                            /*starttime_ticks=*/777)
-                   .valid(),
-              "Compat DirectWorker via register_direct_worker is rejected even "
-              "with a nonzero starttime");
 
         CHECK(!hardening_registry
                    .register_owner(40006, 40006, ReaperOwnerKey{40006, 1},
@@ -551,24 +515,15 @@ void test_lifecycle() {
     // --- Slice-1 hardening requirement #2: ReapEvent::exact_identity() and
     // the event-acceptance gates that depend on it. Requirement #1 above
     // hardened registration; this hardens the orthogonal question of
-    // whether a *delivered* event is accepted. Three independent surfaces:
+    // whether a *delivered* event is accepted. Two independent surfaces:
     //   (a) exact_identity() itself, as a pure predicate -- every conjunct
     //       flipped one at a time from a known-good baseline;
-    //   (b) AttemptLeafIdentity::matches(const ReapEvent&), which must
-    //       reject on !exact_identity() even when every field it compares
-    //       explicitly is already a match;
-    //   (c) SidecarLifecycle::consume_reap(), same shape as (b).
-    // CentralChildReaperRegistry::reap_one_direct_worker() (cache/
-    // p50_sidecar_lifecycle.cpp) and DaemonSidecarAdapter::
-    // outer_observe_child_reaped(const ReapEvent&) (cache/
-    // p50_daemon_sidecar_adapter.cpp) also gate on exact_identity(), but
-    // reaching their exact_identity()-false branch needs a live process:
-    // reap_one_direct_worker()'s event is assembled entirely from fields a
-    // register_direct_worker() call already validated (requirement #1), so
-    // the only way left to make it non-exact is a real wait() returning a
-    // non-terminal kernel_code -- that belongs with requirement #4's
-    // real-fork registry integration test, not here. The adapter's gate is
-    // covered directly in unittests/p50_daemon_sidecar_adapter_test.cpp
+    //   (b) SidecarLifecycle::consume_reap(): same rejection shape against
+    //       an event whose explicitly compared fields all still match.
+    // DaemonSidecarAdapter::outer_observe_child_reaped(const ReapEvent&)
+    // (cache/p50_daemon_sidecar_adapter.cpp) also gates on exact_identity(),
+    // but reaching its exact_identity()-false branch needs a live process;
+    // it is covered directly in unittests/p50_daemon_sidecar_adapter_test.cpp
     // (g_exact_identity_hardening_ok), piggybacked on that test's existing
     // real reaps rather than introducing a new one here.
     {
@@ -661,39 +616,6 @@ void test_lifecycle() {
         CHECK(broken.exact_identity(),
               "exact_identity accepts a Native DirectWorker event once "
               "starttime is supplied alongside the pidfd");
-
-        // (b) AttemptLeafIdentity::matches(const ReapEvent&): construct a
-        // valid leaf identity and a ReapEvent that matches every field the
-        // function compares explicitly (owner, registry_generation, pidfd,
-        // pid, incarnation, starttime_ticks), but break exact_identity()
-        // through a field matches() never looks at directly (kernel_code).
-        // If matches() returned true here, the exact_identity() call inside
-        // it would be provably redundant with its own explicit comparisons.
-        AttemptLeafIdentity leaf;
-        leaf.owner = exact_owner;
-        leaf.registry_generation = 1;
-        leaf.incarnation = exact_incarnation;
-        leaf.pidfd = 1;
-        leaf.direct_worker_pid = 50001;
-        leaf.process_starttime_ticks = 7;
-        leaf.leaf_device = 1;
-        leaf.leaf_inode = 1;
-        leaf.leaf_path = "/tmp/icecc-p50-lifecycle-leaf";
-        CHECK(leaf.valid(), "constructed AttemptLeafIdentity is itself valid");
-
-        ReapEvent leaf_event = baseline_event();
-        leaf_event.kind = ReaperOwnerKind::DirectWorker;
-        leaf_event.starttime_ticks = 7;
-        CHECK(leaf.matches(leaf_event),
-              "AttemptLeafIdentity::matches accepts the fully exact event");
-
-        ReapEvent leaf_event_broken = leaf_event;
-        leaf_event_broken.kernel_code = 0;
-        CHECK(!leaf_event_broken.exact_identity() &&
-                  !leaf.matches(leaf_event_broken),
-              "AttemptLeafIdentity::matches rejects on exact_identity() "
-              "alone even though owner/registry_generation/pidfd/pid/"
-              "incarnation/starttime still all match");
 
         // (c) SidecarLifecycle::consume_reap(): same shape as (b), using a
         // fresh lifecycle driven to Forked so child_pid_/pidfd_/

@@ -769,11 +769,9 @@ DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
             std::max<uint64_t>(1, outer_attempt_budget));
         lifecycle_config.identities = launch_identities_;
         lifecycle_config.kill_domain_verifier = outer_kill_domain_;
-        lifecycle_config.attempt_leaf_authority = config_.attempt_leaf_authority;
         outer_lifecycle_ = std::make_unique<sidecar::SidecarLifecycle>(
             std::move(lifecycle_config));
         outer_reaper_ = config_.central_reaper;
-        outer_attempt_leaf_authority_ = config_.attempt_leaf_authority;
         // This is the only construction-time configuration/path check.  The
         // live reducer must not repeat lstat-backed valid_config() on every
         // daemon turn; changing attempt nodes are checked by their explicit
@@ -1313,108 +1311,6 @@ InputLifecycleResult DaemonSidecarAdapter::queue_outer_input_request(
                                 pending_input_lifecycle_.back()};
 }
 
-InputLifecycleResult DaemonSidecarAdapter::outer_prepare_attempt_retirement(
-    RemoteInputLeaseBinding binding,
-    const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept {
-    InputLifecycleRequest request;
-    request.identity = binding.identity;
-    request.key = binding.key;
-    request.owner = binding.owner;
-    request.operation_id = binding.operation_id;
-    request.action = InputLifecycleAction::PrepareAttemptRetirement;
-    request.f_store_generation = binding.f_store_generation;
-    request.f_store_guid = binding.f_store_guid;
-    request.immutable_size = binding.immutable_size;
-    request.immutable_digest = binding.immutable_digest;
-    request.retirement_id = binding.retirement_id;
-    request.absolute_deadline = original_deadline;
-    request.deadline = original_deadline.as_steady_time_point();
-    if (!binding.valid() || binding.identity.generation != config_.generation)
-        return InputLifecycleResult{InputLifecycleStatus::InvalidArgument, request};
-    // PREPARE is admitted only against the currently published allocator
-    // tuple.  In particular, a syntactically valid stale A binding must not
-    // reach the sidecar and must never be silently rebound to B.
-    if (outer_lifecycle_ == nullptr ||
-        outer_lifecycle_->state() != sidecar::LifecycleState::Ready ||
-        !outer_ready_lease_.has_value() || !outer_ready_lease_->valid())
-        return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
-    const sidecar::ReadyLease& lease = *outer_ready_lease_;
-    if (binding.identity != lease.identity ||
-        binding.f_store_generation != lease.store_generation ||
-        binding.f_store_guid != lease.f_store_guid ||
-        binding.key.c_store_guid != lease.c_store_guid)
-        return InputLifecycleResult{InputLifecycleStatus::GenerationMismatch, request};
-    return queue_outer_input_request(std::move(request));
-}
-
-InputLifecycleResult DaemonSidecarAdapter::outer_commit_attempt_replacement(
-    RemoteInputLeaseBinding binding, InputLeaseOwner replacement_owner,
-    const InputRetirementProof& proof,
-    const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept {
-    InputLifecycleRequest request;
-    request.identity = binding.identity;
-    request.key = binding.key;
-    request.owner = binding.owner;
-    request.operation_id = binding.operation_id;
-    request.action = InputLifecycleAction::CommitAttemptReplacement;
-    request.f_store_generation = binding.f_store_generation;
-    request.f_store_guid = binding.f_store_guid;
-    request.immutable_size = binding.immutable_size;
-    request.immutable_digest = binding.immutable_digest;
-    request.retirement_id = binding.retirement_id;
-    request.replacement_owner = replacement_owner;
-    request.absolute_deadline = original_deadline;
-    request.deadline = original_deadline.as_steady_time_point();
-    if (!binding.valid() || !proof.complete() || proof.binding != binding ||
-        !input_lease_owner_valid(replacement_owner) ||
-        replacement_owner.logical_job != binding.owner.logical_job ||
-        replacement_owner == binding.owner)
-        return InputLifecycleResult{InputLifecycleStatus::RetirementProofRequired,
-                                    request};
-    if (outer_lifecycle_ == nullptr ||
-        outer_lifecycle_->state() != sidecar::LifecycleState::Ready ||
-        !outer_ready_lease_.has_value() || !outer_ready_lease_->valid())
-        return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
-    const sidecar::ReadyLease& lease = *outer_ready_lease_;
-    if (binding.identity != lease.identity ||
-        binding.f_store_generation != lease.store_generation ||
-        binding.f_store_guid != lease.f_store_guid ||
-        binding.key.c_store_guid != lease.c_store_guid)
-        return InputLifecycleResult{InputLifecycleStatus::GenerationMismatch, request};
-    return queue_outer_input_request(std::move(request));
-}
-
-InputLifecycleResult DaemonSidecarAdapter::outer_close_logical_input_lease(
-    RemoteInputLeaseBinding binding,
-    const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept {
-    InputLifecycleRequest request;
-    request.identity = binding.identity;
-    request.key = binding.key;
-    request.owner = binding.owner;
-    request.operation_id = binding.operation_id;
-    request.action = InputLifecycleAction::CloseLogicalInputLease;
-    request.f_store_generation = binding.f_store_generation;
-    request.f_store_guid = binding.f_store_guid;
-    request.immutable_size = binding.immutable_size;
-    request.immutable_digest = binding.immutable_digest;
-    request.retirement_id = binding.retirement_id;
-    request.absolute_deadline = original_deadline;
-    request.deadline = original_deadline.as_steady_time_point();
-    if (!binding.valid())
-        return InputLifecycleResult{InputLifecycleStatus::InvalidArgument, request};
-    if (outer_lifecycle_ == nullptr ||
-        outer_lifecycle_->state() != sidecar::LifecycleState::Ready ||
-        !outer_ready_lease_.has_value() || !outer_ready_lease_->valid())
-        return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
-    const sidecar::ReadyLease& lease = *outer_ready_lease_;
-    if (binding.identity != lease.identity ||
-        binding.f_store_generation != lease.store_generation ||
-        binding.f_store_guid != lease.f_store_guid ||
-        binding.key.c_store_guid != lease.c_store_guid)
-        return InputLifecycleResult{InputLifecycleStatus::GenerationMismatch, request};
-    return queue_outer_input_request(std::move(request));
-}
-
 bool DaemonSidecarAdapter::remember_completed_input_lifecycle(
     const InputLifecycleRequest& request) noexcept
 {
@@ -1468,7 +1364,6 @@ void DaemonSidecarAdapter::retire_input_lifecycle_relationship(
     disable_relationship();
     outer_authenticated_ = false;
     outer_auth_start_pending_ = false;
-    outer_input_cancel_lease_.reset();
     pending_input_lifecycle_.clear();
     completed_input_lifecycle_.clear();
     advertisement::Update withdrawal;
@@ -1621,90 +1516,6 @@ DaemonSidecarAdapter::take_outer_input_lifecycle_result() noexcept
         std::move(outer_last_input_lifecycle_result_);
     outer_last_input_lifecycle_result_.reset();
     return result;
-}
-
-std::chrono::steady_clock::time_point
-DaemonSidecarAdapter::outer_input_next_deadline() const noexcept
-{
-    return outer_input_operation_ != nullptr
-               ? outer_input_operation_->next_wakeup()
-               : std::chrono::steady_clock::time_point{};
-}
-
-std::optional<InputLifecycleOperationLease>
-DaemonSidecarAdapter::outer_input_operation_lease() const noexcept
-{
-    const InputLifecycleRequest* request = nullptr;
-    if (outer_input_request_.has_value())
-        request = &*outer_input_request_;
-    else if (!pending_input_lifecycle_.empty())
-        request = &pending_input_lifecycle_.front();
-    if (request == nullptr)
-        return std::nullopt;
-    const InputLifecycleOperationLease lease =
-        make_input_lifecycle_operation_lease(*request);
-    if (!lease.valid())
-        return std::nullopt;
-    return lease;
-}
-
-std::optional<sidecar::AbsoluteMonotonicDeadline>
-DaemonSidecarAdapter::outer_input_absolute_deadline() const noexcept
-{
-    const auto lease = outer_input_operation_lease();
-    if (!lease.has_value() || !lease->absolute_deadline.valid())
-        return std::nullopt;
-    return lease->absolute_deadline;
-}
-
-bool DaemonSidecarAdapter::outer_cancel_input_operation(
-    const InputLifecycleOperationLease& lease) noexcept
-{
-    if (!lease.valid())
-        return false;
-    const auto current = outer_input_operation_lease();
-    if (!current.has_value() || *current != lease)
-        return false;
-    // Repeating the exact cancellation post is idempotent.  A different
-    // lease (including the same operation id with a renewed deadline) cannot
-    // mutate this role slot.
-    if (outer_input_cancel_lease_.has_value())
-        return *outer_input_cancel_lease_ == lease;
-    try {
-        outer_input_cancel_lease_ = lease;
-    } catch (...) {
-        return false;
-    }
-    return true;
-}
-
-std::optional<sidecar::OutputQuiescenceGranted>
-DaemonSidecarAdapter::outer_grant_output_quiescence(
-    const sidecar::AttemptControlBinding& control,
-    const sidecar::AttemptLeafCensus& census,
-    const sidecar::LocalDrainedObservation& drained,
-    const sidecar::AbsoluteMonotonicDeadline& original_deadline) const noexcept {
-    if (!outer_lifecycle_ || !outer_attempt_leaf_authority_ ||
-        !control.valid() || !census.valid() || !drained.valid() ||
-        !original_deadline.matches_clock(config_.clock_identity))
-        return std::nullopt;
-    return outer_lifecycle_->grant_output_quiescence(
-        control, census, drained, original_deadline);
-}
-
-std::optional<sidecar::AttemptLeafRetirementJoin>
-DaemonSidecarAdapter::outer_join_attempt_leaf_retirement(
-    sidecar::OutputQuiescenceGranted quiescence,
-    sidecar::DirectWorkerStatusConsumed direct_worker_status,
-    bool empty_after_population, bool leaf_cleanup_complete,
-    std::chrono::steady_clock::time_point now) const noexcept {
-    if (!outer_lifecycle_ || !outer_attempt_leaf_authority_ ||
-        !quiescence.valid() ||
-        !quiescence.original_deadline().matches_clock(config_.clock_identity))
-        return std::nullopt;
-    return outer_lifecycle_->join_attempt_leaf_retirement(
-        std::move(quiescence), std::move(direct_worker_status),
-        empty_after_population, leaf_cleanup_complete, now);
 }
 
 InputLifecycleStatus DaemonSidecarAdapter::map_input_control_status(
@@ -3210,7 +3021,6 @@ void DaemonSidecarAdapter::outer_apply_action(
         // allocator incarnation.
         outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         outer_observe(pending_advertisement_update_);
         break;
@@ -3351,7 +3161,6 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_ready_lease_.reset();
         outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         break;
     case sidecar::LifecycleAction::EnterDegradedLegacy:
@@ -3387,7 +3196,6 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_pid_ = outer_pgid_ = -1;
         outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         outer_cleanup_waiting_path_observation_ = false;
         if (outer_listener_inode_ != 0)
@@ -3420,7 +3228,6 @@ void DaemonSidecarAdapter::outer_apply_action(
         outer_auth_start_pending_ = false;
         outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         // Keep cleanup disarmed until an independent authority proves both
         // group and path absence.  FailedClosed remains an explicit HOLD.
@@ -3574,7 +3381,6 @@ bool DaemonSidecarAdapter::outer_immediate_turn_required() const noexcept
            outer_shutdown_input_close_pending_ ||
            outer_replacement_input_close_pending_ ||
            outer_auth_start_pending_ || outer_auth_failure_ ||
-           outer_input_cancel_lease_.has_value() ||
            outer_identity_report_pending_ || outer_launch_failed_ ||
            (outer_ready_complete_ && !outer_ready_invalid_ &&
             lifecycle_state == sidecar::LifecycleState::ForkedAwaitExecAndReady);
@@ -3655,7 +3461,6 @@ bool DaemonSidecarAdapter::outer_advance_input(
                 trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
                 outer_input_operation_.reset();
                 outer_input_request_.reset();
-                outer_input_cancel_lease_.reset();
                 // Every control/input failure is an incarnation observation,
                 // not a private retry authority.  Route it through the same
                 // withdrawal/teardown reducer as scheduler/runtime loss so a
@@ -3668,7 +3473,6 @@ bool DaemonSidecarAdapter::outer_advance_input(
         } catch (...) {
             outer_input_operation_.reset();
             outer_input_request_.reset();
-            outer_input_cancel_lease_.reset();
             retire_input_lifecycle_relationship(AdapterError::InputLifecycleCapacity);
             outer_action_taken_ = true;
             return true;
@@ -3792,7 +3596,6 @@ bool DaemonSidecarAdapter::outer_advance_input(
     }
     outer_input_operation_.reset();
     outer_input_request_.reset();
-    outer_input_cancel_lease_.reset();
     (void)update;
     return true;
 }
@@ -4004,48 +3807,6 @@ bool DaemonSidecarAdapter::outer_advance_turn(
             *result = update;
         return state_ == AdapterState::Ready;
     }
-    if (outer_input_cancel_lease_.has_value() && !reaper_delivery_pending) {
-        // Cancellation is posted by the role owner, but the owner performs
-        // the descriptor close and common-retirement transition only from its
-        // serialized outer turn.  Revalidate the complete lease before doing
-        // anything: a late timer/completion from A cannot cancel B after the
-        // role slot has been reused.
-        const auto current = outer_input_operation_lease();
-        if (!current.has_value() || *current != *outer_input_cancel_lease_) {
-            outer_input_cancel_lease_.reset();
-        } else {
-            if (!outer_input_request_.has_value() &&
-                pending_input_lifecycle_.empty()) {
-                outer_input_cancel_lease_.reset();
-                outer_observe(update);
-                if (result != nullptr)
-                    *result = update;
-                return state_ == AdapterState::Ready;
-            }
-            const InputLifecycleRequest request =
-                outer_input_request_.value_or(pending_input_lifecycle_.front());
-            if (outer_input_operation_ != nullptr)
-                outer_input_operation_.reset();
-            if (!pending_input_lifecycle_.empty() &&
-                pending_input_lifecycle_.front() == request)
-                pending_input_lifecycle_.erase(pending_input_lifecycle_.begin());
-            outer_input_request_.reset();
-            outer_last_input_lifecycle_result_ = InputLifecycleResult{
-                InputLifecycleStatus::Disconnected, request};
-            trace_lifecycle_emit_terminal(*outer_last_input_lifecycle_result_);
-            outer_input_cancel_lease_.reset();
-            // Explicit cancellation is an input-lifecycle failure and enters
-            // the same A withdrawal/teardown reducer as timeout, EOF, and
-            // malformed control.  It never starts a local retry or B.
-            retire_input_lifecycle_relationship(
-                AdapterError::InputLifecycleProtocol);
-            outer_action_taken_ = true;
-            outer_observe(update);
-            if (result != nullptr)
-                *result = update;
-            return state_ == AdapterState::Ready;
-        }
-    }
     if (outer_cleanup_phase_ != 0 && !reaper_delivery_pending) {
         const bool cleanup_action = outer_cleanup_exact();
         if (cleanup_action)
@@ -4075,7 +3836,6 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         if (outer_input_operation_ != nullptr)
             outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         outer_shutdown_input_close_pending_ = false;
         outer_action_taken_ = true;
@@ -4092,7 +3852,6 @@ bool DaemonSidecarAdapter::outer_advance_turn(
         if (outer_input_operation_ != nullptr)
             outer_input_operation_.reset();
         outer_input_request_.reset();
-        outer_input_cancel_lease_.reset();
         pending_input_lifecycle_.clear();
         outer_replacement_input_close_pending_ = false;
         outer_action_taken_ = true;

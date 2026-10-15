@@ -130,41 +130,11 @@ struct Config {
     // value is retained for standalone adapter tests; the outer-loop path
     // still uses exact pid/PGID identity and never performs a local reap.
     sidecar::CentralChildReaperRegistry* central_reaper = nullptr;
-    // The compiler-attempt leaf owner is an independent authority.  The
-    // adapter only routes its typed capabilities; it never creates a local
-    // InputAttachmentCore or treats caller booleans as cgroup proof.
-    std::shared_ptr<sidecar::AttemptLeafAuthority> attempt_leaf_authority;
 };
 
 struct PublicListenerObservation {
     bool bound = false;
     uint32_t port = 0;
-};
-
-// Proof supplied by the future compiler-attempt reducer before it may ask the
-// sidecar owner to install B.  The adapter does not infer any of these facts
-// from a timeout or a PID alone; every field is an independent exact-A
-// retirement observation.
-struct InputRetirementProof {
-    RemoteInputLeaseBinding binding{};
-    // Final proof from the authoritative attempt-leaf/reaper lane.  A
-    // shared immutable handle preserves replay identity while the contained
-    // OUTPUT_QUIESCENCE_GRANTED and consumed exact-pid status remain
-    // non-forgeable move-only capabilities.
-    std::shared_ptr<const sidecar::AttemptLeafRetirementJoin> leaf_join;
-    bool direct_worker_status_consumed = false;
-    bool process_group_absent = false;
-    bool control_closed = false;
-    bool input_fd_closed = false;
-    bool path_absent = false;
-    bool store_generation_current = false;
-
-    [[nodiscard]] bool complete() const noexcept {
-        return binding.valid() && leaf_join != nullptr && leaf_join->valid() &&
-               leaf_join->matches(binding.identity) && direct_worker_status_consumed &&
-               process_group_absent && control_closed && input_fd_closed &&
-               path_absent && store_generation_current;
-    }
 };
 
 class DaemonSidecarAdapter {
@@ -290,39 +260,6 @@ public:
     [[nodiscard]] bool outer_input_operation_active() const noexcept {
         return outer_input_operation_ != nullptr;
     }
-    // The lease is the operation-scoped owner/cancellation identity carried
-    // into a future adopted endpoint.  It is returned only for the current
-    // queued/active operation; a timer or completion holding an older lease
-    // cannot affect a reused attempt role slot.
-    [[nodiscard]] std::optional<InputLifecycleOperationLease>
-    outer_input_operation_lease() const noexcept;
-    [[nodiscard]] std::optional<sidecar::AbsoluteMonotonicDeadline>
-    outer_input_absolute_deadline() const noexcept;
-    // Posts cancellation to this adapter's owner.  The call performs no I/O;
-    // the next outer turn closes the exact dialogue and routes its failure
-    // through the common A-retirement reducer.  A stale lease is rejected.
-    [[nodiscard]] bool outer_cancel_input_operation(
-        const InputLifecycleOperationLease& lease) noexcept;
-    [[nodiscard]] std::chrono::steady_clock::time_point
-    outer_input_next_deadline() const noexcept;
-
-    // Typed attempt-leaf boundary for the future compiler reducer.  The
-    // central reaper remains the only source of DirectWorkerStatusConsumed;
-    // these methods only route the authoritative owner and perform no wait,
-    // poll, or descriptor operation.
-    [[nodiscard]] std::optional<sidecar::OutputQuiescenceGranted>
-    outer_grant_output_quiescence(
-        const sidecar::AttemptControlBinding& control,
-        const sidecar::AttemptLeafCensus& census,
-        const sidecar::LocalDrainedObservation& drained,
-        const sidecar::AbsoluteMonotonicDeadline& original_deadline) const noexcept;
-    [[nodiscard]] std::optional<sidecar::AttemptLeafRetirementJoin>
-    outer_join_attempt_leaf_retirement(
-        sidecar::OutputQuiescenceGranted quiescence,
-        sidecar::DirectWorkerStatusConsumed direct_worker_status,
-        bool empty_after_population,
-        bool leaf_cleanup_complete,
-        std::chrono::steady_clock::time_point now) const noexcept;
 
     // Opens a fresh authenticated control relationship for one exact committed
     // InputRecord.  It neither consumes nor replaces the dispatcher relationship
@@ -345,22 +282,6 @@ public:
         const InputFdRequest& lease,
         InputLifecycleAction action) noexcept;
 
-    // Typed, incremental sidecar InputRecord retirement lane.  PREPARE keeps
-    // the exact A InputRecord open and installs no B.  COMMIT is admitted only
-    // with a complete local proof for that same A binding.  CLOSE is a
-    // separate logical lease operation.  All three return Disconnected while
-    // queued and expose progress through outer_*()/take_outer_*(); none opens
-    // a synchronous helper or creates daemon-local InputAttachmentCore state.
-    [[nodiscard]] InputLifecycleResult outer_prepare_attempt_retirement(
-        RemoteInputLeaseBinding binding,
-        const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept;
-    [[nodiscard]] InputLifecycleResult outer_commit_attempt_replacement(
-        RemoteInputLeaseBinding binding, InputLeaseOwner replacement_owner,
-        const InputRetirementProof& proof,
-        const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept;
-    [[nodiscard]] InputLifecycleResult outer_close_logical_input_lease(
-        RemoteInputLeaseBinding binding,
-        const sidecar::AbsoluteMonotonicDeadline& original_deadline) noexcept;
     [[nodiscard]] size_t pending_input_lifecycle_count() const noexcept {
         return pending_input_lifecycle_.size();
     }
@@ -509,7 +430,6 @@ private:
     std::vector<InputLifecycleRequest> completed_input_lifecycle_;
     std::optional<InputLifecycleRequest> outer_input_request_;
     std::unique_ptr<local::DaemonControlOperation> outer_input_operation_;
-    std::optional<InputLifecycleOperationLease> outer_input_cancel_lease_;
     std::optional<InputLifecycleResult> outer_last_input_lifecycle_result_;
     bool outer_input_failure_ = false;
     advertisement::Update pending_advertisement_update_{};
@@ -517,7 +437,6 @@ private:
     // The live production path below owns exactly one incremental reducer and
     // no local waitpid/reap loop.
     std::shared_ptr<sidecar::KillDomainVerifier> outer_kill_domain_;
-    std::shared_ptr<sidecar::AttemptLeafAuthority> outer_attempt_leaf_authority_;
     std::unique_ptr<sidecar::SidecarLifecycle> outer_lifecycle_;
     sidecar::CentralChildReaperRegistry* outer_reaper_ = nullptr;
     // Configuration is validated once at construction.  Re-running the
