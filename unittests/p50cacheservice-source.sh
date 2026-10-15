@@ -102,7 +102,8 @@ echo 'ok - P29 fingerprint completes before cache-service READY'
 
 endpoint_cap_line=$(grep -n -F \
     'route_endpoint_identities_.size() >=' "$impl" | head -n 1 | cut -d: -f1)
-source_read_line=$(grep -n -F 'const auto source_bytes = read_source_fd(' \
+# The prep-ahead hoist (52b9c269) dropped the call's 'const auto'.
+source_read_line=$(grep -n -F 'source_bytes = read_source_fd(' \
     "$impl" | head -n 1 | cut -d: -f1)
 f_open_line=$(grep -n -F 'const int first_fd = open_armed(' \
     "$impl" | head -n 1 | cut -d: -f1)
