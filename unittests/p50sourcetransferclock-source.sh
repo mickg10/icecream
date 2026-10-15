@@ -16,13 +16,20 @@ for file in "$remote" "$control" "$service"; do
 done
 
 # No client code may bind a transfer to a host clock identity: patience is a
-# duration, anchored by the receiver.
-for needle in 'process_monotonic_clock_identity' 'AbsoluteMonotonicDeadline' \
-              '/proc/self/ns/time'; do
-    if grep -rnF "$needle" "$root/client" --include='*.cpp' --include='*.h' \
-        >/dev/null 2>&1; then
-        echo "FAIL: client sources mention $needle" >&2
-        grep -rnF "$needle" "$root/client" --include='*.cpp' --include='*.h' >&2
+# duration, anchored by the receiver.  The clock-identity type is retired
+# tree-wide, so no production source may mention it at all: every local
+# deadline is a plain steady_clock time_point inside one process.
+for needle in '/proc/self/ns/time' 'process_monotonic_clock_identity' \
+              'MonotonicClockIdentity' 'AbsoluteMonotonicDeadline' \
+              'MonotonicObservation' 'SystemMonotonicObservationSource' \
+              'matches_clock'; do
+    if grep -rnF "$needle" "$root/client" "$root/cache" "$root/daemon" \
+        "$root/scheduler" "$root/services" \
+        --include='*.cpp' --include='*.h' >/dev/null 2>&1; then
+        echo "FAIL: production sources mention $needle" >&2
+        grep -rnF "$needle" "$root/client" "$root/cache" "$root/daemon" \
+            "$root/scheduler" "$root/services" \
+            --include='*.cpp' --include='*.h' >&2
         exit 1
     fi
 done
@@ -55,11 +62,4 @@ for needle in 'transfer_source_on_owner' 'encode_control_operation'; do
         exit 1
     fi
 done
-for needle in 'process_monotonic_clock_identity' 'matches_clock'; do
-    if printf '%s' "$region" | grep -Fq "$needle"; then
-        echo "FAIL: sidecar SourceTransfer handler mentions $needle" >&2
-        exit 1
-    fi
-done
-
 echo 'PASS: SourceTransfer patience clock source gates hold'

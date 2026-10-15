@@ -7,7 +7,6 @@
 
 #include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
-#include "p50_sidecar_identity.h"
 #include "services/comm.h"
 
 #include <algorithm>
@@ -159,9 +158,6 @@ struct ControlOperation {
     ControlCancellationReason cancellation_reason =
         ControlCancellationReason::Requested;
     ControlBindingPlaceholder binding_placeholder{};
-    // SourceTransfer never carries a clock value; this stays zero on the wire
-    // and only the encode/decode invariant checks below read it.
-    sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
     std::optional<P50SourceTransferRequest> source_arm;
     std::optional<P50SourceTransferResult> source_result;
     // SourceTransfer only: how much longer the sender will wait, measured
@@ -268,7 +264,7 @@ inline ControlOperation make_cache_session_operation(Identity identity,
                              ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {},
-                             {}, std::nullopt, std::nullopt, 0};
+                             std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_fd_attachment_operation(
@@ -279,7 +275,7 @@ inline ControlOperation make_input_fd_attachment_operation(
                              std::nullopt, ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {},
-                             {}, std::nullopt, std::nullopt, 0};
+                             std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_lifecycle_operation(
@@ -290,7 +286,7 @@ inline ControlOperation make_input_lifecycle_operation(
                              ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {},
-                             {}, std::nullopt, std::nullopt, 0};
+                             std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_lifecycle_reply_operation(
@@ -301,7 +297,7 @@ inline ControlOperation make_input_lifecycle_reply_operation(
                              request.action, status, ControlOperationRole::Sidecar,
                              ControlCancelTargetRole::FSession,
                              ControlCancellationReason::Requested, {},
-                             {}, std::nullopt, std::nullopt, 0};
+                             std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_operation_cancel_operation(
@@ -316,7 +312,7 @@ inline ControlOperation make_operation_cancel_operation(
                             std::nullopt, std::nullopt, InputLifecycleAction::None,
                             std::nullopt, sender_role, target_role,
                             reason, binding_placeholder,
-                            {}, std::nullopt, std::nullopt, 0};
+                            std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_source_transfer_operation(
@@ -328,7 +324,7 @@ inline ControlOperation make_source_transfer_operation(
                                ControlOperationRole::Daemon,
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {},
-                               {}, std::nullopt, std::nullopt, 0};
+                               std::nullopt, std::nullopt, 0};
     operation.source_patience_ms = patience_ms;
     operation.source_arm = arm;
     return operation;

@@ -50,7 +50,7 @@ echo 'ok - adopted endpoint has no accept/read/reducer duplicate'
 mutant=$(mktemp "${TMPDIR:-/tmp}/p50endpoint-mutant.XXXXXX")
 trap 'rm -f "$mutant"' EXIT HUP INT TERM
 perl -0pe \
-    's{co_return co_await run_connected\(std::move\(socket\), std::move\(registration\),\n                                     std::move\(control\), nullptr, std::nullopt,\n                                     std::nullopt\);}{co_return ServerRunResult{}; /* deletion mutant */}s' \
+    's{co_return co_await run_connected\(std::move\(socket\), std::move\(registration\),\n                                     std::move\(control\), nullptr\);}{co_return ServerRunResult{}; /* deletion mutant */}s' \
     "$endpoint" >"$mutant"
 if cmp -s "$endpoint" "$mutant"; then
     echo 'FAIL: socket-overload reducer-deletion mutant did not apply' >&2
@@ -64,13 +64,10 @@ fi
 echo 'ok - deleting adopted delegation is rejected'
 
 adopted_body=$body
-connected_body=$(function_body_containing 'std::optional<CStoreGuid> expected_c_store_guid' \
+connected_body=$(function_body_containing 'P50ServerEndpoint::run_connected(' \
     "$endpoint")
 test -n "$adopted_body"
 test -n "$connected_body"
-grep -F 'timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)' \
-    "$endpoint" >/dev/null
-grep -F 'timerfd_settime(timer_fd, TFD_TIMER_ABSTIME' "$endpoint" >/dev/null
 grep -F '::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)' "$endpoint" >/dev/null
 grep -F '::fcntl(owner_notification.get(), F_DUPFD_CLOEXEC, 0)' \
     "$endpoint" >/dev/null
@@ -82,7 +79,6 @@ if grep -F 'asio::post(owner_executor' "$endpoint" >/dev/null; then
     exit 1
 fi
 for law in \
-    'io->deadline_timer.async_wait' \
     'require_operation();' \
     'begin_materialization' \
     'co_await async_materialize' \

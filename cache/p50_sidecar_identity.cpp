@@ -1,31 +1,8 @@
 #include "p50_sidecar_identity.h"
 
 #include <limits>
-#include <time.h>
 
 namespace icecc::p50::sidecar {
-
-std::optional<MonotonicObservation>
-SystemMonotonicObservationSource::observe() noexcept {
-    timespec sample{};
-    if (::clock_gettime(CLOCK_MONOTONIC, &sample) != 0 || sample.tv_sec < 0 ||
-        sample.tv_nsec < 0 || sample.tv_nsec >= 1000000000L)
-        return std::nullopt;
-
-    constexpr int64_t kNanosPerSecond = 1000000000;
-    if (static_cast<uint64_t>(sample.tv_sec) >
-        static_cast<uint64_t>((std::numeric_limits<int64_t>::max() -
-                               kNanosPerSecond + 1) /
-                              kNanosPerSecond))
-        return std::nullopt;
-
-    const int64_t seconds = static_cast<int64_t>(sample.tv_sec);
-    const int64_t now_ns = seconds * kNanosPerSecond + sample.tv_nsec;
-    const MonotonicClockIdentity clock = process_monotonic_clock_identity();
-    MonotonicObservation observation{now_ns, clock};
-    return observation.valid() ? std::optional<MonotonicObservation>(observation)
-                               : std::nullopt;
-}
 
 LaunchIdentityAllocator::LaunchIdentityAllocator(
     uint64_t generation, uint64_t first_attempt,

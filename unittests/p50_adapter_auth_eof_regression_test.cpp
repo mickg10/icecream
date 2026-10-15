@@ -173,8 +173,6 @@ int main()
     config.expected_service_gid = config.expected_daemon_gid;
     config.public_listener_port = 0;
     config.readiness_timeout = std::chrono::milliseconds(5000);
-    config.clock_identity =
-        icecc::p50::sidecar::process_monotonic_clock_identity();
 
     if (!DaemonSidecarAdapter::valid_config(config))
         return 3;

@@ -686,8 +686,6 @@ int main()
     // Match daemon/main.cpp: the real service may spend up to two seconds
     // fingerprinting before READY, longer than the adapter's generic default.
     config.readiness_timeout = std::chrono::milliseconds(5000);
-    config.clock_identity =
-        icecc::p50::sidecar::process_monotonic_clock_identity();
 
     if (!DaemonSidecarAdapter::valid_config(config))
         return 3;

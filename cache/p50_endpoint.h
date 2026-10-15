@@ -78,8 +78,6 @@ struct CompletionStamp {
     AsyncOperationKind operation = AsyncOperationKind::Connect;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
-    std::optional<daemon::P50FSessionOperationId> cache_session_operation;
-    std::optional<sidecar::AbsoluteMonotonicDeadline> absolute_deadline;
     uint64_t session_serial = 0;
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};
@@ -97,8 +95,6 @@ struct CompletionLiveIdentity {
     ActorSide actor = ActorSide::C;
     CStoreGuid c_store_guid{};
     FStoreGuid f_store_guid{};
-    std::optional<daemon::P50FSessionOperationId> cache_session_operation;
-    std::optional<sidecar::AbsoluteMonotonicDeadline> absolute_deadline;
     uint64_t session_serial = 0;
     HistoryNonce history_nonce{};
     RelSeq rel_seq{};
@@ -866,9 +862,7 @@ private:
 
     boost::asio::awaitable<ServerRunResult> run_connected(
         boost::asio::ip::tcp::socket socket, SessionRegistration registration,
-        EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor,
-        std::optional<sidecar::AbsoluteMonotonicDeadline> deadline,
-        std::optional<CStoreGuid> expected_c_store_guid);
+        EndpointIoControl control, boost::asio::ip::tcp::acceptor* acceptor);
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

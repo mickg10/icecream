@@ -5444,8 +5444,6 @@ bool Daemon::configure_cache_adapter() noexcept
         // the rolling outer budget still permits transient recovery.
         config.max_attempts_per_recovery = 1;
         config.central_reaper = &cache_child_reaper;
-        config.clock_identity =
-            icecc::p50::sidecar::process_monotonic_clock_identity();
         // M1 (child), M2 (input), and M3 (random): the once-decided platform
         // mitigation backends, threaded down to this adapter's own
         // OuterKillDomainVerifier, the sidecar launch (--input-backend), and

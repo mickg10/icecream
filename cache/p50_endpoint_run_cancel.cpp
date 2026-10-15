@@ -14,9 +14,11 @@ EndpointRunRegistry::EndpointRunRegistry(size_t max_live_runs)
 }
 
 std::optional<EndpointRunHandle> EndpointRunRegistry::admit(
-    EndpointRunIdentity identity, sidecar::AbsoluteMonotonicDeadline deadline,
+    EndpointRunIdentity identity,
+    std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<EndpointSocketTarget> socket, uint64_t timer_identity) {
-    if (!identity.valid() || !deadline.valid() || !socket)
+    if (!identity.valid() ||
+        deadline == std::chrono::steady_clock::time_point{} || !socket)
         return std::nullopt;
     if (active_runs_.size() >= max_live_runs_ || active_runs_.contains(identity))
         return std::nullopt;

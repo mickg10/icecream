@@ -741,8 +741,6 @@ DaemonSidecarAdapter::DaemonSidecarAdapter(Config config) noexcept
     : config_(std::move(config))
 {
     try {
-        if (!config_.clock_identity.valid())
-            config_.clock_identity = sidecar::process_monotonic_clock_identity();
         launch_identities_ = std::make_shared<sidecar::LaunchIdentityAllocator>(
             config_.generation, 1, config_.entropy_provider);
         outer_kill_domain_ = std::make_shared<OuterKillDomainVerifier>(
@@ -870,8 +868,6 @@ std::string DaemonSidecarAdapter::config_refusal_reason(const Config& config) no
              << " differs from the daemon gid " << config.expected_daemon_gid;
         return text.str();
     }
-    if (!config.clock_identity.valid())
-        return "clock identity is invalid";
     if (config.entropy_provider == nullptr)
         return "entropy provider is not set";
     if (!bounded_positive(config.readiness_timeout))

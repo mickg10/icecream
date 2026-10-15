@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -53,8 +54,8 @@ EndpointRunIdentity identity(SidecarLaunchIdentity incarnation,
     return result;
 }
 
-const sidecar::AbsoluteMonotonicDeadline deadline(uint64_t n) {
-    return {static_cast<int64_t>(n), 1, 1};
+const std::chrono::steady_clock::time_point deadline(uint64_t n) {
+    return std::chrono::steady_clock::time_point{std::chrono::nanoseconds{n}};
 }
 
 void require(bool value, const char* message) {

@@ -151,7 +151,7 @@ public:
     [[nodiscard]] const EndpointRunIdentity& identity() const noexcept {
         return identity_;
     }
-    [[nodiscard]] const sidecar::AbsoluteMonotonicDeadline& deadline() const noexcept {
+    [[nodiscard]] const std::chrono::steady_clock::time_point& deadline() const noexcept {
         return deadline_;
     }
     [[nodiscard]] EndpointCancelPermit permit(EndpointCancelReason reason) const noexcept {
@@ -160,13 +160,13 @@ public:
 
 private:
     EndpointRunHandle(EndpointRunIdentity identity,
-                      sidecar::AbsoluteMonotonicDeadline deadline,
+                      std::chrono::steady_clock::time_point deadline,
                       uint64_t observation_id) noexcept
         : identity_(std::move(identity)), deadline_(deadline),
           observation_id_(observation_id) {}
 
     EndpointRunIdentity identity_{};
-    sidecar::AbsoluteMonotonicDeadline deadline_{};
+    std::chrono::steady_clock::time_point deadline_{};
     uint64_t observation_id_ = 0;
     friend class EndpointRunRegistry;
 };
@@ -175,7 +175,7 @@ class EndpointRunRegistry {
 public:
     struct Snapshot {
         EndpointRunIdentity identity{};
-        sidecar::AbsoluteMonotonicDeadline deadline{};
+        std::chrono::steady_clock::time_point deadline{};
         std::shared_ptr<EndpointSocketTarget> socket;
         EndpointRunPhase phase = EndpointRunPhase::Admitted;
         uint64_t timer_identity = 0;
@@ -190,7 +190,7 @@ public:
 
     [[nodiscard]] std::optional<EndpointRunHandle> admit(
         EndpointRunIdentity identity,
-        sidecar::AbsoluteMonotonicDeadline deadline,
+        std::chrono::steady_clock::time_point deadline,
         std::shared_ptr<EndpointSocketTarget> socket,
         uint64_t timer_identity = 0);
 

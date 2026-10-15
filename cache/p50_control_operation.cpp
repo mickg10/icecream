@@ -15,8 +15,7 @@ std::vector<uint8_t> encode_control_operation(
     if (!invalid && operation.kind == ControlOperationKind::CacheSession) {
         invalid = operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
-                  operation.lifecycle_result.has_value() ||
-                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
+                  operation.lifecycle_result.has_value();
     }
     if (!invalid && !source)
         invalid = operation.source_patience_ms != 0;
@@ -28,16 +27,14 @@ std::vector<uint8_t> encode_control_operation(
     }
     if (!invalid && operation.kind == ControlOperationKind::InputFdAttachment) {
         invalid = operation.lifecycle_action != InputLifecycleAction::None ||
-                  operation.lifecycle_result.has_value() ||
-                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
+                  operation.lifecycle_result.has_value();
     }
     if (!invalid && operation.kind == ControlOperationKind::InputLifecycle) {
         // input_lifecycle_action_valid() refuses the reserved retirement
         // actions 4-6, so no extension payload can accompany a live action.
         invalid = !input_lifecycle_action_valid(operation.lifecycle_action) ||
                   (operation.lifecycle_result.has_value() &&
-                   !detail::lifecycle_result_valid(*operation.lifecycle_result)) ||
-                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
+                   !detail::lifecycle_result_valid(*operation.lifecycle_result));
     }
     if (!invalid && cancel) {
         invalid = !detail::control_cancel_target_role_valid(operation.cancel_target_role) ||
@@ -45,8 +42,7 @@ std::vector<uint8_t> encode_control_operation(
                   !detail::control_role_valid(operation.sender_role) ||
                   operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
-                  operation.lifecycle_result.has_value() ||
-                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
+                  operation.lifecycle_result.has_value();
     }
     if (!invalid && source) {
         invalid = !operation.source_arm.has_value() ||
@@ -54,7 +50,6 @@ std::vector<uint8_t> encode_control_operation(
                   operation.request_id != operation.source_arm->source_request_id ||
                   operation.source_patience_ms == 0 ||
                   operation.source_patience_ms > kMaxSourceTransferPatienceMs ||
-                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{} ||
                   operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||

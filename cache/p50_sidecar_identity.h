@@ -1,7 +1,7 @@
 #pragma once
 
-// Clock and launch identity contracts shared by the daemon, sidecar service,
-// and lifecycle owners.  This header has no dependency on the synchronous
+// Launch identity contracts shared by the daemon, sidecar service, and
+// lifecycle owners.  This header has no dependency on the synchronous
 // Supervisor implementation.
 
 #include "p50_incarnation_identity.h"
@@ -18,77 +18,9 @@
 #include <string>
 #include <string_view>
 
-#include <sys/stat.h>
 #include <sys/types.h>
 
 namespace icecc::p50::sidecar {
-
-struct MonotonicClockIdentity {
-    uint64_t clock_domain_id = 0;
-    uint64_t time_namespace_id = 0;
-
-    [[nodiscard]] bool valid() const noexcept {
-        return clock_domain_id != 0 && time_namespace_id != 0;
-    }
-    friend bool operator==(const MonotonicClockIdentity&,
-                           const MonotonicClockIdentity&) = default;
-};
-
-[[nodiscard]] inline MonotonicClockIdentity
-process_monotonic_clock_identity() noexcept {
-    struct stat info{};
-    if (::stat("/proc/self/ns/time", &info) != 0)
-        return {};
-    const uint64_t namespace_id =
-        (static_cast<uint64_t>(info.st_dev) << 32) ^
-        static_cast<uint64_t>(info.st_ino);
-    if (namespace_id == 0)
-        return {};
-    return MonotonicClockIdentity{1, namespace_id};
-}
-
-struct AbsoluteMonotonicDeadline {
-    int64_t expires_at_ns = 0;
-    uint64_t clock_domain_id = 0;
-    uint64_t time_namespace_id = 0;
-
-    [[nodiscard]] bool valid() const noexcept {
-        return expires_at_ns > 0 && clock_domain_id != 0 &&
-               time_namespace_id != 0;
-    }
-    [[nodiscard]] bool matches_clock(uint64_t expected_clock_domain_id,
-                                     uint64_t expected_time_namespace_id) const noexcept {
-        return valid() && expected_clock_domain_id != 0 &&
-               expected_time_namespace_id != 0 &&
-               clock_domain_id == expected_clock_domain_id &&
-               time_namespace_id == expected_time_namespace_id;
-    }
-    [[nodiscard]] bool matches_clock(
-        const MonotonicClockIdentity& expected) const noexcept {
-        return expected.valid() &&
-               matches_clock(expected.clock_domain_id,
-                             expected.time_namespace_id);
-    }
-    [[nodiscard]] bool expired(int64_t now_ns, uint64_t observed_clock_domain_id,
-                               uint64_t observed_time_namespace_id) const noexcept {
-        return !matches_clock(observed_clock_domain_id, observed_time_namespace_id) ||
-               now_ns >= expires_at_ns;
-    }
-    [[nodiscard]] std::chrono::steady_clock::time_point as_steady_time_point() const noexcept {
-        return std::chrono::steady_clock::time_point{
-            std::chrono::nanoseconds{expires_at_ns}};
-    }
-    [[nodiscard]] static AbsoluteMonotonicDeadline from_steady_time_point(
-        std::chrono::steady_clock::time_point deadline,
-        uint64_t clock_domain_id, uint64_t time_namespace_id) noexcept {
-        const auto count = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            deadline.time_since_epoch()).count();
-        return AbsoluteMonotonicDeadline{count, clock_domain_id,
-                                         time_namespace_id};
-    }
-    friend bool operator==(const AbsoluteMonotonicDeadline&,
-                           const AbsoluteMonotonicDeadline&) = default;
-};
 
 namespace detail {
 
@@ -229,39 +161,6 @@ struct Counters {
     uint64_t post_ready_exits = 0;
     uint64_t shutdowns = 0;
     uint64_t forced_kills = 0;
-};
-
-// A sampled CLOCK_MONOTONIC reading together with the identity of the clock it
-// came from.  Observations are taken fresh at every decision point; a stored
-// observation is never renewed or extrapolated.
-struct MonotonicObservation {
-    int64_t now_ns = 0;
-    MonotonicClockIdentity clock{};
-
-    [[nodiscard]] bool valid() const noexcept {
-        return now_ns >= 0 && clock.valid();
-    }
-};
-
-// The source is move-only by ownership.  A production instance samples
-// CLOCK_MONOTONIC; tests inject a deterministic source with one fresh sample
-// per observation call.
-class MonotonicObservationSource {
-public:
-    virtual ~MonotonicObservationSource() = default;
-    MonotonicObservationSource(const MonotonicObservationSource&) = delete;
-    MonotonicObservationSource& operator=(const MonotonicObservationSource&) = delete;
-
-    [[nodiscard]] virtual std::optional<MonotonicObservation>
-    observe() noexcept = 0;
-
-protected:
-    MonotonicObservationSource() = default;
-};
-
-class SystemMonotonicObservationSource final : public MonotonicObservationSource {
-public:
-    [[nodiscard]] std::optional<MonotonicObservation> observe() noexcept override;
 };
 
 } // namespace icecc::p50::sidecar

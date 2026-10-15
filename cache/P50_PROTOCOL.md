@@ -310,10 +310,10 @@ role byte and must match the expected incarnation.
 One move-only Connection owns the socket and write path; concurrent sends
 return Busy. Descriptors are CLOEXEC, peer UID/GID (and the lease PID where
 required) are verified, and sends suppress SIGPIPE. Absolute steady-clock
-deadlines cover whole frames across partial operations. SourceTransfer
-serializes no host clock time_point: it carries only the sender's remaining
-patience as a u32 millisecond duration, which the receiver anchors to its
-own steady clock at decode, capped by the sidecar's own budget.
+deadlines cover whole frames across partial operations. No local frame
+serializes a host clock time_point: SourceTransfer carries only the sender's
+remaining patience as a u32 millisecond duration, which the receiver anchors
+to its own steady clock at decode, capped by the sidecar's own budget.
 Unsupported required OS facilities cause refusal.
 
 The CacheSession DATA operation remains a 32-byte version-1 envelope.

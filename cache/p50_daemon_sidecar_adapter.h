@@ -122,9 +122,6 @@ struct Config {
     uint32_t max_restarts = 3;
     uint32_t max_attempts_per_recovery = 16;
     size_t max_pending_input_lifecycle = 4096;
-    // Established once by the daemon process and inherited by the sidecar;
-    // typed cross-process deadlines must carry this exact pair.
-    sidecar::MonotonicClockIdentity clock_identity{};
 
     // Production iceccd supplies its one daemon-owned central reaper.  A null
     // value is retained for standalone adapter tests; the outer-loop path
@@ -211,8 +208,6 @@ public:
     void outer_request_shutdown(advertisement::Update* update = nullptr) noexcept;
     void outer_append_pollfds(std::vector<pollfd>& pollfds) const noexcept;
     [[nodiscard]] std::chrono::steady_clock::time_point outer_next_deadline() const noexcept;
-    [[nodiscard]] sidecar::MonotonicClockIdentity
-    monotonic_clock_identity() const noexcept { return config_.clock_identity; }
     [[nodiscard]] bool outer_observe_child_reaped(pid_t pid, int status,
                                                    bool echild = false) noexcept;
     [[nodiscard]] bool outer_observe_child_reaped(

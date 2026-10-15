@@ -72,7 +72,6 @@ void test_source_transfer_operation_wire() {
     CHECK(decoded.kind == local::ControlOperationKind::SourceTransfer);
     CHECK(decoded.source_arm == arm);
     CHECK(decoded.source_patience_ms == patience);
-    CHECK(decoded.absolute_deadline == sidecar::AbsoluteMonotonicDeadline{});
 
     // C control/store identity is supplied by the supervised sidecar, never
     // by this daemon request.  Any attempt to populate the reserved C slots
@@ -195,13 +194,6 @@ void test_source_transfer_reserved_bytes_refused() {
 void test_source_transfer_operation_encode_invariants() {
     const local::P50SourceTransferRequest arm = source_arm();
     const local::Identity identity{11, 12};
-
-    // SourceTransfer with a nonzero absolute deadline is refused.
-    auto legacy = local::make_source_transfer_operation(identity, arm, 5000);
-    legacy.absolute_deadline.expires_at_ns = 1;
-    legacy.absolute_deadline.clock_domain_id = 1;
-    legacy.absolute_deadline.time_namespace_id = 1;
-    CHECK(local::encode_control_operation(legacy).empty());
 
     // A non-SourceTransfer kind must not carry the patience.
     const auto cache = local::make_cache_session_operation(identity, 23);
