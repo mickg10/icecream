@@ -612,10 +612,11 @@ private:
     // CompatInvariantViolation, and the owner slot is unconditionally
     // removed here (inlining unregister_owner()'s erase logic rather than
     // calling it, since the caller already holds state_->mutex and the lock
-    // is non-reentrant). DirectWorker owners never have a live mailbox
-    // (register_direct_worker() always passes an expired one), so for them
-    // this call degrades to pid-slot hygiene only -- consistent with
-    // DirectWorker's existing "never retried" contract.
+    // is non-reentrant). The direct-worker registration lane that once fed
+    // this kind is retired; its reserved-arm contract is that such an owner
+    // carries no live mailbox (register_owner does not enforce this), so a
+    // violation degrades to pid-slot hygiene only, never a retried
+    // FailClosed delivery.
     void publish_compat_invariant_violation(
         pid_t pid, ReaperOwnerKey owner, uint64_t observed_starttime_ticks,
         bool observed_readable, int observed_errno) noexcept;

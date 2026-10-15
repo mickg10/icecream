@@ -638,9 +638,11 @@ public:
         // The outer group observation owns the single kill(-pgid, 0) probe
         // for this turn.  Keep this verifier callback pure: repeating an
         // fcntl()/kill() pair here would turn one reducer advance into hidden
-        // extra syscalls.  The cgroup-v2 no-descendant/singleton census and
-        // OUTPUT_QUIESCENCE_GRANTED proof remain an explicit integration
-        // HOLD until the authoritative leaf owner is joined. This holds
+        // extra syscalls.  The retired attempt-replacement lane was to supply
+        // a cgroup-v2 no-descendant/singleton census plus an explicit output
+        // quiescence proof from its authoritative leaf owner; that lane is
+        // gone, so for the kept kill-domain path the single group
+        // observation stays the whole proof, permanently.  This holds
         // identically for the M1 compat backend: record->captured() is a
         // capture-succeeded gate (native: a held pidfd; compat: an armed
         // (pid, starttime) handle), never a second gone-ness probe of its

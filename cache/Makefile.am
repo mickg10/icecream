@@ -63,8 +63,7 @@ libp50ownerwatchdog_a_SOURCES = p50_owner_watchdog.cpp p50_owner_watchdog.h
 libp50ownerwatchdog_a_CPPFLAGS = $(AM_CPPFLAGS)
 
 libp50endpoint_a_SOURCES = p50_endpoint.cpp p50_endpoint.h \
-	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h \
-	p50_sidecar_identity.cpp p50_sidecar_identity.h
+	p50_endpoint_run_cancel.cpp p50_endpoint_run_cancel.h
 libp50endpoint_a_CPPFLAGS = $(AM_CPPFLAGS) $(BOOST_CPPFLAGS)
 
 # Unit-only compatibility object for the pre-existing endpoint behavioral

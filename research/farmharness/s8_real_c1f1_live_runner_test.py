@@ -869,8 +869,6 @@ def test_batch_shell_excludes_warm_prewarm_and_carries_optional_repeat() -> None
     shell = (Path(__file__).resolve().parents[2] / "unittests/p50compilee2e-run.sh").read_text()
     runner_source = Path(__file__).resolve().parent.joinpath(
         "s8_real_c1f1_live_runner.py").read_text()
-    cache_service = (Path(__file__).resolve().parents[2] /
-                     "cache/p50_cache_service.cpp").read_text()
     sidecar_adapter = (Path(__file__).resolve().parents[2] /
                        "cache/p50_daemon_sidecar_adapter.cpp").read_text()
     assert "run_batch prewarm 0" in shell

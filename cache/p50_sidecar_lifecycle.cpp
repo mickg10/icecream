@@ -1190,11 +1190,10 @@ void CentralChildReaperRegistry::publish_compat_invariant_violation(
         // Best-effort delivery.  Whether or not it lands, the owner slot
         // below is removed unconditionally: an invariant violation is never
         // retried, so there is no reason to keep the pid slot occupied
-        // waiting for a mailbox that might stay full or expired (e.g. a
-        // DirectWorker owner, which never has a live mailbox at all -- see
-        // register_direct_worker()). This gives DirectWorker's "never
-        // retried" contract pid-slot hygiene even with no state machine to
-        // deliver a FailClosed signal into.
+        // waiting for a mailbox that might stay full or expired (e.g. an
+        // owner on the reserved direct-worker arm, which carries no live
+        // mailbox by contract). This gives that arm pid-slot hygiene even
+        // with no state machine to deliver a FailClosed signal into.
         (void)target->enqueue_violation(violation);
     }
     const size_t slot = iterator->second.slot;

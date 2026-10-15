@@ -8874,15 +8874,16 @@ bool Daemon::handle_compile_file(Client *client, Msg *msg)
             handle_end(client, 146);
             return false;
         }
-        // The compiler-attempt reducer has not yet joined the outer
-        // InputRecord attachment/result owner.  Do not invoke the historical
-        // whole-operation InputFdAttachmentClient here: that would perform a
-        // hidden connect/receive/SCM_RIGHTS exchange from iceccd and could
+        // The compiler-attempt attachment lane is permanently retired: its
+        // InputLifecycleAction values (4-6) stay reserved and are refused at
+        // decode, so no typed outer operation can ever be routed through
+        // DaemonSidecarAdapter here.  Do not invoke the historical
+        // whole-operation InputFdAttachmentClient either: that would perform
+        // a hidden connect/receive/SCM_RIGHTS exchange from iceccd and could
         // bind A bytes after the lifecycle has begun withdrawing them.
-        // Leave the exact source assignment unconsumed and fail closed until
-        // the future reducer supplies its original deadline and routes the
-        // typed outer operation through DaemonSidecarAdapter.
-        log_warning() << "P50 compiler input attachment unavailable until outer reducer is installed for job "
+        // Leaving the exact source assignment unconsumed and failing closed
+        // is the design, not a transitional state.
+        log_warning() << "P50 compiler input attachment unavailable (attempt lane retired) for job "
                       << job->jobID() << endl;
         if (client->status != Client::CLIENTWORK)
             finish_assignment_claim(job->jobID());

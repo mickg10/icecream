@@ -129,19 +129,16 @@ public:
     EndpointRunHandle(const EndpointRunHandle&) = delete;
     EndpointRunHandle& operator=(const EndpointRunHandle&) = delete;
     EndpointRunHandle(EndpointRunHandle&& other) noexcept
-        : identity_(std::move(other.identity_)), deadline_(other.deadline_),
+        : identity_(std::move(other.identity_)),
           observation_id_(other.observation_id_) {
         other.identity_ = {};
-        other.deadline_ = {};
         other.observation_id_ = 0;
     }
     EndpointRunHandle& operator=(EndpointRunHandle&& other) noexcept {
         if (this != &other) {
             identity_ = std::move(other.identity_);
-            deadline_ = other.deadline_;
             observation_id_ = other.observation_id_;
             other.identity_ = {};
-            other.deadline_ = {};
             other.observation_id_ = 0;
         }
         return *this;
@@ -151,22 +148,17 @@ public:
     [[nodiscard]] const EndpointRunIdentity& identity() const noexcept {
         return identity_;
     }
-    [[nodiscard]] const std::chrono::steady_clock::time_point& deadline() const noexcept {
-        return deadline_;
-    }
     [[nodiscard]] EndpointCancelPermit permit(EndpointCancelReason reason) const noexcept {
         return EndpointCancelPermit{identity_, observation_id_, reason};
     }
 
 private:
     EndpointRunHandle(EndpointRunIdentity identity,
-                      std::chrono::steady_clock::time_point deadline,
                       uint64_t observation_id) noexcept
-        : identity_(std::move(identity)), deadline_(deadline),
+        : identity_(std::move(identity)),
           observation_id_(observation_id) {}
 
     EndpointRunIdentity identity_{};
-    std::chrono::steady_clock::time_point deadline_{};
     uint64_t observation_id_ = 0;
     friend class EndpointRunRegistry;
 };
@@ -175,7 +167,6 @@ class EndpointRunRegistry {
 public:
     struct Snapshot {
         EndpointRunIdentity identity{};
-        std::chrono::steady_clock::time_point deadline{};
         std::shared_ptr<EndpointSocketTarget> socket;
         EndpointRunPhase phase = EndpointRunPhase::Admitted;
         uint64_t timer_identity = 0;

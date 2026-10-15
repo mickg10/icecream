@@ -2347,6 +2347,12 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             m = new P50CacheSessionFdRequestMsg;
         }
         break;
+    // The retired P5CL/P5CO claim/outcome values stay reserved (comm.h):
+    // no message type is constructed for them, so a forged frame leaves m
+    // unset and is refused at decode like any other unknown type.
+    case Msg::P50_CACHE_SESSION_CLAIM:
+    case Msg::P50_CACHE_SESSION_OUTCOME:
+        break;
     case Msg::VERIFY_ENV:
         m = new VerifyEnvMsg;
         break;

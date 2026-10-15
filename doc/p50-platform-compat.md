@@ -315,10 +315,13 @@ existing `>= 0`/equality check already written against it, with no new
 allocator or side-table), tag `Entry` and `ReapEvent` with a minimal
 `ChildHandleBackend backend` field so `reap_one()`'s two call sites into
 the pidfd-status probe can dispatch between the native `waitid(P_PIDFD,
-...)` and the compat `waitid(P_PID, ...)` shape above, and reject
-`register_direct_worker()` outright under compat (the DirectWorker/
-AttemptLeaf machinery it feeds has no production callers as of `c8bb615f`
-and is out of scope for this branch; it is not ported to compat at all).
+...)` and the compat `waitid(P_PID, ...)` shape above.  (A third item of
+the original direction — reject the direct-worker registration lane
+outright under compat — is void as of the 2026-10-14 retirement: that
+lane's dedicated registration API and the DirectWorker/AttemptLeaf
+machinery it fed were removed from the tree, leaving only the reserved
+`ReaperOwnerKind::DirectWorker` arm, which `register_owner()` already
+refuses for the Compat backend.)
 This is implementation in progress; it is recorded here before being
 coded, not after, per this branch's reporting discipline for any point
 where a compat path's guarantee needs a corrected mechanism to hold.
