@@ -4841,8 +4841,8 @@ void test_runtime_zstd_tu_af_unix_loopback() {
     CHECK(second_owner_id != second_caller_id);
 }
 
-// Regression coverage for the sidecar input-lifecycle retirement bug: a
-// non-retirement InputLifecycle action (e.g. CloseAcceptedJob) must get a
+// Regression coverage for the sidecar input-lifecycle budget bug: an
+// InputLifecycle action (e.g. CloseAcceptedJob) must get a
 // sidecar-local owner-apply budget sized from decode time (Options::
 // sidecar_lifecycle_apply_budget / ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS), not
 // the pre-decode 500ms handshake deadline. apply_input_lifecycle_on_owner()

@@ -7,6 +7,7 @@
 
 #include "p50_input_lifecycle.h"
 #include "p50_local_transport.h"
+#include "p50_sidecar_identity.h"
 #include "services/comm.h"
 
 #include <algorithm>
@@ -23,18 +24,17 @@ inline constexpr uint16_t kControlOperationVersionV2 = 2;
 // v3 is the first frozen OP_CANCEL shape: typed target role, bounded reason,
 // and the immutable binding placeholder.  No earlier draft is compatible.
 inline constexpr uint16_t kControlOperationVersionV3 = 3;
-// v4 carries the allocator-bound F-store and immutable-record identity for
-// incremental attempt retirement.  A new shape prevents a v2 peer from
-// silently dropping the proof binding.
+// Version-4/5 named the retired attempt-retirement envelope.  Both values
+// stay reserved forever so no future frame shape can alias them.
 inline constexpr uint16_t kControlOperationVersionV4 = 4;
-// v5 extends the retirement envelope with the unchanged absolute
-// CLOCK_MONOTONIC deadline and daemon/sidecar clock-namespace identity.
 inline constexpr uint16_t kControlOperationVersionV5 = 5;
 inline constexpr uint16_t kControlOperationVersionV6 = 6;
 inline constexpr size_t kCacheSessionOperationBytes = 32;
 inline constexpr size_t kLegacyInputFdAttachmentOperationBytes = 56;
 inline constexpr size_t kInputFdAttachmentOperationBytes = 88;
 inline constexpr size_t kInputLifecycleOperationBytes = 88;
+// The retired attempt-retirement envelope's 192-byte v5 shape.  Reserved so
+// no other operation can alias the size; a v5 frame is refused at decode.
 inline constexpr size_t kInputAttemptRetirementOperationBytes = 192;
 inline constexpr size_t kControlBindingPlaceholderBytes = 32;
 inline constexpr size_t kOperationCancelOperationBytes = 72;
@@ -159,13 +159,8 @@ struct ControlOperation {
     ControlCancellationReason cancellation_reason =
         ControlCancellationReason::Requested;
     ControlBindingPlaceholder binding_placeholder{};
-    // These extension fields are nonzero only for v4 retirement operations.
-    uint64_t f_store_generation = 0;
-    FStoreGuid f_store_guid{};
-    uint64_t immutable_size = 0;
-    Digest128 immutable_digest{};
-    uint64_t retirement_id = 0;
-    std::optional<InputLeaseOwner> replacement_owner;
+    // SourceTransfer never carries a clock value; this stays zero on the wire
+    // and only the encode/decode invariant checks below read it.
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
     std::optional<P50SourceTransferRequest> source_arm;
     std::optional<P50SourceTransferResult> source_result;
@@ -249,11 +244,9 @@ inline bool lifecycle_result_valid(
            status <= InputLifecycleApplyStatus::GenerationMismatch;
 }
 
-inline bool retirement_action(InputLifecycleAction action) noexcept {
-    return action == InputLifecycleAction::PrepareAttemptRetirement ||
-           action == InputLifecycleAction::CommitAttemptReplacement ||
-           action == InputLifecycleAction::CloseLogicalInputLease;
-}
+// input_lifecycle_action_valid() (p50_input_lifecycle.h) is the single
+// admission gate for lifecycle actions: it refuses the reserved values 4-6,
+// so a decoded InputLifecycle frame can only ever carry actions 1-3.
 
 inline bool source_result_code_valid(SourceTransferResultCode code) noexcept {
     return code == SourceTransferResultCode::Committed ||
@@ -274,8 +267,8 @@ inline ControlOperation make_cache_session_operation(Identity identity,
                              InputLifecycleAction::None, std::nullopt,
                              ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
-                             ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                             ControlCancellationReason::Requested, {},
+                             {}, std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_fd_attachment_operation(
@@ -285,46 +278,30 @@ inline ControlOperation make_input_fd_attachment_operation(
                              key, owner, InputLifecycleAction::None,
                              std::nullopt, ControlOperationRole::Daemon,
                              ControlCancelTargetRole::FSession,
-                             ControlCancellationReason::Requested, {}, 0, {}, 0,
-                             {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                             ControlCancellationReason::Requested, {},
+                             {}, std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_lifecycle_operation(
     const InputLifecycleRequest& request) noexcept {
-    ControlOperation operation{ControlOperationKind::InputLifecycle, request.identity,
-                               request.operation_id, request.key, request.owner,
-                               request.action, std::nullopt,
-                               ControlOperationRole::Daemon,
-                               ControlCancelTargetRole::FSession,
-                               ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
-    operation.f_store_generation = request.f_store_generation;
-    operation.f_store_guid = request.f_store_guid;
-    operation.immutable_size = request.immutable_size;
-    operation.immutable_digest = request.immutable_digest;
-    operation.retirement_id = request.retirement_id;
-    operation.replacement_owner = request.replacement_owner;
-    operation.absolute_deadline = request.absolute_deadline;
-    return operation;
+    return ControlOperation{ControlOperationKind::InputLifecycle, request.identity,
+                             request.operation_id, request.key, request.owner,
+                             request.action, std::nullopt,
+                             ControlOperationRole::Daemon,
+                             ControlCancelTargetRole::FSession,
+                             ControlCancellationReason::Requested, {},
+                             {}, std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_input_lifecycle_reply_operation(
     const InputLifecycleRequest& request,
     InputLifecycleApplyStatus status) noexcept {
-    ControlOperation operation{ControlOperationKind::InputLifecycle, request.identity,
-                               request.operation_id, request.key, request.owner,
-                               request.action, status, ControlOperationRole::Sidecar,
-                               ControlCancelTargetRole::FSession,
-                               ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
-    operation.f_store_generation = request.f_store_generation;
-    operation.f_store_guid = request.f_store_guid;
-    operation.immutable_size = request.immutable_size;
-    operation.immutable_digest = request.immutable_digest;
-    operation.retirement_id = request.retirement_id;
-    operation.replacement_owner = request.replacement_owner;
-    operation.absolute_deadline = request.absolute_deadline;
-    return operation;
+    return ControlOperation{ControlOperationKind::InputLifecycle, request.identity,
+                             request.operation_id, request.key, request.owner,
+                             request.action, status, ControlOperationRole::Sidecar,
+                             ControlCancelTargetRole::FSession,
+                             ControlCancellationReason::Requested, {},
+                             {}, std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_operation_cancel_operation(
@@ -338,8 +315,8 @@ inline ControlOperation make_operation_cancel_operation(
     return ControlOperation{ControlOperationKind::OperationCancel, identity, request_id,
                             std::nullopt, std::nullopt, InputLifecycleAction::None,
                             std::nullopt, sender_role, target_role,
-                            reason, binding_placeholder, 0, {}, 0, {}, 0,
-                            std::nullopt, {}, std::nullopt, std::nullopt};
+                            reason, binding_placeholder,
+                            {}, std::nullopt, std::nullopt, 0};
 }
 
 inline ControlOperation make_source_transfer_operation(
@@ -350,8 +327,8 @@ inline ControlOperation make_source_transfer_operation(
                                InputLifecycleAction::None, std::nullopt,
                                ControlOperationRole::Daemon,
                                ControlCancelTargetRole::FSession,
-                               ControlCancellationReason::Requested, {}, 0, {}, 0,
-                               {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
+                               ControlCancellationReason::Requested, {},
+                               {}, std::nullopt, std::nullopt, 0};
     operation.source_patience_ms = patience_ms;
     operation.source_arm = arm;
     return operation;

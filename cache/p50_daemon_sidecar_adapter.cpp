@@ -1068,33 +1068,19 @@ InputLifecycleResult DaemonSidecarAdapter::apply_input_lifecycle(
     request.owner = lease.owner;
     request.action = action;
     request.deadline = std::chrono::steady_clock::now() + config_.input_lifecycle_timeout;
-    const bool retirement = action == InputLifecycleAction::PrepareAttemptRetirement ||
-        action == InputLifecycleAction::CommitAttemptReplacement ||
-        action == InputLifecycleAction::CloseLogicalInputLease;
-    if (retirement)
-        request.absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            request.deadline, config_.clock_identity.clock_domain_id,
-            config_.clock_identity.time_namespace_id);
     if (lease.identity.generation != config_.generation ||
         lease.identity.attempt == 0 || lease.key.c_store_guid == CStoreGuid{} ||
         !input_lease_owner_valid(lease.owner) || lease.request_id == 0 ||
         !input_lifecycle_action_valid(action))
         return InputLifecycleResult{InputLifecycleStatus::InvalidArgument, request};
-    if (action == InputLifecycleAction::PrepareAttemptRetirement ||
-        action == InputLifecycleAction::CommitAttemptReplacement ||
-        action == InputLifecycleAction::CloseLogicalInputLease)
-        return InputLifecycleResult{InputLifecycleStatus::RetirementProofRequired,
-                                    request};
     if (!next_input_lifecycle_operation(request.operation_id)) {
         return InputLifecycleResult{InputLifecycleStatus::StoreReplaced,
                                     request};
     }
-    // Legacy callers may still submit attempt-scoped cancel commands through
-    // this ABI, but the operation is always queued for the daemon outer loop.
-    // There is no synchronous InputLifecycleClient::apply() fallback and no
-    // Supervisor-owned transport path.  Extended PREPARE/COMMIT/CLOSE requests
-    // must use the typed methods below so their allocator-bound F identity and
-    // retirement proof cannot be omitted.
+    // Callers submit attempt-scoped cancel and terminal close commands through
+    // this ABI; the operation is always queued for the daemon outer loop.
+    // There is no synchronous lifecycle fallback and no Supervisor-owned
+    // transport path.
     return queue_outer_input_request(std::move(request));
 }
 
@@ -1218,20 +1204,12 @@ void DaemonSidecarAdapter::trace_lifecycle_emit_terminal(
 InputLifecycleResult DaemonSidecarAdapter::queue_outer_input_request(
     InputLifecycleRequest request) noexcept {
     const InputLifecycleResult invalid{InputLifecycleStatus::InvalidArgument, request};
-    const bool retirement_action =
-        request.action == InputLifecycleAction::PrepareAttemptRetirement ||
-        request.action == InputLifecycleAction::CommitAttemptReplacement ||
-        request.action == InputLifecycleAction::CloseLogicalInputLease;
     if (request.identity.generation != config_.generation ||
         request.identity.attempt == 0 || request.operation_id == 0 ||
         request.key.c_store_guid == CStoreGuid{} ||
         !input_lease_owner_valid(request.owner) ||
         !input_lifecycle_action_valid(request.action) ||
         request.deadline == std::chrono::steady_clock::time_point{} ||
-        (retirement_action &&
-         (!request.absolute_deadline.valid() ||
-          !request.absolute_deadline.matches_clock(config_.clock_identity) ||
-          request.deadline != request.absolute_deadline.as_steady_time_point())) ||
         request.deadline <= std::chrono::steady_clock::now())
         return invalid;
     if (request.identity.attempt != attempt_)
@@ -1249,25 +1227,13 @@ InputLifecycleResult DaemonSidecarAdapter::queue_outer_input_request(
         request.identity !=
             local::Identity{config_.generation, outer_ready_lease_->identity.attempt})
         return InputLifecycleResult{InputLifecycleStatus::StoreReplaced, request};
-    if (retirement_action &&
-        (request.f_store_generation != outer_ready_lease_->store_generation ||
-         request.f_store_guid != outer_ready_lease_->f_store_guid ||
-         request.key.c_store_guid != outer_ready_lease_->c_store_guid))
-        return InputLifecycleResult{InputLifecycleStatus::GenerationMismatch, request};
 
     const auto same_operation = [&](const InputLifecycleRequest& candidate) {
         return candidate.identity == request.identity &&
                candidate.key == request.key && candidate.owner == request.owner &&
                candidate.operation_id == request.operation_id &&
                candidate.action == request.action &&
-               candidate.f_store_generation == request.f_store_generation &&
-               candidate.f_store_guid == request.f_store_guid &&
-               candidate.immutable_size == request.immutable_size &&
-               candidate.immutable_digest == request.immutable_digest &&
-               candidate.retirement_id == request.retirement_id &&
-               candidate.replacement_owner == request.replacement_owner &&
-               candidate.deadline == request.deadline &&
-               candidate.absolute_deadline == request.absolute_deadline;
+               candidate.deadline == request.deadline;
     };
     // An operation id is a replay key, not an allocation hint.  A second
     // request carrying that id must either be byte-for-byte identical (and

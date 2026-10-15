@@ -10,16 +10,15 @@
 // strtoll-based parse), just with the sidecar's own env var name, default,
 // and clamp range.
 //
-// Context: non-retirement InputLifecycle actions (e.g. CloseAcceptedJob)
-// have no daemon-supplied absolute_deadline on the wire -- that is only ever
-// sent for the three retirement actions. Before this diagnostic, the sidecar
+// Context: InputLifecycle actions (e.g. CloseAcceptedJob) carry no
+// daemon-supplied deadline on the wire. Before this diagnostic, the sidecar
 // reused its 500ms pre-decode handshake deadline (kHandshakeMilliseconds) as
 // the budget for the owner-apply + reply + ack sequence of these ops too, even
 // though decode had already consumed part of that window. Under load this
 // occasionally landed a few ms past 500ms and handle_connection silently
 // closed the connection with no reply at all, which the daemon reads as EOF
 // (status=Disconnected) -- a relationship-fatal, non-retriable outcome that
-// retires the whole F sidecar for a single slow non-retirement reply.
+// retires the whole F sidecar for a single slow lifecycle reply.
 //
 // The fix is a *separate*, sidecar-local budget for this specific window,
 // measured from decode (not from the handshake deadline), sized to match the

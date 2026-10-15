@@ -582,13 +582,6 @@ bool DaemonControlOperation::read_lifecycle_reply(size_t& calls,
         observed.request_id != operation_.request_id ||
         observed.input != operation_.input || observed.owner != operation_.owner ||
         observed.lifecycle_action != operation_.lifecycle_action ||
-        observed.f_store_generation != operation_.f_store_generation ||
-        observed.f_store_guid != operation_.f_store_guid ||
-        observed.immutable_size != operation_.immutable_size ||
-        observed.immutable_digest != operation_.immutable_digest ||
-        observed.retirement_id != operation_.retirement_id ||
-        observed.replacement_owner != operation_.replacement_owner ||
-        observed.absolute_deadline != operation_.absolute_deadline ||
         !observed.lifecycle_result.has_value()) {
         fail(DaemonControlStatus::OperationMismatch);
         return false;

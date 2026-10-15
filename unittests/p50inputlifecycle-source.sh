@@ -19,13 +19,6 @@ gate() {
         grep -Fq 'CloseAcceptedJob' "$lifecycle_h" &&
         grep -Fq 'CancelJob' "$lifecycle_h" &&
         grep -Fq 'prepare_route_commit' "$lifecycle_cpp" &&
-        grep -Fq 'ObservePrepared' "$lifecycle_cpp" &&
-        grep -Fq 'CancelOrExpire' "$lifecycle_cpp" &&
-        grep -Fq 'SelectCommit' "$lifecycle_cpp" &&
-        grep -Fq 'CommitDurable' "$lifecycle_cpp" &&
-        grep -Fq 'SuppressDeliveryAfterCommit' "$lifecycle_cpp" &&
-        grep -Fq 'CancelledNoDurability' "$lifecycle_cpp" &&
-        grep -Fq 'CommitWon' "$lifecycle_cpp" &&
         grep -Fq 'retired_owners' "$lifecycle_cpp" &&
         grep -Fq 'ConflictingReplay' "$lifecycle_cpp" &&
         grep -Fq 'lease.attempt_cancelled' "$lifecycle_cpp" &&
@@ -37,6 +30,14 @@ grep -Fq 'kControlOperationVersionV1 = 1' "$control"
 grep -Fq 'kControlOperationVersionV2 = 2' "$control"
 grep -Fq 'kLegacyInputFdAttachmentOperationBytes = 56' "$control"
 grep -Fq 'kInputLifecycleOperationBytes = 88' "$control"
+grep -Fq 'kInputAttemptRetirementOperationBytes = 192' "$control"
+grep -Fq 'kControlOperationVersionV5 = 5' "$control"
+grep -Fq 'PrepareAttemptRetirement = 4' "$lifecycle_h"
+# The retired attempt-replacement lane is refused at decode: this exact
+# three-way comparison is the admission gate a v5/v2 frame must fail.
+grep -Fq 'action == InputLifecycleAction::CancelAttempt ||' "$lifecycle_h"
+grep -Fq 'action == InputLifecycleAction::CloseAcceptedJob ||' "$lifecycle_h"
+grep -Fq 'action == InputLifecycleAction::CancelJob;' "$lifecycle_h"
 grep -Fq 'wire.begin() + 84' "$control_cpp"
 grep -Fq 'input_lifecycle_.prepare_route_commit' "$service"
 grep -Fq 'owner_limits.max_retained_input_records' "$service"
@@ -73,14 +74,8 @@ for needle in \
     'ConflictingReplay' \
     'lease.attempt_cancelled' \
     'lease.job_closed' \
-    'ObservePrepared' \
-    'CancelOrExpire' \
-    'SelectCommit' \
-    'CommitDurable' \
-    'SuppressDeliveryAfterCommit' \
-    'CancelledNoDurability' \
-    'CommitWon' \
-    'prepare_route_commit'; do
+    'prepare_route_commit' \
+    '!input_lifecycle_action_valid(request.action)'; do
     mutant=$mutant_dir/lifecycle.cpp
     awk -v pattern="$needle" 'index($0, pattern) == 0' "$lifecycle_cpp" >"$mutant"
     if grep -Fq 'InputLeaseOwner' "$lifecycle_h" &&
@@ -92,13 +87,7 @@ for needle in \
        grep -Fq 'ConflictingReplay' "$mutant" &&
        grep -Fq 'lease.attempt_cancelled' "$mutant" &&
        grep -Fq 'lease.job_closed' "$mutant" &&
-       grep -Fq 'ObservePrepared' "$mutant" &&
-       grep -Fq 'CancelOrExpire' "$mutant" &&
-       grep -Fq 'SelectCommit' "$mutant" &&
-       grep -Fq 'CommitDurable' "$mutant" &&
-       grep -Fq 'SuppressDeliveryAfterCommit' "$mutant" &&
-       grep -Fq 'CancelledNoDurability' "$mutant" &&
-       grep -Fq 'CommitWon' "$mutant"; then
+       grep -Fq '!input_lifecycle_action_valid(request.action)' "$mutant"; then
         echo "FAIL: lifecycle deletion mutant survived: $needle" >&2
         exit 1
     fi

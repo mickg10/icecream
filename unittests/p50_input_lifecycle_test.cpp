@@ -1,19 +1,11 @@
 #include "cache/p50_control_operation.h"
 #include "cache/p50_input_lifecycle.h"
 
-#include <cerrno>
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <iostream>
-#include <stdexcept>
 #include <string_view>
-#include <thread>
-#include <atomic>
-#include <poll.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -360,61 +352,6 @@ void replacement_cycle_and_bounds() {
             "failed commit reservation leaked capacity");
 }
 
-void prepared_retirement_fences_attachment_until_replacement_commit() {
-    const local::Identity identity{91, 92};
-    const InputRecordKey input = key(19);
-    const InputLeaseOwner old_owner{1901, 1902, 1903};
-    const InputLeaseOwner replacement{1901, 1904, 1905};
-    const FStoreGuid f_store = Id128::from_u64(0xf500000000000017ULL);
-    InputLifecycleRegistry registry(4, 8);
-    registry.bind_store_identity(17, f_store);
-    require(registry.prepare_route_commit(input) ==
-                InputLifecycleCommitDecision::Open &&
-                registry.observe_route_commit(input, true) &&
-                registry.begin_attachment(input, old_owner, 1),
-            "prepared-retirement setup failed");
-    registry.finish_attachment(input, old_owner, 1, false);
-
-    auto retirement_request = request(
-        identity, input, old_owner, 1910,
-        InputLifecycleAction::PrepareAttemptRetirement);
-    retirement_request.f_store_generation = 17;
-    retirement_request.f_store_guid = f_store;
-    retirement_request.immutable_size = 23;
-    retirement_request.immutable_digest =
-        icecc::digest128("prepared-retirement-retained-input");
-    retirement_request.retirement_id = 1911;
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    retirement_request.absolute_deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            clock.clock_domain_id, clock.time_namespace_id);
-    retirement_request.deadline =
-        retirement_request.absolute_deadline.as_steady_time_point();
-    require(registry.begin_apply(retirement_request).status ==
-                InputLifecycleApplyStatus::Applied &&
-                registry.finish_apply(retirement_request, true),
-            "PREPARE did not quiesce the exact retained attempt");
-    require(!registry.begin_attachment(input, old_owner, 2),
-            "PREPARE left the retiring owner attachable before COMMIT");
-    require(!registry.begin_attachment(input, replacement, 2),
-            "uncommitted replacement owner attached before COMMIT");
-
-    InputLifecycleRequest commit = retirement_request;
-    commit.operation_id = 1912;
-    commit.action = InputLifecycleAction::CommitAttemptReplacement;
-    commit.replacement_owner = replacement;
-    require(registry.begin_apply(commit).status ==
-                InputLifecycleApplyStatus::Applied &&
-                registry.finish_apply(commit, true),
-            "replacement COMMIT failed after PREPARE");
-    require(!registry.begin_attachment(input, old_owner, 3),
-            "retired owner reattached after replacement COMMIT");
-    require(registry.begin_attachment(input, replacement, 3),
-            "committed replacement owner could not attach retained input");
-    registry.finish_attachment(input, replacement, 3, false);
-}
-
 void cancellation_racing_attachment_finalization_revokes_exact_owner() {
     for (const bool begin_before_cancel : {false, true}) {
     for (const bool acknowledged : {false, true}) {
@@ -451,253 +388,69 @@ void cancellation_racing_attachment_finalization_revokes_exact_owner() {
     }
 }
 
-InputLifecycleOperationLease refinement_lease(local::Identity identity,
-                                              InputRecordKey input,
-                                              InputLeaseOwner owner,
-                                              uint64_t operation_id) {
-    InputLifecycleRequest lifecycle_request = request(
-        identity, input, owner, operation_id,
-        InputLifecycleAction::PrepareAttemptRetirement);
-    lifecycle_request.f_store_generation = 17;
-    lifecycle_request.f_store_guid = Id128::from_u64(0xf500000000000017ULL);
-    lifecycle_request.immutable_size = 23;
-    lifecycle_request.immutable_digest =
-        icecc::digest128("p50-refinement-input-digest");
-    lifecycle_request.retirement_id = 29;
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    lifecycle_request.absolute_deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5),
-        clock.clock_domain_id, clock.time_namespace_id);
-    lifecycle_request.deadline = lifecycle_request.absolute_deadline.as_steady_time_point();
-    return make_input_lifecycle_operation_lease(lifecycle_request);
-}
 
-void refinement_cancel_commit_ordering() {
-    const local::Identity identity{31, 41};
-    const InputRecordKey input = key(31);
-    const InputLeaseOwner owner{301, 401, 501};
-    const InputLifecycleOperationLease cancel_lease =
-        refinement_lease(identity, input, owner, 601);
-    require(cancel_lease.valid(), "refinement operation lease was not valid");
+// The retired attempt-replacement lane stays wire-reserved but is refused
+// everywhere: a hand-minted 192-byte v5 frame no longer has a decode row,
+// a v2 InputLifecycle frame carrying action 4 is rejected by the admission
+// gate at decode, and encoding an InputLifecycle operation with action 4
+// yields no bytes at all.
+void retired_v5_lane_refused() {
+    using namespace icecc::p50::local;
+    const Identity identity{0x1011121314151617ULL, 0x2122232425262728ULL};
+    const InputRecordKey input = key(41);
+    const InputLeaseOwner owner{0x3132333435363738ULL,
+                                0x4142434445464748ULL,
+                                0x5152535455565758ULL};
 
-    InputLifecycleRegistry cancel_first(4, 8);
-    const auto prepared = cancel_first.ObservePrepared(cancel_lease, 701);
-    require(prepared.has_value() && prepared->valid() &&
-                prepared->decoder_touched && prepared->operation == cancel_lease,
-            "ObservePrepared did not mint an exact touched observation");
-    const auto replay = cancel_first.ObservePrepared(cancel_lease, 701);
-    require(replay.has_value() && *replay == *prepared,
-            "ObservePrepared exact replay changed its observation identity");
-    auto stale = cancel_lease;
-    stale.identity.attempt++;
-    require(!cancel_first.ObservePrepared(stale, 701).has_value(),
-            "stale operation was accepted by ObservePrepared");
-    require(cancel_first.CancelOrExpire(cancel_lease, prepared->observation_id) ==
-                InputLifecycleRefinementResult::CancelledNoDurability &&
-                cancel_first.refinement_state(cancel_lease) ==
-                    InputLifecycleRefinementState::CancelledNoDurability &&
-                !cancel_first.durable_bundle(cancel_lease).has_value(),
-            "cancel-first did not select profile-reset/no-durability state");
-    require(cancel_first.CancelOrExpire(cancel_lease, prepared->observation_id) ==
-                InputLifecycleRefinementResult::AlreadyCancelled &&
-                !cancel_first.SelectCommit(cancel_lease, prepared->observation_id)
-                     .has_value(),
-            "cancel-first state admitted a second commit");
+    std::vector<uint8_t> v5(kInputAttemptRetirementOperationBytes, 0);
+    put_u16(v5, 0, kControlOperationVersionV5);
+    put_u16(v5, 2, static_cast<uint16_t>(ControlOperationKind::InputLifecycle));
+    put_u32(v5, 4, static_cast<uint32_t>(v5.size()));
+    put_u64(v5, 8, identity.generation);
+    put_u64(v5, 16, identity.attempt);
+    put_u64(v5, 24, 4242);
+    std::copy(input.c_store_guid.bytes.begin(), input.c_store_guid.bytes.end(),
+              v5.begin() + 32);
+    put_u64(v5, 48, input.tu_seq.value);
+    put_u64(v5, 56, owner.logical_job);
+    put_u64(v5, 64, owner.assignment_epoch);
+    put_u64(v5, 72, owner.assignment_nonce);
+    put_u16(v5, 80,
+            static_cast<uint16_t>(InputLifecycleAction::PrepareAttemptRetirement));
+    ControlOperation decoded;
+    require(!decode_control_operation(v5, decoded),
+            "retired v5 retirement frame still decodes");
 
-    InputLifecycleRegistry commit_first(4, 8);
-    const auto committed_prepared =
-        commit_first.ObservePrepared(cancel_lease, 702);
-    require(committed_prepared.has_value(),
-            "commit-first preparation was not observed");
-    auto permit = commit_first.SelectCommit(
-        cancel_lease, committed_prepared->observation_id);
-    require(permit.has_value() && permit->valid() &&
-                commit_first.refinement_state(cancel_lease) ==
-                    InputLifecycleRefinementState::CommitSelected,
-            "SelectCommit did not mint one exact permit");
-    require(commit_first.CancelOrExpire(cancel_lease,
-                                        committed_prepared->observation_id) ==
-                InputLifecycleRefinementResult::CommitWon,
-            "cancel after commit selection did not preserve commit-wins");
+    std::vector<uint8_t> v2(kInputLifecycleOperationBytes, 0);
+    put_u16(v2, 0, kControlOperationVersionV2);
+    put_u16(v2, 2, static_cast<uint16_t>(ControlOperationKind::InputLifecycle));
+    put_u32(v2, 4, static_cast<uint32_t>(v2.size()));
+    put_u64(v2, 8, identity.generation);
+    put_u64(v2, 16, identity.attempt);
+    put_u64(v2, 24, 4243);
+    std::copy(input.c_store_guid.bytes.begin(), input.c_store_guid.bytes.end(),
+              v2.begin() + 32);
+    put_u64(v2, 48, input.tu_seq.value);
+    put_u64(v2, 56, owner.logical_job);
+    put_u64(v2, 64, owner.assignment_epoch);
+    put_u64(v2, 72, owner.assignment_nonce);
+    put_u16(v2, 80,
+            static_cast<uint16_t>(InputLifecycleAction::CommitAttemptReplacement));
+    require(!decode_control_operation(v2, decoded),
+            "v2 InputLifecycle frame with reserved action 5 was accepted");
+    put_u16(v2, 80,
+            static_cast<uint16_t>(InputLifecycleAction::CloseLogicalInputLease));
+    require(!decode_control_operation(v2, decoded),
+            "v2 InputLifecycle frame with reserved action 6 was accepted");
 
-    InputLifecycleDurableBundle bundle;
-    bundle.operation = cancel_lease;
-    bundle.prepared_id = committed_prepared->prepared_id;
-    bundle.observation_id = committed_prepared->observation_id;
-    bundle.permit_id = permit->permit_id();
-    bundle.durable_sequence = 801;
-    bundle.durable_digest = icecc::digest128("p50-refinement-durable-digest");
-    require(bundle.valid() &&
-                commit_first.CommitDurable(std::move(*permit), bundle) ==
-                    InputLifecycleRefinementResult::DurableCommitted &&
-                !permit->valid() &&
-                commit_first.durable_bundle(cancel_lease) == bundle,
-            "CommitDurable did not atomically retain the exact bundle");
-    require(commit_first.CancelOrExpire(cancel_lease,
-                                        committed_prepared->observation_id) ==
-                InputLifecycleRefinementResult::CommitWon &&
-                commit_first.SuppressDeliveryAfterCommit(
-                    cancel_lease, committed_prepared->observation_id) &&
-                commit_first.refinement_state(cancel_lease) ==
-                    InputLifecycleRefinementState::DeliverySuppressed &&
-                commit_first.SuppressDeliveryAfterCommit(bundle),
-            "commit-first durable state was not delivery-suppressed idempotently");
-    auto stale_bundle = bundle;
-    stale_bundle.operation.identity.attempt++;
-    require(!commit_first.SuppressDeliveryAfterCommit(stale_bundle),
-            "stale durable completion suppressed a replacement delivery");
-}
-
-void lifecycle_transport_round_trip() {
-    namespace fs = std::filesystem;
-    const char* temporary = std::getenv("TMPDIR");
-    const fs::path runtime =
-        fs::path(temporary != nullptr ? temporary : "/tmp") /
-        ("p50-input-lifecycle-" +
-         std::to_string(static_cast<unsigned long long>(::getpid())));
-    std::error_code error;
-    fs::remove_all(runtime, error);
-    require(fs::create_directory(runtime, error) && !error &&
-                ::chmod(runtime.c_str(), S_IRWXU) == 0,
-            "private lifecycle transport directory creation failed");
-    const std::string socket_path = (runtime / "lifecycle.sock").string();
-    local::Status listen_status = local::Status::InvalidArgument;
-    const int listener = local::listen_unix(socket_path, 3, &listen_status);
-    require(listener >= 0 && listen_status == local::Status::Ok,
-            "lifecycle transport listener setup failed");
-
-    const local::Identity identity{91, 17};
-    const InputLifecycleRequest operation = request(
-        identity, key(17), InputLeaseOwner{7001, 8001, 9001}, 41,
-        InputLifecycleAction::CloseAcceptedJob);
-    const local::CredentialExpectation peer{
-        static_cast<uint64_t>(::geteuid()), std::nullopt, std::nullopt};
-    std::atomic<bool> server_ok{true};
-    std::thread server([&] {
-        for (int turn = 0; turn != 3; ++turn) {
-            local::Status accept_status = local::Status::InvalidArgument;
-            local::Connection connection =
-                local::accept_unix(listener, &accept_status);
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            local::Frame hello;
-            const local::Status credentials = connection.valid()
-                ? connection.verify_peer_credentials(peer)
-                : local::Status::InvalidArgument;
-            const local::Status received = connection.valid()
-                ? connection.receive_until(hello, deadline)
-                : local::Status::InvalidArgument;
-            const local::Status validated = received == local::Status::Ok
-                ? local::validate_handshake(hello, local::MessageType::Hello,
-                                            local::PeerRole::Daemon, identity)
-                : local::Status::InvalidArgument;
-            const local::Status acknowledged = validated == local::Status::Ok
-                ? connection.send_until(
-                      local::make_hello_ack(local::PeerRole::Sidecar, identity),
-                      deadline)
-                : local::Status::InvalidArgument;
-            if (!connection.valid() || accept_status != local::Status::Ok ||
-                credentials != local::Status::Ok ||
-                received != local::Status::Ok || validated != local::Status::Ok ||
-                acknowledged != local::Status::Ok) {
-                std::cerr << "lifecycle fixture handshake failed at turn " << turn
-                          << " statuses " << static_cast<int>(accept_status) << ' '
-                          << static_cast<int>(credentials) << ' '
-                          << static_cast<int>(received) << ' '
-                          << static_cast<int>(validated) << ' '
-                          << static_cast<int>(acknowledged) << '\n';
-                server_ok.store(false, std::memory_order_release);
-                continue;
-            }
-            local::Frame frame;
-            local::ControlOperation decoded;
-            const local::ControlOperation expected =
-                local::make_input_lifecycle_operation(operation);
-            if (connection.receive_until(frame, deadline) != local::Status::Ok ||
-                frame.type != local::MessageType::Data ||
-                !local::decode_control_operation(frame.payload, decoded) ||
-                decoded.kind != expected.kind ||
-                decoded.identity != expected.identity ||
-                decoded.request_id != expected.request_id ||
-                decoded.input != expected.input ||
-                decoded.owner != expected.owner ||
-                decoded.lifecycle_action != expected.lifecycle_action ||
-                decoded.lifecycle_result.has_value()) {
-                server_ok.store(false, std::memory_order_release);
-                continue;
-            }
-            if (turn == 2)
-                continue;  // Applied locally but response lost/disconnected.
-
-            InputLifecycleRequest reply_operation = operation;
-            if (turn == 1)
-                ++reply_operation.owner.assignment_nonce;
-            const std::vector<uint8_t> payload =
-                local::encode_control_operation(
-                    local::make_input_lifecycle_reply_operation(
-                        reply_operation, InputLifecycleApplyStatus::Applied));
-            const local::Frame reply{local::kProtocolVersion,
-                                     local::MessageType::Data,
-                                     identity, payload};
-            const local::Status sent = payload.empty()
-                ? local::Status::InvalidArgument
-                : connection.send_until(reply, deadline);
-            if (payload.empty() || sent != local::Status::Ok) {
-                std::cerr << "lifecycle fixture reply failed at turn " << turn
-                          << " payload " << payload.size() << " status "
-                          << local::status_name(sent) << '\n';
-                server_ok.store(false, std::memory_order_release);
-            }
-            local::Frame acknowledgement;
-            // Production deliberately classifies POLLIN|POLLHUP as a lost
-            // best-effort final ACK after the reducer result is durable.  The
-            // fixture still needs to prove that the client emitted the exact
-            // ACK, so consume already-queued bytes before interpreting HUP.
-            pollfd final_ack{connection.native_handle(), POLLIN, 0};
-            int final_ack_ready = -1;
-            do {
-                final_ack_ready = ::poll(&final_ack, 1, 1000);
-            } while (final_ack_ready < 0 && errno == EINTR);
-            if (sent == local::Status::Ok &&
-                (final_ack_ready != 1 ||
-                 (final_ack.revents & POLLIN) == 0 ||
-                 connection.receive(acknowledgement) != local::Status::Ok ||
-                 acknowledgement.type != local::MessageType::Goodbye ||
-                 !acknowledgement.payload.empty() ||
-                 local::validate_identity(acknowledgement, identity) !=
-                     local::Status::Ok)) {
-                std::cerr << "lifecycle fixture final ACK failed at turn "
-                          << turn << '\n';
-                server_ok.store(false, std::memory_order_release);
-            }
-        }
-    });
-
-    const InputLifecycleResult applied = InputLifecycleClient::apply(
-        socket_path, operation, peer,
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
-    require(applied.status == InputLifecycleStatus::Applied,
-            "exact lifecycle transport result was not applied");
-    const InputLifecycleResult mismatched = InputLifecycleClient::apply(
-        socket_path, operation, peer,
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
-    if (mismatched.status != InputLifecycleStatus::MalformedResponse) {
-        std::cerr << "identity-mutated lifecycle response status: "
-                  << input_lifecycle_status_name(mismatched.status) << '\n';
-        fail("identity-mutated lifecycle response was accepted");
-    }
-    const InputLifecycleResult lost = InputLifecycleClient::apply(
-        socket_path, operation, peer,
-        std::chrono::steady_clock::now() + std::chrono::seconds(5));
-    require(lost.status == InputLifecycleStatus::Disconnected,
-            "lost lifecycle response was not retryable/disconnected");
-
-    server.join();
-    (void)::close(listener);
-    fs::remove_all(runtime, error);
-    require(server_ok.load(std::memory_order_acquire),
-            "lifecycle transport fixture server failed");
+    InputLifecycleRequest forged = request(
+        identity, input, owner, 4244,
+        InputLifecycleAction::CloseLogicalInputLease);
+    require(encode_control_operation(
+                make_input_lifecycle_operation(forged)).empty(),
+            "encode produced bytes for a reserved retirement action");
+    require(!input_lifecycle_action_valid(forged.action),
+            "admission gate still accepts a reserved retirement action");
 }
 
 }  // namespace
@@ -720,9 +473,7 @@ int main() {
     commit_attachment_cancel_replace_close();
     close_before_commit_and_attach_close_race();
     replacement_cycle_and_bounds();
-    prepared_retirement_fences_attachment_until_replacement_commit();
     cancellation_racing_attachment_finalization_revokes_exact_owner();
-    refinement_cancel_commit_ordering();
-    lifecycle_transport_round_trip();
+    retired_v5_lane_refused();
     return 0;
 }

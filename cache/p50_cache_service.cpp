@@ -1570,10 +1570,10 @@ bool handle_connection(local::Connection connection, const Options& options,
         }
 
         // Marks the moment the request envelope finished decoding. Used
-        // below (non-retirement InputLifecycle actions only) as the start
-        // point for the sidecar-local apply/response/ack budget -- distinct
-        // from, and later than, the pre-decode kHandshakeMilliseconds
-        // envelope-receive deadline captured in `deadline` above.
+        // below as the start point for the sidecar-local
+        // apply/response/ack budget -- distinct from, and later than, the
+        // pre-decode kHandshakeMilliseconds envelope-receive deadline
+        // captured in `deadline` above.
         const auto decode_time = std::chrono::steady_clock::now();
 
         if (operation.kind == local::ControlOperationKind::CacheSession) {
@@ -1812,84 +1812,28 @@ bool handle_connection(local::Connection connection, const Options& options,
         request.owner = *operation.owner;
         request.operation_id = operation.request_id;
         request.action = operation.lifecycle_action;
-        request.f_store_generation = operation.f_store_generation;
-        request.f_store_guid = operation.f_store_guid;
-        request.immutable_size = operation.immutable_size;
-        request.immutable_digest = operation.immutable_digest;
-        request.retirement_id = operation.retirement_id;
-        request.replacement_owner = operation.replacement_owner;
-        const bool retirement =
-            operation.lifecycle_action == InputLifecycleAction::PrepareAttemptRetirement ||
-            operation.lifecycle_action == InputLifecycleAction::CommitAttemptReplacement ||
-            operation.lifecycle_action == InputLifecycleAction::CloseLogicalInputLease;
-        if (retirement) {
-            const sidecar::MonotonicClockIdentity clock_identity =
-                sidecar::process_monotonic_clock_identity();
-            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            if (!operation.absolute_deadline.valid() ||
-                !operation.absolute_deadline.matches_clock(clock_identity) ||
-                operation.absolute_deadline.expired(
-                    now_ns, clock_identity.clock_domain_id,
-                    clock_identity.time_namespace_id)) {
-                std::fprintf(stderr,
-                             "P50_INPUT_LIFECYCLE_REFUSED stage=retirement-deadline "
-                             "action=%u operation=%llu elapsed_ns=%lld budget_ms=0 "
-                             "wall_clock_ns=%llu\n",
-                             static_cast<unsigned>(request.action),
-                             static_cast<unsigned long long>(request.operation_id),
-                             static_cast<long long>(std::chrono::duration_cast<
-                                 std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - decode_time).count()),
-                             static_cast<unsigned long long>(wall_clock_ns_now()));
-                std::fflush(stderr);
-                return true;
-            }
-            // Preserve the exact wire value.  This conversion is only a
-            // local representation of the same CLOCK_MONOTONIC nanoseconds;
-            // no receive-time-plus-duration deadline is reconstructed.
-            request.absolute_deadline = operation.absolute_deadline;
-            request.deadline = operation.absolute_deadline.as_steady_time_point();
-        } else {
-            // Non-retirement lifecycle actions (e.g. CloseAcceptedJob) carry
-            // no daemon-supplied absolute_deadline on the wire -- that is
-            // only ever sent for the three retirement actions above. The
-            // daemon's own budget for these ops is
-            // config_.input_lifecycle_timeout (default 5000ms; see
-            // daemon/main.cpp / daemon/p50_lifecycle_timeout_override.h),
-            // but it is never sent down for anything but retirement. Before
-            // this fix, these ops inherited `deadline` -- the pre-decode
-            // kHandshakeMilliseconds=500ms handshake budget for receiving
-            // the still-undecoded envelope -- which is correct for that
-            // receive but far too tight once decode has already happened
-            // and the owner still has to run apply_input_lifecycle_on_owner,
-            // encode the reply, send it, and read back the ACK. Under load
-            // an owner apply landing a few ms past the 500ms mark caused
-            // handle_connection to return true with no reply at all; the
-            // daemon reads that as EOF (status=Disconnected), which is
-            // relationship-fatal with no retry (see
-            // p50_daemon_sidecar_adapter.cpp), retiring the whole F sidecar
-            // for one slow non-retirement reply.
-            //
-            // Fix: measure a separate, sidecar-local budget from
-            // decode_time, sized by
-            // options.sidecar_lifecycle_apply_budget (resolved once at
-            // process startup in run() from
-            // ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS, default 5000ms to match
-            // the daemon's own default for these ops). Purely sidecar-local:
-            // nothing on the wire changes, and retirement actions above are
-            // untouched.
-            request.deadline = decode_time + options.sidecar_lifecycle_apply_budget;
-        }
-        // Once the operation envelope has been decoded, every retirement
-        // phase uses that same absolute deadline for apply, response, and
-        // final ACK.  The pre-decode handshake budget above is only the
-        // bounded envelope receive; it cannot renew the retirement budget.
-        // Non-retirement phases use the sidecar-local budget computed above
-        // (request.deadline), not the handshake deadline.
-        const auto operation_deadline = retirement
-            ? operation.absolute_deadline.as_steady_time_point()
-            : request.deadline;
+        // Live lifecycle actions carry no daemon-supplied deadline on the
+        // wire.  Before this budget existed, these ops inherited `deadline`
+        // -- the pre-decode kHandshakeMilliseconds=500ms handshake budget
+        // for receiving the still-undecoded envelope -- which is correct for
+        // that receive but far too tight once decode has already happened and
+        // the owner still has to run apply_input_lifecycle_on_owner, encode
+        // the reply, send it, and read back the ACK. Under load an owner apply
+        // landing a few ms past the 500ms mark caused handle_connection to
+        // return true with no reply at all; the daemon reads that as EOF
+        // (status=Disconnected), which is relationship-fatal with no retry
+        // (see p50_daemon_sidecar_adapter.cpp), retiring the whole F sidecar
+        // for one slow non-retirement reply.
+        //
+        // Fix: measure a separate, sidecar-local budget from decode_time,
+        // sized by options.sidecar_lifecycle_apply_budget (resolved once at
+        // process startup in run() from ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS,
+        // default 5000ms to match the daemon's own budget for these ops --
+        // config_.input_lifecycle_timeout, see
+        // daemon/p50_lifecycle_timeout_override.h). Purely sidecar-local:
+        // nothing on the wire changes.
+        request.deadline = decode_time + options.sidecar_lifecycle_apply_budget;
+        const auto operation_deadline = request.deadline;
         const std::optional<InputLifecycleApplyStatus> result =
             runtime.apply_input_lifecycle_on_owner(request, operation_deadline);
         if (!result.has_value()) {
@@ -1902,9 +1846,8 @@ bool handle_connection(local::Connection connection, const Options& options,
                          static_cast<long long>(std::chrono::duration_cast<
                              std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - decode_time).count()),
-                         static_cast<long long>(retirement
-                             ? 0
-                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<long long>(
+                             options.sidecar_lifecycle_apply_budget.count()),
                          static_cast<unsigned long long>(wall_clock_ns_now()));
             std::fflush(stderr);
             return true;
@@ -1922,9 +1865,8 @@ bool handle_connection(local::Connection connection, const Options& options,
                          static_cast<long long>(std::chrono::duration_cast<
                              std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - decode_time).count()),
-                         static_cast<long long>(retirement
-                             ? 0
-                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<long long>(
+                             options.sidecar_lifecycle_apply_budget.count()),
                          static_cast<unsigned long long>(wall_clock_ns_now()));
             std::fflush(stderr);
             return true;
@@ -1942,9 +1884,8 @@ bool handle_connection(local::Connection connection, const Options& options,
                          static_cast<long long>(std::chrono::duration_cast<
                              std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - decode_time).count()),
-                         static_cast<long long>(retirement
-                             ? 0
-                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<long long>(
+                             options.sidecar_lifecycle_apply_budget.count()),
                          static_cast<unsigned long long>(wall_clock_ns_now()));
             std::fflush(stderr);
             return true;
@@ -1965,9 +1906,8 @@ bool handle_connection(local::Connection connection, const Options& options,
                          static_cast<long long>(std::chrono::duration_cast<
                              std::chrono::nanoseconds>(
                                  std::chrono::steady_clock::now() - decode_time).count()),
-                         static_cast<long long>(retirement
-                             ? 0
-                             : options.sidecar_lifecycle_apply_budget.count()),
+                         static_cast<long long>(
+                             options.sidecar_lifecycle_apply_budget.count()),
                          static_cast<unsigned long long>(wall_clock_ns_now()));
             std::fflush(stderr);
             return true;
@@ -2116,8 +2056,6 @@ SidecarRuntime::SidecarRuntime(RuntimeConfig config)
                      owner_watchdog_threshold_.rejection_reason.c_str());
         std::fflush(stderr);
     }
-    input_lifecycle_.bind_store_identity(config_.f_store_generation,
-                                         config_.f_store_guid);
     InputJobStateSelector configured_selector =
         std::move(config_.endpoint_config.input_job_state);
     config_.endpoint_config.input_job_state =
@@ -3859,20 +3797,6 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
             }
             bool mutated = true;
             try {
-                const bool retirement =
-                    request.action == InputLifecycleAction::PrepareAttemptRetirement ||
-                    request.action == InputLifecycleAction::CommitAttemptReplacement ||
-                    request.action == InputLifecycleAction::CloseLogicalInputLease;
-                if (retirement) {
-                    // The sidecar endpoint is the one FInputStoreOwner.  This
-                    // read-only cursor check binds retirement to the exact
-                    // retained bytes without creating a daemon-local core or
-                    // reopening a closed record.
-                    const InputCursor cursor = endpoint_->attach_input(request.key);
-                    if (cursor.remaining() != request.immutable_size ||
-                        cursor.raw_digest() != request.immutable_digest)
-                        mutated = false;
-                }
                 if (mutated && decision.close_record)
                     endpoint_->close_input_job(request.key);
                 if (mutated && decision.collect_record)
@@ -3885,12 +3809,6 @@ SidecarRuntime::apply_input_lifecycle_on_owner(
             InputLifecycleApplyStatus status = InputLifecycleApplyStatus::UnknownRecord;
             if (mutated && registry_mutated) {
                 switch (request.action) {
-                case InputLifecycleAction::PrepareAttemptRetirement:
-                    status = InputLifecycleApplyStatus::AttemptQuiescedRecordRetained;
-                    break;
-                case InputLifecycleAction::CommitAttemptReplacement:
-                    status = InputLifecycleApplyStatus::ReplacementInstalledRecordRetained;
-                    break;
                 case InputLifecycleAction::CloseLogicalInputLease:
                     status = endpoint_->owner_usage().retained_input_records <
                                      before.retained_input_records

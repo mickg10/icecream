@@ -494,19 +494,16 @@ struct Options {
     // doc/p50-platform-compat.md, "M2 input artifact".
     InputMaterializationBackend input_backend = InputMaterializationBackend::Native;
     // Sidecar-local budget for the owner-apply + reply + ack sequence of
-    // non-retirement InputLifecycle actions (e.g. CloseAcceptedJob), measured
-    // from the moment handle_connection decodes the request -- NOT the
-    // pre-decode kHandshakeMilliseconds=500ms handshake deadline, which is
-    // too tight once decode has already consumed part of it and which has no
-    // relation to the daemon's own budget for these ops
+    // InputLifecycle actions (e.g. CloseAcceptedJob), measured from the
+    // moment handle_connection decodes the request -- NOT the pre-decode
+    // kHandshakeMilliseconds=500ms handshake deadline, which is too tight
+    // once decode has already consumed part of it and which has no relation
+    // to the daemon's own budget for these ops
     // (config_.input_lifecycle_timeout, default 5000ms,
-    // daemon/p50_lifecycle_timeout_override.h). Retirement actions
-    // (PrepareAttemptRetirement/CommitAttemptReplacement/
-    // CloseLogicalInputLease) are unaffected: they keep using the daemon's
-    // own operation.absolute_deadline, which is already sent down for them.
-    // Resolved exactly once at process startup in run() from
-    // ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS (default 5000ms, matching the
-    // daemon's own default); see p50_sidecar_lifecycle_apply_override.h.
+    // daemon/p50_lifecycle_timeout_override.h). Resolved exactly once at
+    // process startup in run() from ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS
+    // (default 5000ms, matching the daemon's own default); see
+    // p50_sidecar_lifecycle_apply_override.h.
     std::chrono::milliseconds sidecar_lifecycle_apply_budget{5000};
     // Longest a SourceTransfer may run, from the moment its operation is
     // decoded.  The client's patience can only shorten it.  Under ICECC_TESTS,

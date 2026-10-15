@@ -9,8 +9,6 @@ std::vector<uint8_t> encode_control_operation(
     const bool input = detail::control_kind_has_input(operation.kind);
     const bool cancel = operation.kind == ControlOperationKind::OperationCancel;
     const bool source = operation.kind == ControlOperationKind::SourceTransfer;
-    const bool retirement = operation.kind == ControlOperationKind::InputLifecycle &&
-                            detail::retirement_action(operation.lifecycle_action);
     bool invalid = !detail::control_identity_valid(operation.identity) ||
                    operation.request_id == 0 ||
                    !detail::control_kind_valid(operation.kind);
@@ -18,12 +16,6 @@ std::vector<uint8_t> encode_control_operation(
         invalid = operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||
-                  operation.f_store_generation != 0 ||
-                  operation.f_store_guid != FStoreGuid{} ||
-                  operation.immutable_size != 0 ||
-                  operation.immutable_digest != Digest128{} ||
-                  operation.retirement_id != 0 ||
-                  operation.replacement_owner.has_value() ||
                   operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
     }
     if (!invalid && !source)
@@ -37,41 +29,15 @@ std::vector<uint8_t> encode_control_operation(
     if (!invalid && operation.kind == ControlOperationKind::InputFdAttachment) {
         invalid = operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||
-                  operation.f_store_generation != 0 ||
-                  operation.f_store_guid != FStoreGuid{} ||
-                  operation.immutable_size != 0 ||
-                  operation.immutable_digest != Digest128{} ||
-                  operation.retirement_id != 0 ||
-                  operation.replacement_owner.has_value() ||
                   operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
     }
     if (!invalid && operation.kind == ControlOperationKind::InputLifecycle) {
+        // input_lifecycle_action_valid() refuses the reserved retirement
+        // actions 4-6, so no extension payload can accompany a live action.
         invalid = !input_lifecycle_action_valid(operation.lifecycle_action) ||
                   (operation.lifecycle_result.has_value() &&
-                   !detail::lifecycle_result_valid(*operation.lifecycle_result));
-        if (!invalid && !retirement) {
-            invalid = operation.f_store_generation != 0 ||
-                      operation.f_store_guid != FStoreGuid{} ||
-                      operation.immutable_size != 0 ||
-                      operation.immutable_digest != Digest128{} ||
-                      operation.retirement_id != 0 ||
-                      operation.replacement_owner.has_value() ||
-                      operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
-        }
-        if (!invalid && retirement) {
-            invalid = operation.f_store_generation == 0 ||
-                      operation.f_store_guid == FStoreGuid{} ||
-                      operation.immutable_digest == Digest128{} ||
-                      operation.retirement_id == 0 ||
-                      !operation.absolute_deadline.valid() ||
-                      (operation.lifecycle_action ==
-                           InputLifecycleAction::CommitAttemptReplacement &&
-                       (!operation.replacement_owner.has_value() ||
-                        !input_lease_owner_valid(*operation.replacement_owner))) ||
-                      (operation.lifecycle_action !=
-                           InputLifecycleAction::CommitAttemptReplacement &&
-                       operation.replacement_owner.has_value());
-        }
+                   !detail::lifecycle_result_valid(*operation.lifecycle_result)) ||
+                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
     }
     if (!invalid && cancel) {
         invalid = !detail::control_cancel_target_role_valid(operation.cancel_target_role) ||
@@ -92,12 +58,6 @@ std::vector<uint8_t> encode_control_operation(
                   operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||
-                  operation.f_store_generation != 0 ||
-                  operation.f_store_guid != FStoreGuid{} ||
-                  operation.immutable_size != 0 ||
-                  operation.immutable_digest != Digest128{} ||
-                  operation.retirement_id != 0 ||
-                  operation.replacement_owner.has_value() ||
                   (operation.source_result.has_value() &&
                    (!operation.source_result->valid() ||
                     !detail::source_result_code_valid(operation.source_result->code)));
@@ -110,8 +70,7 @@ std::vector<uint8_t> encode_control_operation(
         return {};
 
     const size_t size = source ? kSourceTransferOperationBytes
-                               : retirement ? kInputAttemptRetirementOperationBytes
-                                   : input ? kInputFdAttachmentOperationBytes
+                               : input ? kInputFdAttachmentOperationBytes
                               : cancel ? kOperationCancelOperationBytes
                                        : kCacheSessionOperationBytes;
     std::vector<uint8_t> wire(size, 0);
@@ -120,8 +79,7 @@ std::vector<uint8_t> encode_control_operation(
                          ? kControlOperationVersionV1
                          : cancel ? kControlOperationVersionV3
                                   : source ? kControlOperationVersionV6
-                                  : retirement ? kControlOperationVersionV5
-                                                : kControlOperationVersionV2);
+                                           : kControlOperationVersionV2);
     detail::control_put_u16(wire.data() + 2, static_cast<uint16_t>(operation.kind));
     detail::control_put_u32(wire.data() + 4, static_cast<uint32_t>(size));
     detail::control_put_u64(wire.data() + 8, operation.identity.generation);
@@ -151,31 +109,6 @@ std::vector<uint8_t> encode_control_operation(
             detail::control_put_u16(
                 wire.data() + 82,
                 static_cast<uint16_t>(*operation.lifecycle_result) + 1);
-        if (retirement) {
-            detail::control_put_u64(wire.data() + 88,
-                                    operation.f_store_generation);
-            std::copy(operation.f_store_guid.bytes.begin(),
-                      operation.f_store_guid.bytes.end(), wire.begin() + 96);
-            detail::control_put_u64(wire.data() + 112, operation.immutable_size);
-            std::copy(operation.immutable_digest.bytes.begin(),
-                      operation.immutable_digest.bytes.end(), wire.begin() + 120);
-            detail::control_put_u64(wire.data() + 136, operation.retirement_id);
-            if (operation.replacement_owner.has_value()) {
-                detail::control_put_u64(wire.data() + 144,
-                                        operation.replacement_owner->logical_job);
-                detail::control_put_u64(wire.data() + 152,
-                                        operation.replacement_owner->assignment_epoch);
-                detail::control_put_u64(wire.data() + 160,
-                                        operation.replacement_owner->assignment_nonce);
-            }
-            detail::control_put_u64(
-                wire.data() + 168,
-                static_cast<uint64_t>(operation.absolute_deadline.expires_at_ns));
-            detail::control_put_u64(wire.data() + 176,
-                                    operation.absolute_deadline.clock_domain_id);
-            detail::control_put_u64(wire.data() + 184,
-                                    operation.absolute_deadline.time_namespace_id);
-        }
     }
     if (source) {
         const P50SourceTransferRequest& arm = *operation.source_arm;
@@ -232,9 +165,6 @@ bool decode_control_operation(std::span<const uint8_t> wire,
             : kind == ControlOperationKind::InputFdAttachment &&
                       version == kControlOperationVersionV2
                   ? kInputFdAttachmentOperationBytes
-            : kind == ControlOperationKind::InputLifecycle &&
-                      version == kControlOperationVersionV5
-                  ? kInputAttemptRetirementOperationBytes
             : kind == ControlOperationKind::InputLifecycle &&
                       version == kControlOperationVersionV2
                   ? kInputLifecycleOperationBytes
@@ -304,55 +234,17 @@ bool decode_control_operation(std::span<const uint8_t> wire,
                 return false;
             operation.lifecycle_result = status;
         }
+        // input_lifecycle_action_valid() also refuses the reserved
+        // retirement actions 4-6 here, whatever envelope version carries
+        // them.
         const bool invalid_kind_payload =
             (kind == ControlOperationKind::InputFdAttachment &&
              (operation.lifecycle_action != InputLifecycleAction::None ||
               operation.lifecycle_result.has_value())) ||
             (kind == ControlOperationKind::InputLifecycle &&
-             (!input_lifecycle_action_valid(operation.lifecycle_action) ||
-              (version == kControlOperationVersionV2 &&
-               detail::retirement_action(operation.lifecycle_action))));
+             !input_lifecycle_action_valid(operation.lifecycle_action));
         if (invalid_kind_payload)
             return false;
-        if (kind == ControlOperationKind::InputLifecycle &&
-            version == kControlOperationVersionV5) {
-            if (!detail::retirement_action(operation.lifecycle_action))
-                return false;
-            operation.f_store_generation = detail::control_get_u64(wire.data() + 88);
-            std::copy(wire.begin() + 96, wire.begin() + 112,
-                      operation.f_store_guid.bytes.begin());
-            operation.immutable_size = detail::control_get_u64(wire.data() + 112);
-            std::copy(wire.begin() + 120, wire.begin() + 136,
-                      operation.immutable_digest.bytes.begin());
-            operation.retirement_id = detail::control_get_u64(wire.data() + 136);
-            if (operation.f_store_generation == 0 ||
-                operation.f_store_guid == FStoreGuid{} ||
-                operation.immutable_digest == Digest128{} ||
-                operation.retirement_id == 0)
-                return false;
-            InputLeaseOwner replacement;
-            replacement.logical_job = detail::control_get_u64(wire.data() + 144);
-            replacement.assignment_epoch = detail::control_get_u64(wire.data() + 152);
-            replacement.assignment_nonce = detail::control_get_u64(wire.data() + 160);
-            const bool has_replacement = replacement.logical_job != 0 ||
-                                         replacement.assignment_epoch != 0 ||
-                                         replacement.assignment_nonce != 0;
-            if (operation.lifecycle_action == InputLifecycleAction::CommitAttemptReplacement) {
-                if (!has_replacement || !input_lease_owner_valid(replacement))
-                    return false;
-                operation.replacement_owner = replacement;
-            } else if (has_replacement) {
-                return false;
-            }
-            operation.absolute_deadline.expires_at_ns =
-                static_cast<int64_t>(detail::control_get_u64(wire.data() + 168));
-            operation.absolute_deadline.clock_domain_id =
-                detail::control_get_u64(wire.data() + 176);
-            operation.absolute_deadline.time_namespace_id =
-                detail::control_get_u64(wire.data() + 184);
-            if (!operation.absolute_deadline.valid())
-                return false;
-        }
     }
     if (kind == ControlOperationKind::SourceTransfer) {
         P50SourceTransferRequest arm;
