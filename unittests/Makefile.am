@@ -53,10 +53,6 @@ TESTS += p50completionrecord-sanitize.sh
 TESTS += p50completionflow-run.sh
 TESTS += p50profile p50profile-source.sh p50_profile_sanitize.sh
 TESTS += p50roleowner p50tworole-source.sh
-TESTS += p50sessionjoin p50cachesessionjoin-source.sh \
-	p50cachesessionjoin-mutants.sh p50cachesessionjoin-sanitize.sh
-TESTS += p50cachesessionwire p50cachesessionwire-source.sh \
-	p50cachesessionwire-mutants.sh p50cachesessionwire-sanitize.sh
 TESTS += p50daemoncontrol p50daemoncontrol-source.sh \
 	p50daemoncontrol-mutants.sh p50_daemon_control_sanitize.sh
 TESTS += p50cachefdseam
@@ -86,7 +82,6 @@ TESTS += p50adapterautheofregression
 check_LIBRARIES = libp50reference.a
 libp50reference_a_SOURCES = \
 	support/p50_role_owner.cpp support/p50_role_owner.h \
-	support/p50_cache_session_join.cpp support/p50_cache_session_join.h \
 	support/p50_input_attachment.cpp support/p50_input_attachment.h \
 	support/p50_source_ingress.cpp support/p50_source_ingress.h \
 	support/p50_reverse_fd_retry.cpp support/p50_reverse_fd_retry.h \
@@ -195,16 +190,6 @@ p50roleowner_SOURCES = p50_role_owner_test.cpp
 p50roleowner_LDADD = libp50reference.a
 p50roleowner_CXXFLAGS = -pthread
 p50roleowner_LDFLAGS = -pthread
-p50sessionjoin_SOURCES = p50_cache_session_join_test.cpp \
-	../daemon/connection_provenance.cpp
-p50sessionjoin_CPPFLAGS = $(AM_CPPFLAGS)
-p50sessionjoin_LDADD = libp50reference.a \
-	../cache/libprotocol50.a ../services/libicecc.la \
-	$(LIBZSTD_LIBS) $(XXHASH_LIBS)
-p50cachesessionwire_SOURCES = p50_cache_session_wire_test.cpp
-p50cachesessionwire_CXXFLAGS = -pthread
-p50cachesessionwire_LDFLAGS = -pthread
-p50cachesessionwire_LDADD = ../services/libicecc.la
 p50daemoncontrol_SOURCES = p50_daemon_control_test.cpp
 p50daemoncontrol_CXXFLAGS = -pthread
 p50daemoncontrol_LDFLAGS = -pthread
@@ -245,8 +230,6 @@ check_PROGRAMS += p50storeidentitywire
 check_PROGRAMS += p50reversefdretry
 check_PROGRAMS += p50s2restartreplay
 check_PROGRAMS += p50roleowner
-check_PROGRAMS += p50sessionjoin
-check_PROGRAMS += p50cachesessionwire
 check_PROGRAMS += p50sidecarlifecycle
 check_PROGRAMS += p50daemoncontrol
 check_PROGRAMS += p50cachefdseam
@@ -670,10 +653,6 @@ EXTRA_DIST += p50daemontaskcount-source.sh
 EXTRA_DIST += p50forkfdhygiene-source.sh p50forkfdhygiene-mutants.sh \
 	p50_fork_fd_hygiene_sanitize.sh p50forkfdhygiene-oot.sh \
 	p50forkfdhygiene-package.sh
-EXTRA_DIST += p50cachesessionjoin-source.sh p50cachesessionjoin-mutants.sh \
-	p50cachesessionjoin-sanitize.sh
-EXTRA_DIST += p50cachesessionwire-source.sh p50cachesessionwire-mutants.sh \
-	p50cachesessionwire-sanitize.sh
 EXTRA_DIST += p50daemoncontrol-source.sh p50daemoncontrol-mutants.sh \
 	p50_daemon_control_sanitize.sh
 EXTRA_DIST += p50cacheservice-fcapacity-run.sh

@@ -155,7 +155,7 @@ def test_production_headers_do_not_depend_on_research_tree() -> None:
 
 def test_p50_reference_components_are_not_product_dependencies() -> None:
     references = (
-        "p50_role_owner", "p50_cache_session_join", "p50_input_attachment",
+        "p50_role_owner", "p50_input_attachment",
         "p50_source_ingress", "p50_reverse_fd_retry",
         "p50_sidecar_supervisor",
     )

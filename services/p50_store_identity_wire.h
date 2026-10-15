@@ -6,10 +6,48 @@
 // never belong on ordinary protocol frames.
 
 #include <array>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 
 namespace icecc::p50 {
+
+namespace daemon {
+
+// Protocol-50 wire launch identity.  This value type was originally defined
+// in the retired services/p50_cache_session_wire.h (the P5CL/P5CO
+// claim/outcome design; ids 0x50f00012/13 stay reserved in Msg::Value);
+// production endpoint/cancellation code kept the type itself.
+struct P50WireLaunchIdentity {
+    uint64_t generation = 0;
+    uint64_t attempt = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return generation != 0 && attempt != 0;
+    }
+    auto operator<=>(const P50WireLaunchIdentity &) const = default;
+};
+
+// Numeric value aligns with the typed F-session operation target.  The DTO
+// stays dependency-free from cache/p50_control_operation.h.
+enum class P50SessionOperationRole : uint16_t {
+    FSession = 2,
+};
+
+struct P50FSessionOperationId {
+    P50WireLaunchIdentity sidecar_launch{};
+    P50SessionOperationRole role = P50SessionOperationRole::FSession;
+    uint64_t operation_sequence = 0;
+
+    [[nodiscard]] bool valid() const noexcept {
+        return sidecar_launch.valid() &&
+               role == P50SessionOperationRole::FSession &&
+               operation_sequence != 0;
+    }
+    auto operator<=>(const P50FSessionOperationId &) const = default;
+};
+
+} // namespace icecc::p50::daemon
 
 inline constexpr uint64_t kStoreIdentityDerivationVersion = 1;
 inline constexpr size_t kStoreIdentityRoleByte = 0;

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1026,6 +1027,31 @@ static void test_eof_and_pending_output_barriers()
     }
 }
 
+static void test_retired_claim_value_poisons_channel()
+{
+    static_assert(Msg::P50_CACHE_SESSION_CLAIM == UINT32_C(0x50f00012));
+    REQUIRE(Msg(Msg::P50_CACHE_SESSION_CLAIM).to_string()
+                == std::string("P50_CACHE_SESSION_CLAIM"),
+            "the reserved claim value still renders its diagnostic name");
+
+    Pair pair = make_pair(50);
+    Bytes forged = frame(Msg::P50_CACHE_SESSION_CLAIM);
+    const uint32_t forged_length = htonl(9);
+    std::memcpy(forged.data(), &forged_length, sizeof(forged_length));
+    forged.push_back(0x01);
+    forged.push_back(0x02);
+    forged.push_back(0x03);
+    forged.push_back(0x04);
+    forged.push_back(0x05);
+    send_bytes(pair.left->fd, forged);
+    REQUIRE(pair.right->get_msg(2, true) == nullptr,
+            "a forged retired-claim frame is refused at decode");
+    REQUIRE(pair.right->get_msg(2, true) == nullptr,
+            "the poisoned channel stays dead instead of silently recovering");
+    REQUIRE(pair.right->release_fd_if_input_empty() == -1,
+            "a refused retired-claim frame never hands off the descriptor");
+}
+
 static void test_nonblocking_accepted_protocol_admission()
 {
     int sockets[2] = {-1, -1};
@@ -1241,6 +1267,7 @@ int main()
     test_split_frame_reads();
     test_read_ahead_barriers();
     test_eof_and_pending_output_barriers();
+    test_retired_claim_value_poisons_channel();
     test_nonblocking_accepted_protocol_admission();
     test_absolute_message_deadline();
     return failures ? 1 : 0;

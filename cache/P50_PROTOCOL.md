@@ -468,7 +468,6 @@ that equivalent behavior is wired into the live path.
 
 | Component | Contract and scope |
 |---|---|
-| P50CacheSessionJoin | Registers a complete WAIT owner, revalidates connection/READY identity and reserves exact attempts; not called by current daemon cache dispatch. Expiry before detach may release a slot; uncertainty after detach requires exact settlement. |
 | SourceIngress / SourceFinalize | Separately latches wrapper EOF and exact-child completion; a revocable finalization token and F ACK gate transfer. This reducer is not the current CompileFile bridge. |
 | PhaseOpen / HandoffAuthority | Exact request/arm echo and replay high-water mark with nonrenewable establishment/source deadlines. Linking these helpers does not send their frames in production. |
 | ReverseFdOwner / ReceiverLedger | Sealed master plus fresh CLOEXEC duplicate per retry; unchanged delivery token/deadline, remaining-duration wire field, accept-before-ACK and duplicate suppression. Not the live attachment transport. |

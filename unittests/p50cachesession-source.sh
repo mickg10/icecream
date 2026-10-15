@@ -37,8 +37,8 @@ require_count 1 '|| inofs != intogo || msgtogo != 0 || !pending_frame_ends.empty
     services/comm.cpp 'buffered input and pending output barriers are explicit'
 require_count 2 'const int released_fd = fd;' services/comm.cpp \
     'ownership is captured before both directional transfers'
-require_count 4 '    fd = -1;' services/comm.cpp \
-    'destructor and all transfers clear descriptor ownership explicitly'
+require_count 3 '    fd = -1;' services/comm.cpp \
+    'destructor and both transfers clear descriptor ownership explicitly'
 require_count 4 'cache_session_release_armed = false;' services/comm.cpp \
     'construction, parser use, transfer, and outbound send clear the one-shot arm'
 require_count 1 'const uint32_t word = htonl(magic);' services/comm.cpp \

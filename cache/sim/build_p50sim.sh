@@ -102,7 +102,7 @@ else
         "$root/cache/p50_slice0.cpp" "$root/cache/p50_profile.cpp" \
         "$root/cache/p50_endpoint_run_cancel.cpp" \
         "$root/cache/p50_sidecar_identity.cpp" \
-        "$root/services/digest128.cpp" "$root/services/p50_cache_session_wire.cpp" \
+        "$root/services/digest128.cpp" \
         -L"$dep_root/lib/x86_64-linux-gnu" \
         -lzstd -lxxhash -pthread -o "$temporary"
 fi

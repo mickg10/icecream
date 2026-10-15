@@ -66,14 +66,12 @@
 #include "logging.h"
 #include "job.h"
 #include "comm.h"
-#include "p50_cache_session_wire.h"
 
 using namespace std;
 
 namespace {
 
 std::atomic<uint64_t> g_p50_channel_generation{1};
-std::atomic<uint64_t> g_p50_local_ticket_nonce{1};
 
 uint64_t next_p50_nonzero(std::atomic<uint64_t> &counter) noexcept
 {
@@ -218,218 +216,6 @@ bool fresh_claim_attempt_capabilities(
 {
     return fresh_claim_attempt_capabilities_with_provider(
         capability_1, capability_2, system_claim_attempt_entropy);
-}
-
-P50DecodedClaimStamp::P50DecodedClaimStamp(
-    uint64_t channel_generation, uint64_t mutation_epoch,
-    uint64_t frame_sequence, uint64_t stamp_nonce,
-    std::vector<uint8_t> canonical_wire) noexcept
-    : channel_generation_(channel_generation),
-      mutation_epoch_(mutation_epoch), frame_sequence_(frame_sequence),
-      stamp_nonce_(stamp_nonce), canonical_wire_(std::move(canonical_wire))
-{
-}
-
-P50DecodedClaimStamp::P50DecodedClaimStamp(
-    P50DecodedClaimStamp &&other) noexcept
-    : channel_generation_(std::exchange(other.channel_generation_, 0)),
-      mutation_epoch_(std::exchange(other.mutation_epoch_, 0)),
-      frame_sequence_(std::exchange(other.frame_sequence_, 0)),
-      stamp_nonce_(std::exchange(other.stamp_nonce_, 0)),
-      canonical_wire_(std::move(other.canonical_wire_))
-{
-}
-
-P50DecodedClaimStamp &P50DecodedClaimStamp::operator=(
-    P50DecodedClaimStamp &&other) noexcept
-{
-    if (this != &other) {
-        invalidate();
-        channel_generation_ = std::exchange(other.channel_generation_, 0);
-        mutation_epoch_ = std::exchange(other.mutation_epoch_, 0);
-        frame_sequence_ = std::exchange(other.frame_sequence_, 0);
-        stamp_nonce_ = std::exchange(other.stamp_nonce_, 0);
-        canonical_wire_ = std::move(other.canonical_wire_);
-    }
-    return *this;
-}
-
-void P50DecodedClaimStamp::invalidate() noexcept
-{
-    channel_generation_ = mutation_epoch_ = frame_sequence_ = stamp_nonce_ = 0;
-    canonical_wire_.clear();
-}
-
-P50DecodedOutcomeStamp::P50DecodedOutcomeStamp(
-    uint64_t channel_generation, uint64_t mutation_epoch,
-    uint64_t frame_sequence, uint64_t stamp_nonce,
-    std::vector<uint8_t> canonical_wire) noexcept
-    : channel_generation_(channel_generation),
-      mutation_epoch_(mutation_epoch), frame_sequence_(frame_sequence),
-      stamp_nonce_(stamp_nonce), canonical_wire_(std::move(canonical_wire))
-{
-}
-
-P50DecodedOutcomeStamp::P50DecodedOutcomeStamp(
-    P50DecodedOutcomeStamp &&other) noexcept
-    : channel_generation_(std::exchange(other.channel_generation_, 0)),
-      mutation_epoch_(std::exchange(other.mutation_epoch_, 0)),
-      frame_sequence_(std::exchange(other.frame_sequence_, 0)),
-      stamp_nonce_(std::exchange(other.stamp_nonce_, 0)),
-      canonical_wire_(std::move(other.canonical_wire_))
-{
-}
-
-P50DecodedOutcomeStamp &P50DecodedOutcomeStamp::operator=(
-    P50DecodedOutcomeStamp &&other) noexcept
-{
-    if (this != &other) {
-        invalidate();
-        channel_generation_ = std::exchange(other.channel_generation_, 0);
-        mutation_epoch_ = std::exchange(other.mutation_epoch_, 0);
-        frame_sequence_ = std::exchange(other.frame_sequence_, 0);
-        stamp_nonce_ = std::exchange(other.stamp_nonce_, 0);
-        canonical_wire_ = std::move(other.canonical_wire_);
-    }
-    return *this;
-}
-
-void P50DecodedOutcomeStamp::invalidate() noexcept
-{
-    channel_generation_ = mutation_epoch_ = frame_sequence_ = stamp_nonce_ = 0;
-    canonical_wire_.clear();
-}
-
-P50ServerClaimReleaseTicket::P50ServerClaimReleaseTicket(
-    uint64_t channel_generation, uint64_t mutation_epoch,
-    uint64_t decoded_frame_sequence, uint64_t reservation_id,
-    ClaimAttemptCapability128 attempt_capability, uint64_t stamp_nonce,
-    uint64_t release_nonce,
-    std::vector<uint8_t> canonical_claim) noexcept
-    : channel_generation_(channel_generation), mutation_epoch_(mutation_epoch),
-      decoded_frame_sequence_(decoded_frame_sequence),
-      reservation_id_(reservation_id),
-      attempt_capability_(attempt_capability),
-      stamp_nonce_(stamp_nonce), release_nonce_(release_nonce),
-      canonical_claim_(std::move(canonical_claim))
-{
-}
-
-P50ServerClaimReleaseTicket::P50ServerClaimReleaseTicket(
-    P50ServerClaimReleaseTicket &&other) noexcept
-    : channel_generation_(std::exchange(other.channel_generation_, 0)),
-      mutation_epoch_(std::exchange(other.mutation_epoch_, 0)),
-      decoded_frame_sequence_(
-          std::exchange(other.decoded_frame_sequence_, 0)),
-      reservation_id_(std::exchange(other.reservation_id_, 0)),
-      attempt_capability_(std::exchange(
-          other.attempt_capability_, ClaimAttemptCapability128{})),
-      stamp_nonce_(std::exchange(other.stamp_nonce_, 0)),
-      release_nonce_(std::exchange(other.release_nonce_, 0)),
-      outcome_frame_sequence_(
-          std::exchange(other.outcome_frame_sequence_, 0)),
-      canonical_claim_(std::move(other.canonical_claim_))
-{
-}
-
-P50ServerClaimReleaseTicket &P50ServerClaimReleaseTicket::operator=(
-    P50ServerClaimReleaseTicket &&other) noexcept
-{
-    if (this != &other) {
-        invalidate();
-        channel_generation_ = std::exchange(other.channel_generation_, 0);
-        mutation_epoch_ = std::exchange(other.mutation_epoch_, 0);
-        decoded_frame_sequence_ =
-            std::exchange(other.decoded_frame_sequence_, 0);
-        reservation_id_ = std::exchange(other.reservation_id_, 0);
-        attempt_capability_ = std::exchange(
-            other.attempt_capability_, ClaimAttemptCapability128{});
-        stamp_nonce_ = std::exchange(other.stamp_nonce_, 0);
-        release_nonce_ = std::exchange(other.release_nonce_, 0);
-        outcome_frame_sequence_ =
-            std::exchange(other.outcome_frame_sequence_, 0);
-        canonical_claim_ = std::move(other.canonical_claim_);
-    }
-    return *this;
-}
-
-void P50ServerClaimReleaseTicket::invalidate() noexcept
-{
-    channel_generation_ = mutation_epoch_ = decoded_frame_sequence_ = 0;
-    reservation_id_ = stamp_nonce_ = release_nonce_ = 0;
-    outcome_frame_sequence_ = 0;
-    attempt_capability_.bytes.fill(0);
-    canonical_claim_.clear();
-}
-
-P50ClientAdoptedReleaseTicket::P50ClientAdoptedReleaseTicket(
-    uint64_t channel_generation, uint64_t mutation_epoch,
-    uint64_t decoded_frame_sequence,
-    ClaimAttemptCapability128 attempt_capability,
-    uint64_t stamp_nonce, uint64_t release_nonce,
-    std::vector<uint8_t> canonical_claim, uint64_t f_launch_generation,
-    uint64_t f_launch_attempt, std::array<uint8_t, 16> f_store_guid,
-    uint64_t operation_sequence) noexcept
-    : channel_generation_(channel_generation), mutation_epoch_(mutation_epoch),
-      decoded_frame_sequence_(decoded_frame_sequence),
-      attempt_capability_(attempt_capability), stamp_nonce_(stamp_nonce),
-      release_nonce_(release_nonce),
-      canonical_claim_(std::move(canonical_claim)),
-      f_launch_generation_(f_launch_generation),
-      f_launch_attempt_(f_launch_attempt), f_store_guid_(f_store_guid),
-      operation_sequence_(operation_sequence)
-{
-}
-
-P50ClientAdoptedReleaseTicket::P50ClientAdoptedReleaseTicket(
-    P50ClientAdoptedReleaseTicket &&other) noexcept
-    : channel_generation_(std::exchange(other.channel_generation_, 0)),
-      mutation_epoch_(std::exchange(other.mutation_epoch_, 0)),
-      decoded_frame_sequence_(
-          std::exchange(other.decoded_frame_sequence_, 0)),
-      attempt_capability_(std::exchange(
-          other.attempt_capability_, ClaimAttemptCapability128{})),
-      stamp_nonce_(std::exchange(other.stamp_nonce_, 0)),
-      release_nonce_(std::exchange(other.release_nonce_, 0)),
-      canonical_claim_(std::move(other.canonical_claim_)),
-      f_launch_generation_(std::exchange(other.f_launch_generation_, 0)),
-      f_launch_attempt_(std::exchange(other.f_launch_attempt_, 0)),
-      f_store_guid_(std::exchange(other.f_store_guid_, {})),
-      operation_sequence_(std::exchange(other.operation_sequence_, 0))
-{
-}
-
-P50ClientAdoptedReleaseTicket &P50ClientAdoptedReleaseTicket::operator=(
-    P50ClientAdoptedReleaseTicket &&other) noexcept
-{
-    if (this != &other) {
-        invalidate();
-        channel_generation_ = std::exchange(other.channel_generation_, 0);
-        mutation_epoch_ = std::exchange(other.mutation_epoch_, 0);
-        decoded_frame_sequence_ =
-            std::exchange(other.decoded_frame_sequence_, 0);
-        attempt_capability_ = std::exchange(
-            other.attempt_capability_, ClaimAttemptCapability128{});
-        stamp_nonce_ = std::exchange(other.stamp_nonce_, 0);
-        release_nonce_ = std::exchange(other.release_nonce_, 0);
-        canonical_claim_ = std::move(other.canonical_claim_);
-        f_launch_generation_ =
-            std::exchange(other.f_launch_generation_, 0);
-        f_launch_attempt_ = std::exchange(other.f_launch_attempt_, 0);
-        f_store_guid_ = std::exchange(other.f_store_guid_, {});
-        operation_sequence_ = std::exchange(other.operation_sequence_, 0);
-    }
-    return *this;
-}
-
-void P50ClientAdoptedReleaseTicket::invalidate() noexcept
-{
-    channel_generation_ = mutation_epoch_ = decoded_frame_sequence_ = 0;
-    stamp_nonce_ = release_nonce_ = 0;
-    attempt_capability_.bytes.fill(0);
-    canonical_claim_.clear();
-    f_launch_generation_ = f_launch_attempt_ = operation_sequence_ = 0;
-    f_store_guid_.fill(0);
 }
 
 P50CacheFdReplyTicket::P50CacheFdReplyTicket(
@@ -1008,10 +794,7 @@ bool MsgChannel::flush_pending(void)
     }
 
     const bool flushed = flush_writebuf(SendNonBlocking | SendDeferrable);
-    if (flushed)
-        p50_promote_flushed_claim();
-    else
-        p50_clear_outbound_claim();
+    (void)flushed;
     p50_promote_flushed_fd_request();
     return flushed;
 }
@@ -1332,7 +1115,6 @@ void MsgChannel::write_line(const string &line)
 void MsgChannel::set_error(bool silent)
 {
     p50_note_channel_mutation();
-    p50_clear_outbound_claim();
     if( instate == ERROR ) {
         return;
     }
@@ -2316,50 +2098,17 @@ bool MsgChannel::wait_for_msg(int timeout)
     return true;
 }
 
-void MsgChannel::p50_clear_decoded_stamp() noexcept
-{
-    p50_last_decoded_type = Msg::UNKNOWN;
-    p50_last_stamp_nonce = 0;
-    p50_last_stamp_taken = false;
-    p50_last_canonical_payload.clear();
-}
-
-void MsgChannel::p50_clear_outbound_claim() noexcept
-{
-    p50_queued_claim_frame = 0;
-    p50_queued_claim.clear();
-    p50_queued_claim_attempt_capability.bytes.fill(0);
-    p50_outbound_claim.clear();
-    p50_outbound_claim_attempt_capability.bytes.fill(0);
-}
-
 void MsgChannel::p50_note_channel_mutation() noexcept
 {
     if (p50_mutation_epoch == std::numeric_limits<uint64_t>::max())
         p50_mutation_epoch = 0;
     else if (p50_mutation_epoch != 0)
         ++p50_mutation_epoch;
-    p50_clear_decoded_stamp();
     p50_fd_request_ready = false;
     p50_last_fd_request = {};
     p50_fd_receive_arm = false;
     p50_fd_receive_frame_sequence = 0;
     p50_armed_fd_request = {};
-    p50_active_server_release_nonce = 0;
-    p50_active_server_claim_stamp_nonce = 0;
-    p50_active_client_release_nonce = 0;
-}
-
-void MsgChannel::p50_promote_flushed_claim() noexcept
-{
-    if (p50_queued_claim_frame == 0 ||
-        framesFlushed() < p50_queued_claim_frame)
-        return;
-    p50_outbound_claim = std::move(p50_queued_claim);
-    p50_outbound_claim_attempt_capability =
-        p50_queued_claim_attempt_capability;
-    p50_queued_claim_frame = 0;
-    p50_queued_claim_attempt_capability.bytes.fill(0);
 }
 
 void MsgChannel::p50_promote_flushed_fd_request() noexcept
@@ -2374,62 +2123,6 @@ void MsgChannel::p50_promote_flushed_fd_request() noexcept
     p50_armed_fd_request = p50_pending_fd_request;
     p50_fd_pending_request_frame = 0;
     p50_pending_fd_request = {};
-}
-
-bool MsgChannel::p50_clean_release_boundary() const noexcept
-{
-    return fd >= 0 && protocol == PROTOCOL_VERSION && !eof &&
-           instate == NEED_LEN && inofs == intogo && msgtogo == 0 &&
-           pending_frame_ends.empty();
-}
-
-int MsgChannel::p50_checked_release_fd() noexcept
-{
-    if (!p50_clean_release_boundary()) {
-        p50_note_channel_mutation();
-        return -1;
-    }
-    unsigned char byte = 0;
-    const ssize_t result =
-        recv(fd, &byte, sizeof(byte), MSG_PEEK | MSG_DONTWAIT);
-    if (result >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-        p50_note_channel_mutation();
-        return -1;
-    }
-    const int released = fd;
-    fd = -1;
-    p50_note_channel_mutation();
-    p50_clear_outbound_claim();
-    return released;
-}
-
-bool MsgChannel::read_current_message_payload(std::vector<uint8_t> &payload,
-                                              size_t min_bytes,
-                                              size_t max_bytes)
-{
-    payload.clear();
-    const size_t remaining = current_message_bytes_remaining();
-    if (min_bytes > max_bytes || remaining < min_bytes ||
-        remaining > max_bytes) {
-        intogo = current_message_end;
-        return false;
-    }
-    try {
-        const auto *begin = reinterpret_cast<const uint8_t *>(inbuf + intogo);
-        payload.assign(begin, begin + remaining);
-    } catch (...) {
-        intogo = current_message_end;
-        payload.clear();
-        return false;
-    }
-    intogo = current_message_end;
-    return true;
-}
-
-void MsgChannel::write_message_payload(std::span<const uint8_t> payload)
-{
-    if (!payload.empty())
-        writefull(payload.data(), payload.size());
 }
 
 void MsgChannel::begin_receive() noexcept
@@ -2520,10 +2213,6 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
         *this >> t;
         type = (Msg::Value) t;
     }
-
-    if (type != Msg::P50_CACHE_SESSION_OUTCOME &&
-        !p50_outbound_claim.empty())
-        p50_clear_outbound_claim();
 
     switch (type) {
     case Msg::UNKNOWN:
@@ -2653,16 +2342,6 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
             m = new P50SourceArmedMsg;
         }
         break;
-    case Msg::P50_CACHE_SESSION_CLAIM:
-        if (protocol == PROTOCOL_VERSION) {
-            m = new P50CacheSessionClaimMsg;
-        }
-        break;
-    case Msg::P50_CACHE_SESSION_OUTCOME:
-        if (protocol == PROTOCOL_VERSION) {
-            m = new P50CacheSessionOutcomeMsg;
-        }
-        break;
     case Msg::P50_CACHE_SESSION_FD_REQUEST:
         if (protocol == PROTOCOL_VERSION) {
             m = new P50CacheSessionFdRequestMsg;
@@ -2751,25 +2430,7 @@ Msg *MsgChannel::get_msg(int timeout, bool eofAllowed)
     ++p50_decoded_frame_sequence;
 
     try {
-        if (type == Msg::P50_CACHE_SESSION_CLAIM) {
-            const auto *claim =
-                dynamic_cast<const P50CacheSessionClaimMsg *>(m);
-            if (claim == nullptr)
-                throw std::bad_cast();
-            p50_last_decoded_type = type;
-            p50_last_canonical_payload = claim->wire;
-            p50_last_stamp_nonce = next_p50_nonzero(g_p50_local_ticket_nonce);
-            p50_last_stamp_taken = false;
-        } else if (type == Msg::P50_CACHE_SESSION_OUTCOME) {
-            const auto *outcome =
-                dynamic_cast<const P50CacheSessionOutcomeMsg *>(m);
-            if (outcome == nullptr)
-                throw std::bad_cast();
-            p50_last_decoded_type = type;
-            p50_last_canonical_payload = outcome->wire;
-            p50_last_stamp_nonce = next_p50_nonzero(g_p50_local_ticket_nonce);
-            p50_last_stamp_taken = false;
-        } else if (type == Msg::P50_CACHE_SESSION_FD_REQUEST) {
+        if (type == Msg::P50_CACHE_SESSION_FD_REQUEST) {
             const auto *request =
                 dynamic_cast<const P50CacheSessionFdRequestMsg *>(m);
             if (request == nullptr)
@@ -2808,260 +2469,9 @@ bool MsgChannel::take_invalid_p50_source_arm_identity(
     return true;
 }
 
-P50DecodedClaimStamp MsgChannel::take_p50_decoded_claim_stamp() noexcept
-{
-    if (p50_mutation_epoch == 0 || p50_last_stamp_nonce == 0 ||
-        p50_last_stamp_taken ||
-        p50_last_decoded_type != Msg::P50_CACHE_SESSION_CLAIM ||
-        p50_last_canonical_payload.empty())
-        return {};
-    p50_last_stamp_taken = true;
-    return P50DecodedClaimStamp(
-        p50_channel_generation, p50_mutation_epoch,
-        p50_decoded_frame_sequence, p50_last_stamp_nonce,
-        std::move(p50_last_canonical_payload));
-}
-
-P50DecodedOutcomeStamp MsgChannel::take_p50_decoded_outcome_stamp() noexcept
-{
-    if (p50_mutation_epoch == 0 || p50_last_stamp_nonce == 0 ||
-        p50_last_stamp_taken ||
-        p50_last_decoded_type != Msg::P50_CACHE_SESSION_OUTCOME ||
-        p50_last_canonical_payload.empty())
-        return {};
-    p50_last_stamp_taken = true;
-    return P50DecodedOutcomeStamp(
-        p50_channel_generation, p50_mutation_epoch,
-        p50_decoded_frame_sequence, p50_last_stamp_nonce,
-        std::move(p50_last_canonical_payload));
-}
-
-P50ServerClaimReleaseTicket
-MsgChannel::issue_p50_server_claim_release_ticket(
-    P50DecodedClaimStamp &&stamp, uint64_t reservation_id,
-    ClaimAttemptCapability128 attempt_capability) noexcept
-{
-    if (!stamp.valid() || reservation_id == 0 ||
-        !attempt_capability.valid() ||
-        p50_mutation_epoch == 0 ||
-        stamp.channel_generation_ != p50_channel_generation ||
-        stamp.mutation_epoch_ != p50_mutation_epoch ||
-        stamp.frame_sequence_ != p50_decoded_frame_sequence ||
-        stamp.stamp_nonce_ != p50_last_stamp_nonce ||
-        p50_last_decoded_type != Msg::P50_CACHE_SESSION_CLAIM ||
-        !p50_last_stamp_taken || p50_active_server_release_nonce != 0) {
-        stamp.invalidate();
-        return {};
-    }
-    const auto claim = icecc::p50::daemon::decode_cache_session_wire_claim(
-        stamp.canonical_wire_);
-    if (!claim.has_value() ||
-        claim->attempt.selected_capability != attempt_capability) {
-        stamp.invalidate();
-        return {};
-    }
-    const uint64_t release_nonce = next_p50_nonzero(g_p50_local_ticket_nonce);
-    if (release_nonce == 0) {
-        stamp.invalidate();
-        return {};
-    }
-    p50_active_server_release_nonce = release_nonce;
-    p50_active_server_claim_stamp_nonce = stamp.stamp_nonce_;
-    P50ServerClaimReleaseTicket ticket(
-        p50_channel_generation, p50_mutation_epoch,
-        p50_decoded_frame_sequence, reservation_id, attempt_capability,
-        stamp.stamp_nonce_, release_nonce, std::move(stamp.canonical_wire_));
-    stamp.invalidate();
-    return ticket;
-}
-
-bool MsgChannel::send_p50_cache_session_outcome(
-    P50ServerClaimReleaseTicket &ticket,
-    const P50CacheSessionOutcomeMsg &message) noexcept
-{
-    const auto outcome =
-        icecc::p50::daemon::decode_cache_session_outcome(message.wire);
-    const bool exact =
-        ticket.valid() && ticket.outcome_frame_sequence_ == 0 &&
-        ticket.channel_generation_ == p50_channel_generation &&
-        ticket.mutation_epoch_ == p50_mutation_epoch &&
-        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
-        ticket.stamp_nonce_ != 0 &&
-        ticket.stamp_nonce_ == p50_last_stamp_nonce &&
-        ticket.stamp_nonce_ == p50_active_server_claim_stamp_nonce &&
-        ticket.release_nonce_ == p50_active_server_release_nonce &&
-        ticket.reservation_id_ != 0 && ticket.attempt_capability_.valid() &&
-        !ticket.canonical_claim_.empty() && outcome.has_value() &&
-        outcome->canonical_claim == ticket.canonical_claim_;
-    if (!exact) {
-        ticket.invalidate();
-        p50_note_channel_mutation();
-        return false;
-    }
-
-    const uint64_t release_nonce = ticket.release_nonce_;
-    const uint64_t claim_stamp_nonce = ticket.stamp_nonce_;
-    p50_server_outcome_send_armed = true;
-    bool sent = false;
-    try {
-        sent = send_msg(message, SendBlocking);
-    } catch (...) {
-        p50_server_outcome_send_armed = false;
-        ticket.invalidate();
-        p50_note_channel_mutation();
-        return false;
-    }
-    p50_server_outcome_send_armed = false;
-    if (!sent || msgtogo != 0 || !pending_frame_ends.empty() ||
-        framesQueued() == 0 || framesFlushed() != framesQueued()) {
-        ticket.invalidate();
-        p50_note_channel_mutation();
-        return false;
-    }
-
-    if (outcome->kind ==
-        icecc::p50::daemon::P50CacheSessionOutcomeKind::RefusedPreDetach) {
-        ticket.invalidate();
-        return true;
-    }
-    if (outcome->kind !=
-        icecc::p50::daemon::P50CacheSessionOutcomeKind::Adopted) {
-        ticket.invalidate();
-        p50_note_channel_mutation();
-        return false;
-    }
-
-    ticket.mutation_epoch_ = p50_mutation_epoch;
-    ticket.outcome_frame_sequence_ = framesQueued();
-    p50_active_server_release_nonce = release_nonce;
-    p50_active_server_claim_stamp_nonce = claim_stamp_nonce;
-    return true;
-}
-
-P50ClientAdoptedReleaseTicket
-MsgChannel::issue_p50_client_adopted_release_ticket(
-    P50DecodedOutcomeStamp &&stamp, uint64_t expected_f_launch_generation,
-    uint64_t expected_f_launch_attempt,
-    std::array<uint8_t, 16> expected_f_store_guid,
-    uint64_t expected_operation_sequence) noexcept
-{
-    p50_promote_flushed_claim();
-    if (!stamp.valid() || expected_f_launch_generation == 0 ||
-        expected_f_launch_attempt == 0 || expected_operation_sequence == 0 ||
-        p50_outbound_claim.empty() ||
-        !p50_outbound_claim_attempt_capability.valid() ||
-        p50_mutation_epoch == 0 ||
-        stamp.channel_generation_ != p50_channel_generation ||
-        stamp.mutation_epoch_ != p50_mutation_epoch ||
-        stamp.frame_sequence_ != p50_decoded_frame_sequence ||
-        stamp.stamp_nonce_ != p50_last_stamp_nonce ||
-        p50_last_decoded_type != Msg::P50_CACHE_SESSION_OUTCOME ||
-        !p50_last_stamp_taken || p50_active_client_release_nonce != 0) {
-        stamp.invalidate();
-        p50_clear_outbound_claim();
-        return {};
-    }
-    const auto outcome = icecc::p50::daemon::decode_cache_session_outcome(
-        stamp.canonical_wire_);
-    const auto claim = icecc::p50::daemon::decode_cache_session_wire_claim(
-        p50_outbound_claim);
-    if (!outcome.has_value() || !claim.has_value() ||
-        outcome->kind !=
-            icecc::p50::daemon::P50CacheSessionOutcomeKind::Adopted ||
-        outcome->canonical_claim != p50_outbound_claim ||
-        claim->attempt.selected_capability !=
-            p50_outbound_claim_attempt_capability ||
-        claim->binding.f_control_identity().generation !=
-            expected_f_launch_generation ||
-        claim->binding.f_control_identity().attempt !=
-            expected_f_launch_attempt ||
-        claim->binding.f_store_guid != expected_f_store_guid ||
-        outcome->f_sidecar_launch.generation !=
-            expected_f_launch_generation ||
-        outcome->f_sidecar_launch.attempt != expected_f_launch_attempt ||
-        outcome->f_store_guid != expected_f_store_guid ||
-        outcome->operation.sidecar_launch != outcome->f_sidecar_launch ||
-        outcome->operation.role !=
-            icecc::p50::daemon::P50SessionOperationRole::FSession ||
-        outcome->operation.operation_sequence !=
-            expected_operation_sequence) {
-        stamp.invalidate();
-        p50_clear_outbound_claim();
-        return {};
-    }
-    const uint64_t release_nonce = next_p50_nonzero(g_p50_local_ticket_nonce);
-    if (release_nonce == 0) {
-        stamp.invalidate();
-        p50_clear_outbound_claim();
-        return {};
-    }
-    p50_active_client_release_nonce = release_nonce;
-    P50ClientAdoptedReleaseTicket ticket(
-        p50_channel_generation, p50_mutation_epoch,
-        p50_decoded_frame_sequence,
-        p50_outbound_claim_attempt_capability,
-        stamp.stamp_nonce_, release_nonce, std::move(p50_outbound_claim),
-        expected_f_launch_generation, expected_f_launch_attempt,
-        expected_f_store_guid, expected_operation_sequence);
-    p50_outbound_claim_attempt_capability.bytes.fill(0);
-    stamp.invalidate();
-    return ticket;
-}
-
-int MsgChannel::release_fd_after_p50_server_claim(
-    P50ServerClaimReleaseTicket &&ticket) noexcept
-{
-    const bool exact =
-        ticket.valid() &&
-        ticket.channel_generation_ == p50_channel_generation &&
-        ticket.mutation_epoch_ == p50_mutation_epoch &&
-        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
-        ticket.stamp_nonce_ != 0 &&
-        ticket.stamp_nonce_ == p50_active_server_claim_stamp_nonce &&
-        ticket.release_nonce_ == p50_active_server_release_nonce &&
-        ticket.outcome_frame_sequence_ != 0 &&
-        ticket.outcome_frame_sequence_ == framesQueued() &&
-        ticket.outcome_frame_sequence_ == framesFlushed() &&
-        ticket.reservation_id_ != 0 &&
-        ticket.attempt_capability_.valid() &&
-        !ticket.canonical_claim_.empty();
-    ticket.invalidate();
-    if (!exact) {
-        p50_note_channel_mutation();
-        return -1;
-    }
-    return p50_checked_release_fd();
-}
-
-int MsgChannel::release_fd_after_p50_client_adopted(
-    P50ClientAdoptedReleaseTicket &&ticket) noexcept
-{
-    const bool exact =
-        ticket.valid() &&
-        ticket.channel_generation_ == p50_channel_generation &&
-        ticket.mutation_epoch_ == p50_mutation_epoch &&
-        ticket.decoded_frame_sequence_ == p50_decoded_frame_sequence &&
-        ticket.stamp_nonce_ == p50_last_stamp_nonce &&
-        ticket.release_nonce_ == p50_active_client_release_nonce &&
-        ticket.attempt_capability_.valid() &&
-        !ticket.canonical_claim_.empty() &&
-        ticket.f_launch_generation_ != 0 &&
-        ticket.f_launch_attempt_ != 0 &&
-        ticket.operation_sequence_ != 0 &&
-        icecc::p50::store_identity_guid_valid_for_role(
-            ticket.f_store_guid_, icecc::p50::kStoreIdentityFileRole);
-    ticket.invalidate();
-    if (!exact) {
-        p50_note_channel_mutation();
-        return -1;
-    }
-    return p50_checked_release_fd();
-}
-
 int MsgChannel::release_fd_if_input_empty()
 {
     p50_note_channel_mutation();
-    p50_clear_outbound_claim();
     /* Every condition is checked before changing ownership.  In particular,
        do not call read_a_bit(): a failed handoff must leave an early CacheWire
        byte, or a partial/complete ordinary frame, exactly where the legacy
@@ -3208,7 +2618,6 @@ int MsgChannel::release_fd_after_cache_session_ready(
     std::chrono::steady_clock::time_point deadline, bool *busy)
 {
     p50_note_channel_mutation();
-    p50_clear_outbound_claim();
     /* Calling this seam is one-shot even when READY is malformed, late, or
        absent.  A failed caller still owns the descriptor so normal teardown
        closes it, but it can never reinterpret later bytes as a fresh READY. */
@@ -3227,18 +2636,6 @@ int MsgChannel::release_fd_after_cache_session_ready(
 
 bool MsgChannel::send_msg(const Msg &m, int flags)
 {
-    p50_promote_flushed_claim();
-
-    const bool client_claim_pending =
-        p50_queued_claim_frame != 0 || !p50_outbound_claim.empty();
-    const bool server_claim_pending =
-        p50_active_server_release_nonce != 0;
-    const bool client_ticket_pending =
-        p50_active_client_release_nonce != 0;
-    const bool authorized_server_outcome =
-        m == Msg::P50_CACHE_SESSION_OUTCOME &&
-        p50_server_outcome_send_armed && server_claim_pending;
-
     p50_note_channel_mutation();
 
     if (m != Msg::P50_CACHE_SESSION_FD_REQUEST) {
@@ -3254,45 +2651,6 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         log_error() << "refusing " << m.to_string()
                     << " on negotiated protocol " << protocol << endl;
         return false;
-    }
-
-    // A P5CL connection is singular: C sends no second ordinary frame, and F
-    // sends exactly one ticket-bound P5CO through the dedicated API. An
-    // attempted extra frame poisons the ordinary parser instead of silently
-    // discarding capability state and continuing on a different protocol.
-    if (client_claim_pending ||
-        (server_claim_pending && !authorized_server_outcome) ||
-        client_ticket_pending ||
-        (m == Msg::P50_CACHE_SESSION_OUTCOME &&
-         !authorized_server_outcome)) {
-        p50_clear_outbound_claim();
-        set_error(true);
-        return false;
-    }
-
-    std::vector<uint8_t> outbound_p50_claim;
-    ClaimAttemptCapability128 outbound_p50_attempt_capability{};
-    if (m == Msg::P50_CACHE_SESSION_CLAIM) {
-        const auto *claim_message =
-            dynamic_cast<const P50CacheSessionClaimMsg *>(&m);
-        if (claim_message == nullptr || !p50_outbound_claim.empty() ||
-            p50_queued_claim_frame != 0 || msgtogo != 0 ||
-            !pending_frame_ends.empty()) {
-            p50_clear_outbound_claim();
-            return false;
-        }
-        const auto claim =
-            icecc::p50::daemon::decode_cache_session_wire_claim(
-                claim_message->wire);
-        if (!claim.has_value()) {
-            p50_clear_outbound_claim();
-            return false;
-        }
-        outbound_p50_claim = claim_message->wire;
-        outbound_p50_attempt_capability =
-            claim->attempt.selected_capability;
-    } else if (!authorized_server_outcome) {
-        p50_clear_outbound_claim();
     }
 
     /* CACHE_SESSION is a bidirectional stream boundary.  Once any later
@@ -3350,12 +2708,6 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         pending_frame_ends.pop_front();
     }
 
-    if (m == Msg::P50_CACHE_SESSION_CLAIM) {
-        p50_queued_claim_frame = frames_queued_seq;
-        p50_queued_claim = std::move(outbound_p50_claim);
-        p50_queued_claim_attempt_capability =
-            outbound_p50_attempt_capability;
-    }
     if (m == Msg::P50_CACHE_SESSION_FD_REQUEST) {
         const auto *request =
             dynamic_cast<const P50CacheSessionFdRequestMsg *>(&m);
@@ -3379,10 +2731,6 @@ bool MsgChannel::send_msg(const Msg &m, int flags)
         pending_frame_ends.empty()) {
         cache_session_send_release_armed = true;
     }
-    if (flushed)
-        p50_promote_flushed_claim();
-    else if (m == Msg::P50_CACHE_SESSION_CLAIM)
-        p50_clear_outbound_claim();
     if (!flushed && m == Msg::P50_CACHE_SESSION_FD_REQUEST) {
         p50_fd_request_pending = false;
         p50_fd_pending_request_frame = 0;
@@ -4082,58 +3430,6 @@ bool p50_read_arm(MsgChannel *channel, P50SourceArmFields &arm)
 }
 
 } // namespace
-
-bool P50CacheSessionClaimMsg::valid_payload() const
-{
-    if (!wire_payload_valid || wire.empty() || wire.size() > MaxPayloadBytes)
-        return false;
-    const auto decoded =
-        icecc::p50::daemon::decode_cache_session_wire_claim(wire);
-    return decoded.has_value() &&
-           icecc::p50::daemon::encode_cache_session_wire_claim(*decoded) ==
-               wire;
-}
-
-void P50CacheSessionClaimMsg::fill_from_channel(MsgChannel *channel)
-{
-    wire_payload_valid = channel != nullptr &&
-        channel->read_current_message_payload(wire, 1, MaxPayloadBytes);
-    if (!wire_payload_valid)
-        wire.clear();
-}
-
-void P50CacheSessionClaimMsg::send_to_channel(MsgChannel *channel) const
-{
-    if (channel != nullptr && valid_payload()) {
-        Msg::send_to_channel(channel);
-        channel->write_message_payload(wire);
-    }
-}
-
-bool P50CacheSessionOutcomeMsg::valid_payload() const
-{
-    if (!wire_payload_valid || wire.empty() || wire.size() > MaxPayloadBytes)
-        return false;
-    const auto decoded = icecc::p50::daemon::decode_cache_session_outcome(wire);
-    return decoded.has_value() &&
-           icecc::p50::daemon::encode_cache_session_outcome(*decoded) == wire;
-}
-
-void P50CacheSessionOutcomeMsg::fill_from_channel(MsgChannel *channel)
-{
-    wire_payload_valid = channel != nullptr &&
-        channel->read_current_message_payload(wire, 1, MaxPayloadBytes);
-    if (!wire_payload_valid)
-        wire.clear();
-}
-
-void P50CacheSessionOutcomeMsg::send_to_channel(MsgChannel *channel) const
-{
-    if (channel != nullptr && valid_payload()) {
-        Msg::send_to_channel(channel);
-        channel->write_message_payload(wire);
-    }
-}
 
 bool P50SourceArmMsg::valid_payload() const
 {

@@ -438,6 +438,49 @@ void test_ordinary_mutation_clears_receive_arm()
               expected, observed, deadline()) == -1);
 }
 
+void test_deferred_request_flush_still_arms_reply()
+{
+    /* An FD_REQUEST sent behind already-queued ordinary output defers
+       (SendBulkOnly leaves under-4KiB output unflushed).  The deferred
+       flush must still arm the fd receive seam: the reply is delivered
+       after flush_pending() promotes the pending request. */
+    ChannelPair pair = make_pair();
+    const auto expected = request();
+    PingMsg ping;
+    CHECK(pair.left->send_msg(ping, MsgChannel::SendBulkOnly));
+    P50CacheSessionFdRequestMsg outbound(expected);
+    CHECK(pair.left->send_msg(outbound, MsgChannel::SendBulkOnly));
+    CHECK(pair.left->flush_pending());
+
+    Msg *first = pair.right->get_msg(2, true);
+    CHECK(first != nullptr && *first == Msg::PING);
+    delete first;
+    Msg *decoded = pair.right->get_msg(2, true);
+    auto *typed = dynamic_cast<P50CacheSessionFdRequestMsg *>(decoded);
+    CHECK(typed != nullptr && typed->request == expected);
+
+    char path[] = "/tmp/icecc-p50-fd-XXXXXX";
+    const int source = ::mkstemp(path);
+    CHECK(source >= 0);
+    const char contents[] = "deferred flush arms the reply";
+    CHECK(::write(source, contents, sizeof(contents)) == sizeof(contents));
+    CHECK(::unlink(path) == 0);
+    CHECK(pair.right->send_p50_cache_fd_reply(
+        *typed, control_identity(), source, deadline()));
+
+    P50CacheControlIdentity observed;
+    const int received = pair.left->receive_p50_cache_fd_reply(
+        expected, observed, deadline());
+    CHECK(received >= 0);
+    CHECK(observed == control_identity());
+    CHECK(::lseek(received, 0, SEEK_SET) == 0);
+    char readback[sizeof(contents)]{};
+    CHECK(::read(received, readback, sizeof(readback)) == sizeof(readback));
+    CHECK(std::memcmp(readback, contents, sizeof(contents)) == 0);
+    ::close(received);
+    delete decoded;
+}
+
 } // namespace
 
 int main()
@@ -454,6 +497,7 @@ int main()
         test_sender_deadline_consumes_fd();
         test_deferred_reply_ticket_survives_only_empty_probe();
         test_ordinary_mutation_clears_receive_arm();
+        test_deferred_request_flush_still_arms_reply();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "p50 cache fd seam test failed: %s\n", error.what());
         return 1;
