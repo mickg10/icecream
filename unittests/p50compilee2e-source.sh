@@ -63,6 +63,17 @@ contract() {
     require_text "$root/client/remote.cpp" 'make_source_transfer_operation' || return 1
     require_text "$root/client/remote.cpp" 'source.release()' || return 1
     require_text "$root/client/remote.cpp" 'control.advance' || return 1
+    # The patience sent to the sidecar must be the client's remaining wait
+    # minus a reply reserve, floored at 1 ms and capped at the wire bound:
+    # deleting any of the three (reserve, floor, cap) lets the sidecar's
+    # anchored deadline meet or outlast the client's own poll deadline.
+    require_text "$root/client/remote.cpp" \
+        'constexpr auto kP50SourceReplyReserve = std::chrono::milliseconds(250)' || return 1
+    require_text "$root/client/remote.cpp" \
+        'deadline - std::chrono::steady_clock::now() - kP50SourceReplyReserve' || return 1
+    require_text "$root/client/remote.cpp" 'patience.count() < 1' || return 1
+    require_text "$root/client/remote.cpp" \
+        'patience.count(), kMaxSourceTransferPatienceMs' || return 1
     for field in wire_job_id assignment_epoch assignment_nonce selected_f_host \
         selected_f_ordinary_port selected_f_cache_port cache_protocol cache_profile \
         logical_job compiler_attempt source_request_id source_mode; do
@@ -185,6 +196,10 @@ for pair in \
     "client/remote.cpp|begin_authenticated" \
     "client/remote.cpp|make_source_transfer_operation" \
     "client/remote.cpp|source.release()" \
+    "client/remote.cpp|constexpr auto kP50SourceReplyReserve = std::chrono::milliseconds(250)" \
+    "client/remote.cpp|deadline - std::chrono::steady_clock::now() - kP50SourceReplyReserve" \
+    "client/remote.cpp|patience.count() < 1" \
+    "client/remote.cpp|patience.count(), kMaxSourceTransferPatienceMs" \
     "client/Makefile.am|libp50localtransport.a" \
     "client/remote.cpp|std::chrono::seconds(120)" \
     "client/remote.cpp|ICECC_P50_PREPROCESSED_CAPTURE" \

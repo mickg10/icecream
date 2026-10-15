@@ -6,6 +6,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/use_future.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 #include <limits>
@@ -41,7 +42,7 @@ P50RouteRelationship relationship(uint64_t c, uint64_t f, uint64_t generation,
                                 profile};
 }
 
-void test_source_transfer_operation_wire() {
+local::P50SourceTransferRequest source_arm() {
     local::P50SourceTransferRequest arm;
     arm.wire_job_id = 17;
     arm.assignment_epoch = 3;
@@ -56,19 +57,22 @@ void test_source_transfer_operation_wire() {
     arm.source_request_id = 8;
     arm.source_mode = P50_SOURCE_MODE_ZSTD_ROUTE;
     CHECK(arm.valid());
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5),
-        clock.clock_domain_id, clock.time_namespace_id);
+    return arm;
+}
+
+void test_source_transfer_operation_wire() {
+    const local::P50SourceTransferRequest arm = source_arm();
+    constexpr uint32_t patience = 5000;
     const local::Identity identity{11, 12};
-    const auto request = local::make_source_transfer_operation(identity, arm, deadline);
+    const auto request = local::make_source_transfer_operation(identity, arm, patience);
     const auto wire = local::encode_control_operation(request);
     CHECK(wire.size() == local::kSourceTransferOperationBytes);
     local::ControlOperation decoded;
     CHECK(local::decode_control_operation(wire, decoded));
     CHECK(decoded.kind == local::ControlOperationKind::SourceTransfer);
     CHECK(decoded.source_arm == arm);
-    CHECK(decoded.absolute_deadline == deadline);
+    CHECK(decoded.source_patience_ms == patience);
+    CHECK(decoded.absolute_deadline == sidecar::AbsoluteMonotonicDeadline{});
 
     // C control/store identity is supplied by the supervised sidecar, never
     // by this daemon request.  Any attempt to populate the reserved C slots
@@ -106,6 +110,116 @@ void test_source_transfer_operation_wire() {
     CHECK(decoded.source_result->error_code == static_cast<uint16_t>(
         local::SourceTransferErrorCode::RouteReplacementRequired));
     CHECK(decoded.source_result->attempts == 2);
+}
+
+// The patience is a big-endian u32 at offset 408 and the 20 bytes the old
+// absolute deadline occupied (408..431 minus the u32) stay zero on the wire.
+void test_source_transfer_patience_wire_layout() {
+    const local::P50SourceTransferRequest arm = source_arm();
+    const local::Identity identity{11, 12};
+    constexpr uint32_t patience = 12345;  // 0x00003039, inside the cap.
+    const auto request =
+        local::make_source_transfer_operation(identity, arm, patience);
+    const auto wire = local::encode_control_operation(request);
+    CHECK(wire.size() == local::kSourceTransferOperationBytes);
+    CHECK(wire[1] == local::kControlOperationVersionV6);
+    CHECK(wire[408] == 0x00 && wire[409] == 0x00 && wire[410] == 0x30 &&
+          wire[411] == 0x39);
+    CHECK(local::detail::control_get_u32(wire.data() + 408) == patience);
+    CHECK(std::all_of(wire.begin() + 412, wire.begin() + 432,
+                      [](uint8_t byte) { return byte == 0; }));
+}
+
+// Decode bounds the patience: zero is a missing deadline, and the sender's
+// own deadline cap is the upper bound of what a receiver will honor.
+void test_source_transfer_patience_decode_bounds() {
+    const local::P50SourceTransferRequest arm = source_arm();
+    const local::Identity identity{11, 12};
+    local::ControlOperation decoded;
+    const auto wire = local::encode_control_operation(
+        local::make_source_transfer_operation(
+            identity, arm, local::kMaxSourceTransferPatienceMs));
+    CHECK(local::decode_control_operation(wire, decoded));
+    CHECK(decoded.source_patience_ms == local::kMaxSourceTransferPatienceMs);
+
+    // Encode refuses both bounds before any byte reaches the wire.
+    CHECK(local::encode_control_operation(
+              local::make_source_transfer_operation(identity, arm, 0))
+              .empty());
+    CHECK(local::encode_control_operation(local::make_source_transfer_operation(
+                  identity, arm,
+                  local::kMaxSourceTransferPatienceMs + 1))
+              .empty());
+
+    // Decode refuses the same bounds on a hand-built frame.
+    for (const uint32_t patience : {0U, local::kMaxSourceTransferPatienceMs + 1U,
+                                    std::numeric_limits<uint32_t>::max()}) {
+        auto mutant = local::encode_control_operation(
+            local::make_source_transfer_operation(identity, arm, 1));
+        CHECK(!mutant.empty());
+        local::detail::control_put_u32(mutant.data() + 408, patience);
+        CHECK(!local::decode_control_operation(mutant, decoded));
+    }
+}
+
+// Every one of the 20 reserved bytes behind the patience u32 must stay zero;
+// an old-layout frame still writing clock_domain_id at 416 or a time
+// namespace id at 424 is refused rather than misread.
+void test_source_transfer_reserved_bytes_refused() {
+    const local::P50SourceTransferRequest arm = source_arm();
+    const local::Identity identity{11, 12};
+    local::ControlOperation decoded;
+    const auto wire = local::encode_control_operation(
+        local::make_source_transfer_operation(identity, arm, 5000));
+    CHECK(!wire.empty());
+    for (size_t offset = 412; offset != 432; ++offset) {
+        auto mutant = wire;
+        mutant[offset] = 1;
+        CHECK(!local::decode_control_operation(mutant, decoded));
+    }
+
+    // An old-layout frame still writing the absolute clock identity into the
+    // retired fields: clock_domain_id=1 at 416 and a time namespace id at 424
+    // are exactly what the reserved range now guards.
+    auto old_layout = wire;
+    local::detail::control_put_u64(old_layout.data() + 416, 1);
+    CHECK(!local::decode_control_operation(old_layout, decoded));
+    auto namespace_mutant = wire;
+    namespace_mutant[424] = 1;
+    CHECK(!local::decode_control_operation(namespace_mutant, decoded));
+}
+
+// Encode demands the operation's own invariants: SourceTransfer carries a
+// bounded nonzero patience and never a leftover absolute deadline, and the
+// patience field is absent (zero) on every other kind.
+void test_source_transfer_operation_encode_invariants() {
+    const local::P50SourceTransferRequest arm = source_arm();
+    const local::Identity identity{11, 12};
+
+    // SourceTransfer with a nonzero absolute deadline is refused.
+    auto legacy = local::make_source_transfer_operation(identity, arm, 5000);
+    legacy.absolute_deadline.expires_at_ns = 1;
+    legacy.absolute_deadline.clock_domain_id = 1;
+    legacy.absolute_deadline.time_namespace_id = 1;
+    CHECK(local::encode_control_operation(legacy).empty());
+
+    // A non-SourceTransfer kind must not carry the patience.
+    const auto cache = local::make_cache_session_operation(identity, 23);
+    CHECK(!local::encode_control_operation(cache).empty());
+    auto patient_cache = cache;
+    patient_cache.source_patience_ms = 1;
+    CHECK(local::encode_control_operation(patient_cache).empty());
+
+    InputRecordKey input;
+    input.c_store_guid.bytes[15] = 3;
+    input.tu_seq.value = 5;
+    const InputLeaseOwner owner{9, 10, 11};
+    const auto attachment =
+        local::make_input_fd_attachment_operation(identity, input, owner, 23);
+    CHECK(!local::encode_control_operation(attachment).empty());
+    auto patient_attachment = attachment;
+    patient_attachment.source_patience_ms = local::kMaxSourceTransferPatienceMs;
+    CHECK(local::encode_control_operation(patient_attachment).empty());
 }
 
 ZstdSourceTransferResult route_call(
@@ -1187,6 +1301,10 @@ void test_reset_f_store_exact_refuses_while_transfer_in_flight() {
 
 int main() {
     test_source_transfer_operation_wire();
+    test_source_transfer_patience_wire_layout();
+    test_source_transfer_patience_decode_bounds();
+    test_source_transfer_reserved_bytes_refused();
+    test_source_transfer_operation_encode_invariants();
     test_long_lived_relationship_owner();
     test_same_request_route_fork_wire();
     test_multiroute_release_lifetime();

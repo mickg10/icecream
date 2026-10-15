@@ -1861,11 +1861,12 @@ test "$ready" -eq 1
                 command = ["env", *external_env,
                            *[item for item in command[1:]
                              if not str(item).startswith("ICECC_P50_C1F1_WORKDIR=")]]
-            # C and the compiler wrapper exchange an absolute CLOCK_MONOTONIC
-            # deadline whose wire identity includes /proc/self/ns/time.
-            # ``--pid=host`` does not make two sibling Docker containers share
-            # a time namespace, so execute the batch inside C's already pinned
-            # container.  The second C bind above exposes the unique evidence
+            # SourceTransfer's wire patience keeps every P50 clock local, so
+            # no time namespace has to be shared for the batch.  What still
+            # binds is the wrapper's SO_PEERCRED pid: the daemon resolves
+            # /proc/<pid>/cmdline from the socket peer, so the batch executes
+            # inside C's already pinned container to inherit its PID
+            # namespace.  The second C bind above exposes the unique evidence
             # root at the same absolute path expected by the mature runner.
             batch = (f"docker exec --user 0 {token}-c /bin/sh -c "
                      f"{shlex.quote(shlex.join([str(item) for item in command]))}")

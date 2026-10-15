@@ -310,8 +310,11 @@ role byte and must match the expected incarnation.
 One move-only Connection owns the socket and write path; concurrent sends
 return Busy. Descriptors are CLOEXEC, peer UID/GID (and the lease PID where
 required) are verified, and sends suppress SIGPIPE. Absolute steady-clock
-deadlines cover whole frames across partial operations; no host clock
-time_point is serialized. Unsupported required OS facilities cause refusal.
+deadlines cover whole frames across partial operations. SourceTransfer
+serializes no host clock time_point: it carries only the sender's remaining
+patience as a u32 millisecond duration, which the receiver anchors to its
+own steady clock at decode, capped by the sidecar's own budget.
+Unsupported required OS facilities cause refusal.
 
 The CacheSession DATA operation remains a 32-byte version-1 envelope.
 Owner-bearing InputFdAttachment and InputLifecycle operations use this
@@ -340,6 +343,32 @@ reject a result field or queued trailing data before mutation. Replies echo
 the full identity. The daemon-side caller sends an empty identity-bound GOODBYE after the reply so
 stream closure does not race reply delivery. Losing that ACK does not undo
 the operation.
+
+SourceTransfer uses a fixed 512-byte version-6 layout. Patience is
+1..300000 ms; a peer still writing the old absolute deadline shape in the
+reserved bytes is refused instead of misread. The sidecar anchors the
+patience to its own steady clock at decode and caps it with its own budget
+(`Options::source_transfer_budget`, default 120000 ms). After F answers
+ARMED, the sidecar counts `ARMED.source_budget_msec` from its own ARM send
+and clamps the transfer deadline to 1 s before that lease ends.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 2 | operation version (6) |
+| 2 | 2 | operation kind (SourceTransfer) |
+| 4 | 4 | exact length (512) |
+| 8 | 8 | sidecar generation |
+| 16 | 8 | sidecar attempt |
+| 24 | 8 | request/source ID |
+| 32 | 356 | arm: wire job ID, assignment epoch/nonce, F host, ports, protocol, profile, logical job/attempt, source request ID, source mode |
+| 388 | 20 | reserved zero |
+| 408 | 4 | source_patience_ms u32 |
+| 412 | 20 | reserved zero |
+| 432 | 56 | result block: C GUID, code, error code, attempts, TU sequence, raw bytes, raw digest |
+| 488 | 24 | reserved zero |
+
+The reply is a bitwise echo of the request with the result block filled in;
+the daemon compares the echoed patience, not any absolute deadline.
 
 ### Descriptor records
 

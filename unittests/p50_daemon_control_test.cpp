@@ -43,11 +43,8 @@ ControlOperation source_operation() {
     arm.compiler_attempt = 20;
     arm.source_request_id = 23;
     arm.source_mode = P50_SOURCE_MODE_ZSTD_TU;
-    const auto clock = icecc::p50::sidecar::process_monotonic_clock_identity();
-    const auto deadline = icecc::p50::sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(5),
-        clock.clock_domain_id, clock.time_namespace_id);
-    return make_source_transfer_operation(Identity{91, 17}, arm, deadline);
+    // Only the remaining wait crosses the boundary; the sidecar anchors it.
+    return make_source_transfer_operation(Identity{91, 17}, arm, 5000);
 }
 
 CredentialExpectation credentials() {
@@ -234,14 +231,17 @@ void test_source_transfer_reply_and_tu0() {
         CHECK(decoded.kind == expected.kind && decoded.identity == expected.identity &&
               decoded.request_id == expected.request_id &&
               decoded.source_arm == expected.source_arm &&
-              decoded.absolute_deadline == expected.absolute_deadline);
+              decoded.source_patience_ms == expected.source_patience_ms);
 
         Connection connection(pair[1]);
         CHECK(connection.verify_peer_credentials(credentials()) == Status::Ok);
         FdHandoffReceiver receiver;
+        // Anchoring the remaining patience starts at this side's own clock.
+        const auto local_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
         const auto handoff = receiver.receive_and_ack(
             connection, HandoffRequest{expected.identity, expected.request_id},
-            expected.absolute_deadline.as_steady_time_point());
+            local_deadline);
         CHECK(handoff.status == FdHandoffStatus::Accepted);
         HandoffFd received = receiver.take_adopted_fd();
         CHECK(received.valid());
@@ -272,6 +272,66 @@ void test_source_transfer_reply_and_tu0() {
           daemon_control_status_name(sender.status()));
     CHECK(sender.source_transfer_result().has_value());
     CHECK(sender.source_transfer_result()->tu_seq == 0);
+    ::close(pair[1]);
+}
+
+// The sidecar's reply is an echo of the request: a reply carrying a different
+// patience than the one this side sent must be refused as a mismatch, never
+// silently adopted as the new wait bound.
+void test_source_transfer_reply_patience_mismatch_rejected() {
+    int pair[2] = {-1, -1};
+    CHECK(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    nonblock(pair[0]);
+    const ControlOperation expected = source_operation();
+    const int payload = ::open("/dev/null", O_RDONLY);
+    CHECK(payload >= 0);
+    DaemonControlOperation sender;
+    CHECK(sender.begin_authenticated(
+              pair[0], expected, payload, credentials(), expected.identity,
+              std::chrono::steady_clock::now() + std::chrono::seconds(5),
+              DaemonControlLimits{}, DaemonControlFdOwnership::Borrowed) ==
+          DaemonControlStatus::InProgress);
+
+    std::thread peer([&] {
+        Frame control;
+        CHECK(read_frame(pair[1], control) == Status::Ok);
+        ControlOperation decoded;
+        CHECK(control.type == MessageType::Data &&
+              decode_control_operation(control.payload, decoded));
+        // Fake sidecar: acknowledge the fd handoff, then reply with the same
+        // arm but the patience of a fresher, more patient sender.
+        Connection connection(pair[1]);
+        CHECK(connection.verify_peer_credentials(credentials()) == Status::Ok);
+        FdHandoffReceiver receiver;
+        const auto handoff = receiver.receive_and_ack(
+            connection, HandoffRequest{expected.identity, expected.request_id},
+            std::chrono::steady_clock::now() + std::chrono::seconds(5));
+        CHECK(handoff.status == FdHandoffStatus::Accepted);
+        receiver.take_adopted_fd().reset();
+
+        P50SourceTransferResult result;
+        result.code = SourceTransferResultCode::Committed;
+        result.attempts = 1;
+        result.tu_seq = 0;
+        result.raw_bytes = 1;
+        result.raw_digest.bytes[0] = 9;
+        result.c_store_guid.bytes[15] = 91;
+        auto response = make_source_transfer_reply_operation(expected, result);
+        response.source_patience_ms = expected.source_patience_ms + 1;
+        write_frame(pair[1], Frame{kProtocolVersion, MessageType::Data,
+                                   expected.identity,
+                                   encode_control_operation(response)});
+    });
+    while (!sender.done()) {
+        pollfd pfd{pair[0], sender.desired_events(), 0};
+        CHECK(::poll(&pfd, 1, 1000) == 1);
+        sender.advance(std::chrono::steady_clock::now(), pfd.revents);
+    }
+    peer.join();
+    check(sender.status() == DaemonControlStatus::OperationMismatch,
+          daemon_control_status_name(sender.status()));
+    CHECK(!sender.source_transfer_result().has_value());
+    ::close(pair[0]);
     ::close(pair[1]);
 }
 
@@ -1078,6 +1138,7 @@ int main() {
     test_incremental_handoff_and_fairness();
     test_extra_fd_is_closed_and_rejected();
     test_source_transfer_reply_and_tu0();
+    test_source_transfer_reply_patience_mismatch_rejected();
     test_canonical_request_codec_both_directions();
     test_nonzero_reserved_code_rejected();
     test_client_frame_trailing_rejected();

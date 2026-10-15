@@ -660,7 +660,7 @@ bool DaemonControlOperation::read_source_reply(size_t& calls,
         observed.identity != operation_.identity ||
         observed.request_id != operation_.request_id ||
         observed.source_arm != operation_.source_arm ||
-        observed.absolute_deadline != operation_.absolute_deadline ||
+        observed.source_patience_ms != operation_.source_patience_ms ||
         !observed.source_result.has_value()) {
         fail(DaemonControlStatus::OperationMismatch);
         return false;

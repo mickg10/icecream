@@ -59,7 +59,6 @@
 #include "p50_compile_binding.h"
 #include "cache/p50_control_operation.h"
 #include "cache/p50_daemon_control.h"
-#include "cache/p50_sidecar_identity.h"
 #include "services/digest128.h"
 #include "services/util.h"
 #include "services/stage_trace.h"
@@ -596,6 +595,9 @@ icecc::p50::local::P50SourceTransferResult p50_transfer_error(
     return result;
 }
 
+// Headroom kept between the sidecar's anchored deadline and this client's own.
+constexpr auto kP50SourceReplyReserve = std::chrono::milliseconds(250);
+
 icecc::p50::local::P50SourceTransferResult transfer_p50_source(
     CompileJob &job, const UseCSMsg &assignment, MsgChannel &local_daemon,
     icecc::p50::OwnedSourceFd source, icecc::p50::ProfileId profile)
@@ -648,12 +650,21 @@ icecc::p50::local::P50SourceTransferResult transfer_p50_source(
         return p50_transfer_error(5);
     }
 
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto absolute_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        deadline, clock.clock_domain_id, clock.time_namespace_id);
+    // Only the remaining wait crosses to the sidecar, which anchors it to its
+    // own clock at decode: a build in another time namespace, or on a kernel
+    // without time namespaces, transfers the same way.  The reserve leaves
+    // the sidecar room to reply before this wait gives up.
+    const auto patience = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now() - kP50SourceReplyReserve);
+    if (patience.count() < 1) {
+        ::close(control_fd);
+        return p50_transfer_error(8);
+    }
+    const uint32_t patience_ms = static_cast<uint32_t>(std::min<int64_t>(
+        patience.count(), kMaxSourceTransferPatienceMs));
     const Identity identity{control_identity.generation, control_identity.attempt};
     const ControlOperation operation = make_source_transfer_operation(
-        identity, request, absolute_deadline);
+        identity, request, patience_ms);
     CredentialExpectation credentials;
     credentials.uid = control_identity.peer_uid;
     credentials.gid = control_identity.peer_gid;

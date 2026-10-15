@@ -26,6 +26,8 @@ std::vector<uint8_t> encode_control_operation(
                   operation.replacement_owner.has_value() ||
                   operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{};
     }
+    if (!invalid && !source)
+        invalid = operation.source_patience_ms != 0;
     if (!invalid && input) {
         invalid = !operation.input.has_value() ||
                   operation.input->c_store_guid == CStoreGuid{} ||
@@ -84,7 +86,9 @@ std::vector<uint8_t> encode_control_operation(
         invalid = !operation.source_arm.has_value() ||
                   !operation.source_arm->valid() ||
                   operation.request_id != operation.source_arm->source_request_id ||
-                  !operation.absolute_deadline.valid() ||
+                  operation.source_patience_ms == 0 ||
+                  operation.source_patience_ms > kMaxSourceTransferPatienceMs ||
+                  operation.absolute_deadline != sidecar::AbsoluteMonotonicDeadline{} ||
                   operation.input.has_value() || operation.owner.has_value() ||
                   operation.lifecycle_action != InputLifecycleAction::None ||
                   operation.lifecycle_result.has_value() ||
@@ -190,13 +194,9 @@ std::vector<uint8_t> encode_control_operation(
         detail::control_put_u64(wire.data() + 336, arm.compiler_attempt);
         detail::control_put_u64(wire.data() + 376, arm.source_request_id);
         detail::control_put_u32(wire.data() + 384, arm.source_mode);
-        detail::control_put_u64(
-            wire.data() + 408,
-            static_cast<uint64_t>(operation.absolute_deadline.expires_at_ns));
-        detail::control_put_u64(wire.data() + 416,
-                                operation.absolute_deadline.clock_domain_id);
-        detail::control_put_u64(wire.data() + 424,
-                                operation.absolute_deadline.time_namespace_id);
+        // 412..431 stay zero: a peer still sending the old absolute deadline
+        // there is refused instead of misread.
+        detail::control_put_u32(wire.data() + 408, operation.source_patience_ms);
         if (operation.source_result.has_value()) {
             const P50SourceTransferResult& result = *operation.source_result;
             std::copy(result.c_store_guid.bytes.begin(),
@@ -381,13 +381,11 @@ bool decode_control_operation(std::span<const uint8_t> wire,
                         [](uint8_t byte) { return byte != 0; }))
             return false;
         operation.source_arm = std::move(arm);
-        operation.absolute_deadline.expires_at_ns =
-            static_cast<int64_t>(detail::control_get_u64(wire.data() + 408));
-        operation.absolute_deadline.clock_domain_id =
-            detail::control_get_u64(wire.data() + 416);
-        operation.absolute_deadline.time_namespace_id =
-            detail::control_get_u64(wire.data() + 424);
-        if (!operation.absolute_deadline.valid() ||
+        operation.source_patience_ms = detail::control_get_u32(wire.data() + 408);
+        if (operation.source_patience_ms == 0 ||
+            operation.source_patience_ms > kMaxSourceTransferPatienceMs ||
+            std::any_of(wire.begin() + 412, wire.begin() + 432,
+                        [](uint8_t byte) { return byte != 0; }) ||
             std::any_of(wire.begin() + 453, wire.begin() + 456,
                         [](uint8_t byte) { return byte != 0; }) ||
             std::any_of(wire.begin() + 488, wire.end(),

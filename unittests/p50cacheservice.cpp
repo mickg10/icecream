@@ -271,6 +271,53 @@ Child launch(const std::string& directory, uint64_t generation = 7, uint64_t att
     return child;
 }
 
+// A plain cache-service launch whose child-only environment can arm test-only
+// knobs (the source-transfer budget override needs ICECC_TESTS) and whose
+// stderr lands in a capture file, so a spawned-service test can assert the
+// child's own refusal lines without touching the test process's stderr.
+Child launch_with_stderr_capture(
+    const std::string& directory, const std::string& stderr_capture,
+    const std::vector<std::pair<std::string, std::string>>& environment) {
+    int ready[2] = {-1, -1};
+    CHECK(::pipe(ready) == 0);
+    const int flags = ::fcntl(ready[1], F_GETFD);
+    CHECK(flags >= 0);
+    CHECK(::fcntl(ready[1], F_SETFD, flags & ~FD_CLOEXEC) == 0);
+    const std::string socket = directory + "/service.sock";
+    const std::string uid = std::to_string(static_cast<uint64_t>(::getuid()));
+    const std::string gid = std::to_string(static_cast<uint64_t>(::getgid()));
+    const std::string ready_fd = std::to_string(ready[1]);
+    const std::string executable = service_path();
+    const pid_t pid = ::fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        (void)::close(ready[0]);
+        const int capture =
+            ::open(stderr_capture.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (capture >= 0) {
+            (void)::dup2(capture, STDERR_FILENO);
+            if (capture != STDERR_FILENO)
+                (void)::close(capture);
+        }
+        (void)::setenv("ICECC_CACHE_SERVICE_READY_FD", ready_fd.c_str(), 1);
+        for (const auto& [name, value] : environment)
+            (void)::setenv(name.c_str(), value.c_str(), 1);
+        ::execl(executable.c_str(), executable.c_str(), "--socket", socket.c_str(),
+                "--peer-uid", uid.c_str(), "--peer-gid", gid.c_str(), "--generation",
+                "7", "--attempt", "1", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    (void)::close(ready[1]);
+    Child child{pid, ready[0]};
+    expect_exact_ready_then_eof(child.ready_read);
+    (void)::close(child.ready_read);
+    child.ready_read = -1;
+    struct stat socket_info{};
+    CHECK(::lstat(socket.c_str(), &socket_info) == 0 && S_ISSOCK(socket_info.st_mode));
+    CHECK((socket_info.st_mode & 07777) == 0600);
+    return child;
+}
+
 void fingerprint_stop_before_ready_is_bounded() {
     char template_path[] = "/tmp/icecc-p29-fingerprint-stop-XXXXXX";
     CHECK(::mkdtemp(template_path) != nullptr);
@@ -980,10 +1027,8 @@ void test_route_endpoint_cap_refuses_before_f_open() {
     request.source_request_id = 76;
     request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
     CHECK(request.valid());
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(2),
-        clock.clock_domain_id, clock.time_namespace_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult result = runtime.transfer_source_on_owner(
         request, deadline, local::HandoffFd(source_fd));
@@ -1047,10 +1092,8 @@ void test_known_endpoint_relationship_cap_refuses_before_f_open() {
     request.source_request_id = 86;
     request.source_mode = P50_SOURCE_MODE_ZSTD_TU;
     CHECK(request.valid());
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(2),
-        clock.clock_domain_id, clock.time_namespace_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult result = runtime.transfer_source_on_owner(
         request, deadline, local::HandoffFd(source_fd));
@@ -1584,7 +1627,8 @@ void serve_stalled_source_arm(int listener,
 
 void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
                           uint64_t f_store_generation,
-                          SourceArmServerObservation& observation) noexcept {
+                          SourceArmServerObservation& observation,
+                          uint32_t source_budget_msec = 2500) noexcept {
     try {
         sockaddr_in peer{};
         socklen_t peer_size = sizeof(peer);
@@ -1612,7 +1656,7 @@ void serve_one_source_arm(int listener, FStoreGuid f_store_guid,
         capability_2.bytes.fill(0xc2);
         const P50SourceArmedMsg acknowledgement(
             arm->arm, 91, 92, f_store_generation, f_store_guid.bytes,
-            kStoreIdentityDerivationVersion, 93, 2500,
+            kStoreIdentityDerivationVersion, 93, source_budget_msec,
             capability_1, capability_2);
         if (!channel->send_msg(acknowledgement))
             return;
@@ -1646,7 +1690,8 @@ void serve_accepted_source_transfer(
     int accepted, sockaddr_in peer, socklen_t peer_size,
     FStoreGuid f_store_guid, uint64_t f_store_generation,
     SourceArmServerObservation& observation,
-    bool disconnect_after_ready = false) noexcept {
+    bool disconnect_after_ready = false,
+    uint32_t source_budget_msec = 2500) noexcept {
     try {
         if (accepted < 0)
             return;
@@ -1669,7 +1714,7 @@ void serve_accepted_source_transfer(
         capability_2.bytes.fill(0xd2);
         const P50SourceArmedMsg acknowledgement(
             arm->arm, 101, 102, f_store_generation, f_store_guid.bytes,
-            kStoreIdentityDerivationVersion, 103, 2500,
+            kStoreIdentityDerivationVersion, 103, source_budget_msec,
             capability_1, capability_2);
         if (!channel->send_msg(acknowledgement))
             return;
@@ -1717,14 +1762,17 @@ void serve_accepted_source_transfer(
 
 void serve_one_source_transfer(int listener, FStoreGuid f_store_guid,
                                uint64_t f_store_generation,
-                               SourceArmServerObservation& observation) noexcept {
+                               SourceArmServerObservation& observation,
+                               uint32_t source_budget_msec = 2500) noexcept {
     sockaddr_in peer{};
     socklen_t peer_size = sizeof(peer);
     const int accepted = ::accept(
         listener, reinterpret_cast<sockaddr*>(&peer), &peer_size);
     (void)::close(listener);
     serve_accepted_source_transfer(accepted, peer, peer_size, f_store_guid,
-                                   f_store_generation, observation);
+                                   f_store_generation, observation,
+                                   /*disconnect_after_ready=*/false,
+                                   source_budget_msec);
 }
 
 struct SourceConnectRetryObservation {
@@ -1903,11 +1951,8 @@ void test_source_connect_protocol_slice_retries_before_arm() {
 
     const std::array<uint8_t, 13> source{
         'r', 'e', 't', 'r', 'y', '-', 's', 'o', 'u', 'r', 'c', 'e', '\n'};
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            clock.clock_domain_id, clock.time_namespace_id);
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     const auto started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult result =
         runtime.transfer_source_on_owner(
@@ -1954,11 +1999,8 @@ void test_source_connect_protocol_slices_share_one_outer_budget() {
     std::thread server([&] { serve_only_protocol_stalls(listener, attempts); });
     const std::array<uint8_t, 12> source{
         'a', 'l', 'l', '-', 's', 't', 'a', 'l', 'l', 'e', 'd', '\n'};
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            clock.clock_domain_id, clock.time_namespace_id);
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     const auto started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult result =
         runtime.transfer_source_on_owner(
@@ -2002,11 +2044,8 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
     const std::array<uint8_t, 8> stalled_source{
         's', 't', 'a', 'l', 'l', 'e', 'd', '\n'};
     local::P50SourceTransferResult stalled_result;
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto stalled_deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            clock.clock_domain_id, clock.time_namespace_id);
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     std::thread stalled_transfer([&] {
         stalled_result = runtime.transfer_source_on_owner(
             source_transfer_request(stalled_port, 121, CACHE_PROFILE_ZSTD_TU),
@@ -2033,9 +2072,7 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
     const std::array<uint8_t, 9> healthy_source{
         'h', 'e', 'a', 'l', 't', 'h', 'y', '!', '\n'};
     const auto healthy_deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(5),
-            clock.clock_domain_id, clock.time_namespace_id);
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
     const auto healthy_started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult healthy_result =
         runtime.transfer_source_on_owner(
@@ -2062,6 +2099,158 @@ void test_stalled_f_arm_is_bounded_before_healthy_transfer() {
     CHECK(healthy_elapsed < std::chrono::seconds(3));
 }
 
+// F's armed-source lease clamps the transfer deadline: after F's ARMED
+// acknowledgement the remaining wait is min(caller deadline, f_lease - 1s
+// handoff reserve).  A grant SHORTER than the 1s reserve clamps the deadline
+// into the past, so the transfer must fail before CacheWire (error 7, the
+// stop/deadline refusal) even though the caller passed a deadline 30s away.
+// A normal 2500ms grant (the historical fixture default) clears the
+// reserve and still commits.
+void test_f_lease_shorter_than_handoff_reserve_fails_before_cachewire() {
+    const auto run_once = [&](uint32_t source_budget_msec,
+                              local::P50SourceTransferResult& result,
+                              SourceArmServerObservation& observation) {
+        StoreIdentityRoot local_root{};
+        local_root.bytes[15] = 0x76;
+        const SidecarLaunchIdentity launch = test_sidecar_launch(local_root);
+        service::RuntimeConfig config = test_runtime_config();
+        config.c_store_guid = launch.c_store_guid;
+        config.f_store_guid = launch.f_store_guid;
+        config.f_store_generation = launch.store_generation;
+        config.sidecar_launch = launch;
+        service::SidecarRuntime runtime(std::move(config));
+
+        StoreIdentityRoot remote_root{};
+        remote_root.bytes[14] = 0x77;
+        const FStoreGuid remote_guid = f_store_guid_for_root(remote_root);
+        uint16_t port = 0;
+        const int listener = loopback_listener(port);
+        std::thread server([&] {
+            serve_one_source_transfer(listener, remote_guid, 21,
+                                      observation, source_budget_msec);
+        });
+        const std::array<uint8_t, 8> source{
+            'l', 'e', 'a', 's', 'e', '-', '1', '\n'};
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        result = runtime.transfer_source_on_owner(
+            source_transfer_request(port, 131, CACHE_PROFILE_ZSTD_TU),
+            deadline, local::HandoffFd(source_file("p50-f-lease", source)));
+        server.join();
+    };
+
+    // 900ms grant < 1s kFLeaseHandoffReserve: the clamped deadline is
+    // already behind the transfer, so it refuses before the route lock.
+    {
+        local::P50SourceTransferResult refused{};
+        SourceArmServerObservation observation;
+        const auto started = std::chrono::steady_clock::now();
+        run_once(900, refused, observation);
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        CHECK(refused.code == local::SourceTransferResultCode::Error);
+        CHECK(refused.error_code == 7 && refused.attempts == 0);
+        CHECK(refused.tu_seq == 0);
+        CHECK(observation.accepted && observation.protocol_50 &&
+              observation.arm_received && observation.armed_sent &&
+              observation.cache_session_received && observation.ready_sent &&
+              !observation.transfer_completed);
+        CHECK(elapsed < std::chrono::seconds(10));
+    }
+    // The ordinary 2500ms grant clears the reserve and commits end to end.
+    {
+        local::P50SourceTransferResult committed{};
+        SourceArmServerObservation observation;
+        run_once(2500, committed, observation);
+        CHECK(committed.code == local::SourceTransferResultCode::Committed);
+        CHECK(committed.attempts == 1);
+        CHECK(observation.transfer_completed);
+    }
+}
+
+// The sidecar anchors the received patience at its own decode instant and
+// caps it with Options::source_transfer_budget.  The wire accepts a patience
+// far beyond any budget a sidecar should honor, so the cap -- not the
+// patience -- must bound the wait: with the test-only budget knob shrunk, a
+// SourceTransfer whose source descriptor never arrives must give up on the
+// handoff after the budget and close without a reply, long before the
+// 300 s patience or the 120 s production default would.
+void test_source_transfer_budget_caps_wire_patience() {
+    char template_path[] = "/tmp/icecc-cache-service-budget-XXXXXX";
+    const int directory_fd = ::mkstemp(template_path);
+    CHECK(directory_fd >= 0);
+    CHECK(::close(directory_fd) == 0);
+    CHECK(::unlink(template_path) == 0);
+    CHECK(::mkdir(template_path, 0700) == 0);
+    char capture_path[] = "/tmp/p50-source-transfer-budget-XXXXXX";
+    const int capture_created = ::mkstemp(capture_path);
+    CHECK(capture_created >= 0);
+    CHECK(::close(capture_created) == 0);
+
+    Child child = launch_with_stderr_capture(
+        template_path, capture_path,
+        {{"ICECC_TESTS", "1"},
+         {"ICECC_TEST_P50_SOURCE_TRANSFER_BUDGET_MS", "400"}});
+    auto connection = connect_to(template_path);
+    CHECK(connection.send(local::make_hello(local::PeerRole::Daemon, {7, 1})) ==
+          local::Status::Ok);
+    local::Frame acknowledgement;
+    CHECK(connection.receive_with_timeout(acknowledgement, 1000) ==
+          local::Status::Ok);
+    CHECK(local::validate_handshake(acknowledgement, local::MessageType::HelloAck,
+                                    local::PeerRole::Sidecar, {7, 1}) ==
+          local::Status::Ok);
+
+    // F is never dialed: the handoff that would carry the source descriptor
+    // is exactly where the anchored, capped deadline is spent.
+    const local::P50SourceTransferRequest arm =
+        source_transfer_request(1, 141, CACHE_PROFILE_ZSTD_TU);
+    const local::ControlOperation operation = local::make_source_transfer_operation(
+        local::Identity{7, 1}, arm, local::kMaxSourceTransferPatienceMs);
+    const local::Frame request{local::kProtocolVersion, local::MessageType::Data,
+                               {7, 1},
+                               local::encode_control_operation(operation)};
+    const auto started = std::chrono::steady_clock::now();
+    CHECK(connection.send(request) == local::Status::Ok);
+    local::Frame response;
+    const local::Status received = connection.receive_until(
+        response, std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    // No source descriptor follows, so the sidecar closes without a reply:
+    // EOF is the refusal, and it must arrive inside the capped budget.
+    CHECK(received == local::Status::CleanEof);
+    CHECK(elapsed < std::chrono::seconds(5));
+
+    connection = local::Connection(-1);
+    CHECK(::kill(child.pid, SIGTERM) == 0);
+    int status = 0;
+    CHECK(::waitpid(child.pid, &status, 0) == child.pid);
+    child.pid = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(::access((std::string(template_path) + "/service.sock").c_str(), F_OK) != 0);
+    CHECK(::rmdir(template_path) == 0);
+
+    std::string captured;
+    {
+        const int read_fd = ::open(capture_path, O_RDONLY | O_CLOEXEC);
+        CHECK(read_fd >= 0);
+        char buffer[8192]{};
+        for (;;) {
+            const ssize_t count = ::read(read_fd, buffer, sizeof(buffer));
+            if (count <= 0)
+                break;
+            captured.append(buffer, static_cast<size_t>(count));
+            CHECK(captured.size() <= 65536);
+        }
+        CHECK(::close(read_fd) == 0);
+    }
+    CHECK(::unlink(capture_path) == 0);
+    // The wait ended as a handoff timeout against the sidecar's own anchored
+    // deadline, not as a decode refusal or any transfer-stage failure.
+    CHECK(captured.find("P50_SOURCE_TRANSFER_REFUSED stage=fd-handoff") !=
+          std::string::npos);
+    CHECK(captured.find("status=timeout") != std::string::npos);
+}
+
 void test_transport_loss_preserves_other_worker_service() {
     StoreIdentityRoot root{};
     root.bytes[15] = 0x73;
@@ -2073,11 +2262,8 @@ void test_transport_loss_preserves_other_worker_service() {
     config.sidecar_launch = launch;
     config.source_open_arm_timeout = std::chrono::milliseconds(500);
     service::SidecarRuntime runtime(std::move(config));
-    const auto clock = sidecar::process_monotonic_clock_identity();
     auto deadline = [&] {
-        return sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(4),
-            clock.clock_domain_id, clock.time_namespace_id);
+        return std::chrono::steady_clock::now() + std::chrono::seconds(4);
     };
     const std::array<uint8_t, 4> source{'h', '5', '!', '\n'};
     StoreIdentityRoot failed_root{};
@@ -2164,10 +2350,8 @@ void test_route_poison_latches_before_successor_f_open() {
     const std::array<uint8_t, 6> first_source{'p', 'o', 'i', 's', 'o', 'n'};
     CHECK(write_all(first_source_fd, first_source));
     CHECK(::unlink(first_source_path) == 0);
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto first_deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(4),
-        clock.clock_domain_id, clock.time_namespace_id);
+    const auto first_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
     const local::P50SourceTransferResult first = runtime.transfer_source_on_owner(
         source_transfer_request(first_port, 91, CACHE_PROFILE_P29V1),
         first_deadline, local::HandoffFd(first_source_fd));
@@ -2193,9 +2377,7 @@ void test_route_poison_latches_before_successor_f_open() {
     CHECK(write_all(successor_source_fd, successor_source));
     CHECK(::unlink(successor_source_path) == 0);
     const auto successor_deadline =
-        sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(2),
-            clock.clock_domain_id, clock.time_namespace_id);
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto started = std::chrono::steady_clock::now();
     const local::P50SourceTransferResult successor =
         runtime.transfer_source_on_owner(
@@ -2244,10 +2426,8 @@ void test_interner_fault_returns_permanent_profile_unavailable() {
         'p', '2', '9', '-', 'f', 'a', 'u', 'l', 't', '\n', 'x', '\n'};
     CHECK(write_all(source_fd, source));
     CHECK(::unlink(source_path) == 0);
-    const auto clock = sidecar::process_monotonic_clock_identity();
-    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(4),
-        clock.clock_domain_id, clock.time_namespace_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
     const local::P50SourceTransferResult result =
         runtime.transfer_source_on_owner(
             source_transfer_request(port, 111, CACHE_PROFILE_P29V1),
@@ -2302,6 +2482,15 @@ bool eventually(Predicate predicate, std::chrono::milliseconds limit) {
     }
     return true;
 }
+
+// The storm fronts (CapacityFront/ScriptedFront/RefusingFront) hold an armed
+// session open far past the old 2500ms fixture grant (the gated head's FILL
+// sits on the wire for 5s+), so their F double must grant a lease long
+// enough that the sidecar's f-lease deadline clamp
+// (min(caller deadline, f_lease - 1s), cache/p50_cache_service.cpp) never
+// fires: 60s matches the production F arm budget and outlives every test
+// deadline here.
+constexpr uint32_t kFixtureSourceBudgetMsec = 60000;
 
 // Stands in for F's iceccd and its sidecar control worker: acknowledges each
 // arm, then answers CACHE_SESSION as the production control worker does:
@@ -2440,7 +2629,7 @@ private:
             const P50SourceArmedMsg acknowledgement(
                 arm->arm, 111, 112, f_store_generation_,
                 f_runtime_.f_store_guid().bytes, kStoreIdentityDerivationVersion,
-                113, 2500, capability_1, capability_2);
+                113, kFixtureSourceBudgetMsec, capability_1, capability_2);
             if (!channel->send_msg(acknowledgement))
                 return;
             std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
@@ -2536,13 +2725,11 @@ void test_f_live_session_overflow_from_two_c_runtimes() {
 
     CapacityFront front(f_runtime, kFStoreGeneration);
     front.hold(first_c_store);
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](service::SidecarRuntime& runtime, uint64_t identity) {
         const std::string text = "window-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-f-capacity", source)));
@@ -2641,13 +2828,11 @@ void test_armed_window_env_override_shifts_gate_capacity() {
 
     CapacityFront front(f_runtime, kFStoreGeneration);
     front.hold(c_store);
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity) {
         const std::string text = "armed-window-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-armed-window", source)));
@@ -2787,7 +2972,7 @@ private:
                 arm->arm, 111, 112,
                 f_store_generation_ + (step == Step::BusyReplaced ? 1 : 0),
                 f_runtime_.f_store_guid().bytes, kStoreIdentityDerivationVersion,
-                113, 2500, capability_1, capability_2);
+                113, kFixtureSourceBudgetMsec, capability_1, capability_2);
             if (!channel->send_msg(acknowledgement))
                 return;
             std::unique_ptr<Msg> cache_message(channel->get_msg(3, true));
@@ -2877,11 +3062,8 @@ void test_prep_ahead_env_reorders_source_intern_around_admission() {
 
         const std::string text = "prep-ahead\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto clock = sidecar::process_monotonic_clock_identity();
         const auto deadline =
-            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-                std::chrono::steady_clock::now() + std::chrono::seconds(10),
-                clock.clock_domain_id, clock.time_namespace_id);
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
         const local::P50SourceTransferResult result =
             c_runtime.transfer_source_on_owner(
                 source_transfer_request(front.port(),
@@ -2937,14 +3119,12 @@ void test_reopen_busy_waits_only_for_the_same_f_store() {
         config.sidecar_launch = launch;
         return config;
     };
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](service::SidecarRuntime& runtime, uint16_t port,
                               uint64_t identity) {
         const std::string text = "reopen-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return runtime.transfer_source_on_owner(
             source_transfer_request(port, identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-busy-reopen", source)));
@@ -3103,13 +3283,11 @@ void test_route_lanes_concurrent_transfers_use_distinct_lanes() {
 
     CapacityFront front(f_runtime, kFStoreGeneration);
 
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity) {
         const std::string text = "route-lanes-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-route-lanes", source)));
@@ -3194,12 +3372,10 @@ void test_route_lanes_default_off_trace_matches_base_guid() {
     CHECK(::unlink(f_trace_path.c_str()) == 0);
     CHECK(::unsetenv("ICECC_P50_F_RESULT_TRACE") == 0);
 
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const std::string text = "route-lanes-default\n";
     const std::vector<uint8_t> source(text.begin(), text.end());
-    const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-        std::chrono::steady_clock::now() + std::chrono::seconds(20),
-        clock.clock_domain_id, clock.time_namespace_id);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(20);
     const local::P50SourceTransferResult result = c_runtime.transfer_source_on_owner(
         source_transfer_request(front.port(), 920, CACHE_PROFILE_P29V1),
         deadline, local::HandoffFd(source_file("p50-route-lanes-default", source)));
@@ -3410,14 +3586,12 @@ void test_route_pipeline_depth_forces_single_lane() {
 
     CapacityFront front(f_runtime, kFStoreGeneration);
 
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity) {
         const std::string text =
             "route-pipeline-depth-lane-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-pipeline-depth-lane", source)));
@@ -3664,7 +3838,6 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
         control.before_materialize_on_worker = [&gate] { gate.before_materialize(); };
         return control;
     };
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const uint64_t identity_base = pipeline_depth == 2 ? 300 : 100;
     const auto transfer = [&](uint64_t identity) {
         std::vector<uint8_t> source;
@@ -3685,9 +3858,8 @@ RouteStormResult run_stalled_head_storm(uint32_t pipeline_depth,
             const std::string text = "storm-" + std::to_string(identity) + "\n";
             source.assign(text.begin(), text.end());
         }
-        const auto deadline = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + std::chrono::seconds(20),
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(20);
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
             deadline, local::HandoffFd(source_file("p50-route-storm", source)));
@@ -4010,7 +4182,6 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
         control.before_materialize_on_worker = [&gate] { gate.before_materialize(); };
         return control;
     };
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity,
                               std::chrono::milliseconds budget,
                               size_t source_bytes = 0) {
@@ -4032,12 +4203,11 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
                 "stale-epoch-" + std::to_string(identity) + "\n";
             source.assign(text.begin(), text.end());
         }
-        const auto absolute = sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-            std::chrono::steady_clock::now() + budget,
-            clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + budget;
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity, CACHE_PROFILE_P29V1),
-            absolute, local::HandoffFd(source_file("p50-stale-epoch", source)));
+            deadline, local::HandoffFd(source_file("p50-stale-epoch", source)));
     };
 
     StaleEpochStormResult storm;
@@ -4311,7 +4481,8 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
                 const P50SourceArmedMsg acknowledgement(
                     arm->arm, 111, 112, f_store_generation_,
                     f_runtime_.f_store_guid().bytes,
-                    kStoreIdentityDerivationVersion, 113, 2500,
+                    kStoreIdentityDerivationVersion, 113,
+                    kFixtureSourceBudgetMsec,
                     capability_1, capability_2);
                 if (!channel->send_msg(acknowledgement))
                     return;
@@ -4369,19 +4540,16 @@ Attempt2StormResult run_attempt2_arm_refusal_storm() {
     };
 
     RefusingFront front(f_runtime, kFStoreGeneration);
-    const auto clock = sidecar::process_monotonic_clock_identity();
     const auto transfer = [&](uint64_t identity,
                                std::chrono::milliseconds budget) {
         const std::string text = "attempt2-" + std::to_string(identity) + "\n";
         const std::vector<uint8_t> source(text.begin(), text.end());
-        const auto absolute =
-            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-                std::chrono::steady_clock::now() + budget,
-                clock.clock_domain_id, clock.time_namespace_id);
+        const auto deadline =
+            std::chrono::steady_clock::now() + budget;
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity,
                                     CACHE_PROFILE_P29V1),
-            absolute,
+            deadline,
             local::HandoffFd(source_file("p50-attempt2-arm-refusal", source)));
     };
 
@@ -5097,6 +5265,8 @@ int main(int argc, char** argv) {
         test_source_connect_protocol_slice_retries_before_arm();
         test_source_connect_protocol_slices_share_one_outer_budget();
         test_stalled_f_arm_is_bounded_before_healthy_transfer();
+        test_f_lease_shorter_than_handoff_reserve_fails_before_cachewire();
+        test_source_transfer_budget_caps_wire_patience();
         test_route_poison_latches_before_successor_f_open();
         test_transport_loss_preserves_other_worker_service();
         test_prep_ahead_env_reorders_source_intern_around_admission();

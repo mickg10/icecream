@@ -38,11 +38,15 @@ inline constexpr size_t kInputLifecycleOperationBytes = 88;
 inline constexpr size_t kInputAttemptRetirementOperationBytes = 192;
 inline constexpr size_t kControlBindingPlaceholderBytes = 32;
 inline constexpr size_t kOperationCancelOperationBytes = 72;
-// Source transfer carries the bounded daemon assignment request and unchanged
-// absolute deadline.  The sidecar fills the authenticated C identity before
-// sending P50SourceArm to F.  The fixed envelope keeps operation demux bounded
-// while leaving the host field at its protocol maximum.
+// Source transfer carries the bounded daemon assignment request and the
+// sender's remaining patience as a duration; no clock value crosses the
+// boundary.  The sidecar fills the authenticated C identity before sending
+// P50SourceArm to F.  The fixed envelope keeps operation demux bounded while
+// leaving the host field at its protocol maximum.
 inline constexpr size_t kSourceTransferOperationBytes = 512;
+// Upper bound for SourceTransfer patience; matches the zstd sender's own
+// deadline bound.
+inline constexpr uint32_t kMaxSourceTransferPatienceMs = 300000;
 
 enum class ControlOperationKind : uint16_t {
     CacheSession = 1,
@@ -165,6 +169,10 @@ struct ControlOperation {
     sidecar::AbsoluteMonotonicDeadline absolute_deadline{};
     std::optional<P50SourceTransferRequest> source_arm;
     std::optional<P50SourceTransferResult> source_result;
+    // SourceTransfer only: how much longer the sender will wait, measured
+    // when it encoded the operation.  The receiver anchors it to its own
+    // steady clock on decode.
+    uint32_t source_patience_ms = 0;
 };
 
 namespace detail {
@@ -336,7 +344,7 @@ inline ControlOperation make_operation_cancel_operation(
 
 inline ControlOperation make_source_transfer_operation(
     Identity identity, const P50SourceTransferRequest& arm,
-    sidecar::AbsoluteMonotonicDeadline deadline) noexcept {
+    uint32_t patience_ms) noexcept {
     ControlOperation operation{ControlOperationKind::SourceTransfer, identity,
                                arm.source_request_id, std::nullopt, std::nullopt,
                                InputLifecycleAction::None, std::nullopt,
@@ -344,7 +352,7 @@ inline ControlOperation make_source_transfer_operation(
                                ControlCancelTargetRole::FSession,
                                ControlCancellationReason::Requested, {}, 0, {}, 0,
                                {}, 0, std::nullopt, {}, std::nullopt, std::nullopt};
-    operation.absolute_deadline = deadline;
+    operation.source_patience_ms = patience_ms;
     operation.source_arm = arm;
     return operation;
 }

@@ -49,9 +49,12 @@ for pair in \
     "$impl|wait_p29_system_source_fingerprint_for(" \
     "$impl|cancel_p29_system_source_fingerprint();" \
     "$impl|kP29FingerprintReadyBudget" \
+    "$impl|ICECC_TEST_P50_SOURCE_TRANSFER_BUDGET_MS" \
+    "$impl|options.source_transfer_budget" \
     "$impl|ICECC_CACHE_SERVICE_EXPECTED_DERIVATION_VERSION" \
     "$header|RuntimeConfig" \
     "$header|source_open_arm_timeout{5000}" \
+    "$header|source_transfer_budget{120000}" \
     "$header|std::map<RouteEndpointKey, std::shared_ptr<RouteGate>> source_route_gates_" \
     "$header|seed_route_endpoint_identity_for_test" \
     "$header|seed_route_relationship_for_test" \
@@ -65,6 +68,7 @@ for pair in \
     "$test_file|test_source_connect_protocol_slices_share_one_outer_budget" \
     "$test_file|attempts.size() == 2" \
     "$test_file|test_stalled_f_arm_is_bounded_before_healthy_transfer" \
+    "$test_file|test_source_transfer_budget_caps_wire_patience" \
     "$test_file|healthy_result.code == local::SourceTransferResultCode::Committed" \
     "$test_file|test_route_poison_latches_before_successor_f_open" \
     "$test_file|first_observation.eof_without_cachewire" \

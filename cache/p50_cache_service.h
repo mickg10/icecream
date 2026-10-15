@@ -177,7 +177,7 @@ public:
     // the persistent route owner and mutable sender state stay on context_.
     [[nodiscard]] local::P50SourceTransferResult transfer_source_on_owner(
         local::P50SourceTransferRequest request,
-        sidecar::AbsoluteMonotonicDeadline deadline,
+        std::chrono::steady_clock::time_point deadline,
         local::HandoffFd source) noexcept;
 
     // Route an authenticated dedicated F-session control connection (first
@@ -525,6 +525,11 @@ struct Options {
     // ICECC_P50_SIDECAR_LIFECYCLE_APPLY_MS (default 5000ms, matching the
     // daemon's own default); see p50_sidecar_lifecycle_apply_override.h.
     std::chrono::milliseconds sidecar_lifecycle_apply_budget{5000};
+    // Longest a SourceTransfer may run, from the moment its operation is
+    // decoded.  The client's patience can only shorten it.  Under ICECC_TESTS,
+    // run() may shrink it via ICECC_TEST_P50_SOURCE_TRANSFER_BUDGET_MS so the
+    // cap is testable in bounded time; production keeps the fixed default.
+    std::chrono::milliseconds source_transfer_budget{120000};
 };
 
 // Parses only the service's explicit options.  It never consults PATH,

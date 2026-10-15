@@ -1662,45 +1662,30 @@ bool handle_connection(local::Connection connection, const Options& options,
             return true;
         }
         if (operation.kind == local::ControlOperationKind::SourceTransfer) {
-            const auto clock = sidecar::process_monotonic_clock_identity();
-            const int64_t now_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch())
-                    .count();
+            // The client sends only its remaining patience; this process's
+            // own clock, read at decode, is the only one the deadline uses.
             const bool source_present = operation.source_arm.has_value();
-            const bool deadline_valid = operation.absolute_deadline.valid();
-            const bool clock_matches =
-                operation.absolute_deadline.matches_clock(clock);
-            const bool deadline_expired = operation.absolute_deadline.expired(
-                now_ns, clock.clock_domain_id, clock.time_namespace_id);
-            if (!source_present || !deadline_valid || !clock_matches ||
-                deadline_expired) {
+            if (!source_present || operation.source_patience_ms == 0) {
                 std::fprintf(
                     stderr,
-                    "P50_SOURCE_TRANSFER_REFUSED stage=deadline request=%llu "
-                    "source=%u valid=%u clock_match=%u expired=%u now_ns=%lld "
-                    "expires_ns=%lld operation_clock=%llu "
-                    "operation_time_namespace=%llu local_clock=%llu "
-                    "local_time_namespace=%llu wall_clock_ns=%llu\n",
+                    "P50_SOURCE_TRANSFER_REFUSED stage=budget request=%llu "
+                    "source=%u patience_ms=%u wall_clock_ns=%llu\n",
                     static_cast<unsigned long long>(operation.request_id),
-                    source_present ? 1u : 0u, deadline_valid ? 1u : 0u,
-                    clock_matches ? 1u : 0u, deadline_expired ? 1u : 0u,
-                    static_cast<long long>(now_ns),
-                    static_cast<long long>(operation.absolute_deadline.expires_at_ns),
-                    static_cast<unsigned long long>(
-                        operation.absolute_deadline.clock_domain_id),
-                    static_cast<unsigned long long>(
-                        operation.absolute_deadline.time_namespace_id),
-                    static_cast<unsigned long long>(clock.clock_domain_id),
-                    static_cast<unsigned long long>(clock.time_namespace_id),
+                    source_present ? 1u : 0u,
+                    static_cast<unsigned>(operation.source_patience_ms),
                     static_cast<unsigned long long>(wall_clock_ns_now()));
                 std::fflush(stderr);
                 return true;
             }
+            const auto operation_deadline =
+                decode_time +
+                std::min<std::chrono::milliseconds>(
+                    std::chrono::milliseconds(operation.source_patience_ms),
+                    options.source_transfer_budget);
             local::FdHandoffReceiver receiver;
             const local::FdHandoffResult handoff = receiver.receive_and_ack(
                 connection, local::HandoffRequest{options.identity, operation.request_id},
-                operation.absolute_deadline.as_steady_time_point());
+                operation_deadline);
             if (handoff.status != local::FdHandoffStatus::Accepted) {
                 std::fprintf(stderr,
                              "P50_SOURCE_TRANSFER_REFUSED stage=fd-handoff "
@@ -1715,7 +1700,7 @@ bool handle_connection(local::Connection connection, const Options& options,
             local::HandoffFd source = receiver.take_adopted_fd();
             const local::P50SourceTransferResult transfer =
                 runtime.transfer_source_on_owner(
-                    *operation.source_arm, operation.absolute_deadline,
+                    *operation.source_arm, operation_deadline,
                     std::move(source));
             if (transfer.code != local::SourceTransferResultCode::Committed) {
                 std::fprintf(stderr,
@@ -1741,7 +1726,6 @@ bool handle_connection(local::Connection connection, const Options& options,
                 std::fflush(stderr);
                 return true;
             }
-            const auto operation_deadline = operation.absolute_deadline.as_steady_time_point();
             const local::Frame response{local::kProtocolVersion,
                                         local::MessageType::Data,
                                         options.identity, response_payload};
@@ -2485,7 +2469,7 @@ uint32_t SidecarRuntime::RouteGate::route_pipeline_depth(
 
 local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     local::P50SourceTransferRequest request,
-    sidecar::AbsoluteMonotonicDeadline deadline,
+    std::chrono::steady_clock::time_point deadline,
     local::HandoffFd source) noexcept {
     icecc::stagetrace::stage_trace("csidecar", "transfer_request_received",
         (int64_t)request.assignment_epoch, (int64_t)request.wire_job_id,
@@ -2503,21 +2487,16 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 static_cast<int64_t>(start_ts.tv_sec) * 1000000000LL +
                 start_ts.tv_nsec;
     }
-    const auto clock = sidecar::process_monotonic_clock_identity();
     if (!route_owner_ || !request.valid() || !config_.sidecar_launch.has_value() ||
         !config_.sidecar_launch->valid() ||
         config_.sidecar_launch->c_store_guid != config_.c_store_guid ||
         config_.f_store_guid == FStoreGuid{} || config_.f_store_generation == 0 ||
-        !deadline.valid() ||
-        !deadline.matches_clock(clock) ||
-        deadline.expired(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now().time_since_epoch())
-                             .count(),
-                         clock.clock_domain_id, clock.time_namespace_id) ||
+        std::chrono::steady_clock::now() >= deadline ||
         !source.valid())
         return source_transfer_error(1);
 
-    const auto transfer_deadline = deadline.as_steady_time_point();
+    // Shortened below to F's armed-source lease once F acknowledges the arm.
+    auto transfer_deadline = deadline;
     if (stop_requested_.load(std::memory_order_acquire))
         return source_transfer_error(7);
     if (route_replacement_required_.load(std::memory_order_acquire))
@@ -2670,7 +2649,8 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                        open_arm_timeout = config_.source_open_arm_timeout](
                           std::chrono::steady_clock::time_point outer_limit,
                           FStoreGuid& remote_guid,
-                          uint64_t& remote_generation) {
+                          uint64_t& remote_generation,
+                          std::chrono::steady_clock::time_point& f_lease) {
         const auto open_arm_start = std::chrono::steady_clock::now();
         const auto limit = std::min(
             outer_limit, open_arm_start + open_arm_timeout);
@@ -2726,6 +2706,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 stall_stage->store(ClientStallStage::Connecting,
                                    std::memory_order_relaxed);
             stage_start = std::chrono::steady_clock::now();
+            const auto arm_sent = stage_start;
             const P50SourceArmMsg request_message(arm);
             if (!channel->send_msg(request_message, MsgChannel::SendNonBlocking))
                 return refused("f-arm-send");
@@ -2738,6 +2719,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return refused("f-arm-reply");
             if (!acknowledgement->acknowledges(request_message))
                 return refused("f-arm-mismatch");
+            // F's grant is a duration counted from its own ACK; counting it
+            // from our ARM send can only make it shorter, never longer.
+            f_lease = arm_sent + std::chrono::milliseconds(
+                                     acknowledgement->source_budget_msec);
             icecc::stagetrace::stage_trace("csidecar", "arm_ack_received",
                 (int64_t)arm.assignment_epoch, (int64_t)arm.wire_job_id,
                 (int64_t)arm.logical_job, (int64_t)arm.compiler_attempt);
@@ -2775,6 +2760,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
     };
 
     constexpr auto kSourceTransferLockPoll = std::chrono::milliseconds(50);
+    // Covers the reply to the client and its CompileFile on the F connection
+    // it opened before the transfer.
+    constexpr auto kFLeaseHandoffReserve = std::chrono::seconds(1);
     const auto wait_for = [&](auto try_until) {
         for (;;) {
             if (stop_requested_.load(std::memory_order_acquire))
@@ -2869,8 +2857,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
 
     FStoreGuid remote_f_guid;
     uint64_t remote_f_generation = 0;
+    std::chrono::steady_clock::time_point f_lease{};
     const int first_fd = open_armed(transfer_deadline, remote_f_guid,
-                                    remote_f_generation);
+                                    remote_f_generation, f_lease);
     if (first_fd == kFSessionBusy)
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::FSessionCapacity));
@@ -2878,6 +2867,9 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         return source_transfer_error(4);
     auto first = std::make_shared<PendingFd>();
     first->fd = first_fd;
+    // F drops the armed source when its lease ends, so finish early enough
+    // for the client's CompileFile to still reach F inside it.
+    transfer_deadline = std::min(transfer_deadline, f_lease - kFLeaseHandoffReserve);
 
     if (!prep_ahead) {
 #ifdef ICECC_P50_ENDPOINT_TEST_HOOKS
@@ -2998,7 +2990,10 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
                 return -1;
             FStoreGuid observed_guid;
             uint64_t observed_generation = 0;
-            const int fd = open_armed(limit, observed_guid, observed_generation);
+            // A re-arm of the same assignment shares the first arm's lease.
+            std::chrono::steady_clock::time_point reopen_lease{};
+            const int fd = open_armed(limit, observed_guid, observed_generation,
+                                      reopen_lease);
             const bool same_store = observed_guid == expected_guid &&
                                     observed_generation == expected_generation;
             // BUSY from the same F store is capacity only; any other store
@@ -3137,7 +3132,7 @@ local::P50SourceTransferResult SidecarRuntime::transfer_source_on_owner(
         return source_transfer_error(static_cast<uint16_t>(
             local::SourceTransferErrorCode::RouteReplacementRequired));
     }
-    // The route owner uses the same absolute deadline for connect, arm, and
+    // The route owner uses the same deadline for connect, arm, and
     // CacheWire.  A bounded grace lets the owner coroutine publish its typed
     // terminal result without allowing a control worker to wait forever.
     const auto wait_limit = transfer_deadline + config_.cancellation_grace;
@@ -4481,6 +4476,24 @@ int run(const Options& options) noexcept {
                      resolved.override_applied ? 1 : 0,
                      static_cast<unsigned long long>(wall_clock_ns_now()));
         std::fflush(stderr);
+    }
+
+    // Test-only shrink of Options::source_transfer_budget so the SourceTransfer
+    // cap (min(patience, budget), anchored at decode) is observable from a
+    // spawned service in bounded time. Accepted only under ICECC_TESTS and
+    // inside the same nonzero wire bound the client can send; production has
+    // one fixed 120-second budget.
+    if (::getenv("ICECC_TESTS") != nullptr) {
+        const char* const text = ::getenv("ICECC_TEST_P50_SOURCE_TRANSFER_BUDGET_MS");
+        if (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(text, &end, 10);
+            if (end != text && *end == '\0' && parsed != 0 &&
+                parsed <= local::kMaxSourceTransferPatienceMs) {
+                effective_options.source_transfer_budget =
+                    std::chrono::milliseconds(static_cast<long long>(parsed));
+            }
+        }
     }
 
     local::Status listen_status = local::Status::Ok;
