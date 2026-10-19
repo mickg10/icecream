@@ -100,6 +100,18 @@ formal/Protocol50ReconnectActiveResetMutant.cfg
 formal/Protocol50ReconnectRepeatResetMutant.cfg
 formal/Protocol50ReconnectSameGuidMutant.cfg
 formal/Protocol50RelSeqMutant.cfg
+formal/Protocol50RoutePipeline.cfg
+formal/Protocol50RoutePipeline.tla
+formal/Protocol50RoutePipelineK2.cfg
+formal/Protocol50RoutePipelineK3.cfg
+formal/Protocol50RoutePipelineM1.cfg
+formal/Protocol50RoutePipelineM2.cfg
+formal/Protocol50RoutePipelineM3.cfg
+formal/Protocol50RoutePipelineM4.cfg
+formal/Protocol50RoutePipelineM5.cfg
+formal/Protocol50RoutePipelineM6.cfg
+formal/Protocol50RoutePipelineM7.cfg
+formal/Protocol50RoutePipelineProgress.cfg
 formal/Protocol50ZstdRoute.tla
 formal/Protocol50ZstdRouteActiveRoutesOverflowMutant.cfg
 formal/Protocol50ZstdRouteCRollbackMutant.cfg
@@ -206,6 +218,7 @@ formal/run_global_formal_gate.sh
 formal/run_global_tlc.sh
 formal/run_global_trace_gate.sh
 formal/run_live_global_trace_gate.sh
+formal/run_route_pipeline_tlc.sh
 formal/run_tlc.sh
 formal/run_zstd_route_finput_composition_tlc.sh
 formal/s6_mutation_manifest.jsonl

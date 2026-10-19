@@ -108,6 +108,7 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
         "assignment-delivery",
         "assignment-identity",
         "global",
+        "route-pipeline",
         "zstd-route-finput",
     ]
     # 26322613 removed the Advisory fence mode and, with it, the three lane
@@ -121,7 +122,9 @@ def test_packaged_manifest_selects_every_formal_lane_and_preflights() -> None:
     #   assignment-delivery: late-prepare-mutant (ClaimedPhaseNeverRegresses'
     #         AdvisoryClaimCurrent disjunct); claim-races-revoke coverage for the
     #         surviving modes continues via ClaimAfterPrepareCurrent  -- 7 -> 6 rows
-    assert [len(lane["rows"]) for lane in prepared] == [33, 6, 29, 17, 9]
+    # 01eb03db added the route-pipeline lane (11 rows: K1/K2/K3/Progress
+    # clean models plus the M1..M7 mutants), which this pin predated.
+    assert [len(lane["rows"]) for lane in prepared] == [33, 6, 29, 17, 11, 9]
     assert manifest["tool"]["sha256"] == (
         "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
     )
