@@ -52,8 +52,10 @@ echo 'ok - deleting the exact retry reddens the focused test'
 # control fail: the mutant attempts the factory again and returns a retry
 # failure instead of the cached committed witness.
 ledger_mutant="$work/p50_zstd_sender_ledger.cpp"
-sed 's/impl_->completed_for(request, \*source, raw_digest)/std::optional<ZstdSourceTransferResult>{}/' \
+sed 's/impl_->completed_for(request, source->span(), raw_digest)/std::optional<ZstdSourceTransferResult>{}/' \
     "$sender" >"$ledger_mutant"
+# A stale sed anchor would test the unmutated sender; redden on it instead.
+test "$(grep -F -c 'std::optional<ZstdSourceTransferResult>{}' "$ledger_mutant")" -eq 1
 "$cxx" "$standard" -O1 -g -pthread \
     ${ICECC_TEST_CPPFLAGS:-} ${ICECC_TEST_BOOST_CPPFLAGS:-} \
     -I"$src" -I"$src/client" -I"$src/cache" -I"$src/services" \

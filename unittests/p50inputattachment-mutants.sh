@@ -24,6 +24,7 @@ compile_mutant() {
         -I"$root" -I"$root/cache" -I"$root/services" \
         "$root/unittests/p50_input_attachment_test.cpp" \
         "$work/p50_input_attachment.cpp" "$work/p50_input_record.cpp" \
+        "$root/cache/p50_input_buffer_pool.cpp" \
         "$root/cache/protocol50.cpp" "$root/services/digest128.cpp" \
         $ldflags -o "$work/test" $zstd_libs $xxhash_libs
 }

@@ -4272,8 +4272,7 @@ StaleEpochStormResult run_stale_epoch_successor_storm(uint32_t depth) {
     return storm;
 }
 
-void stale_epoch_storm_asserts(const StaleEpochStormResult& storm,
-                               uint32_t depth) {
+void stale_epoch_storm_asserts(const StaleEpochStormResult& storm) {
     const auto replacement_code = static_cast<uint16_t>(
         local::SourceTransferErrorCode::RouteReplacementRequired);
     // No member of the storm may end sticky-replacement-required and none
@@ -4313,7 +4312,7 @@ void stale_epoch_storm_asserts(const StaleEpochStormResult& storm,
 }
 
 void test_k3_stale_epoch_successor_does_not_repoison_or_replace() {
-    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(3), 3);
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(3));
 }
 
 // K=2 (k22t3 farm leg, 2026-10-09): no second successor exists, so the
@@ -4324,7 +4323,7 @@ void test_k3_stale_epoch_successor_does_not_repoison_or_replace() {
 // the authority identification logic_error out of its retry, or the
 // committed-then-abandoned invalid_argument, both escalating to 0x5002).
 void test_k2_stale_epoch_head_retires_route_locally() {
-    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(2), 2);
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(2));
 }
 
 // K=4: the same shape with TWO stale successors outstanding behind the
@@ -4332,7 +4331,7 @@ void test_k2_stale_epoch_head_retires_route_locally() {
 // epoch; both must retire route-locally with no re-poison and no sticky
 // latch, and the fresh assignment still commits.
 void test_k4_stale_epoch_successors_retire_route_locally() {
-    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(4), 4);
+    stale_epoch_storm_asserts(run_stale_epoch_successor_storm(4));
 }
 
 // The k45 farm leg shape (2026-10-09): a transfer whose FIRST attempt fails

@@ -40,6 +40,7 @@ trap cleanup EXIT HUP INT TERM
     "$test_srcdir/../cache/protocol50.cpp" \
     "$test_srcdir/../cache/p50_actions.cpp" \
     "$test_srcdir/../cache/p50_slice0.cpp" \
+    "$test_srcdir/../cache/p50_input_buffer_pool.cpp" \
     $ldflags "$services_lib" $zstd_libs $xxhash_libs $libs -o "$binary"
 ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 "$binary"
 echo 'PASS: profile vtable ASan/UBSan/LSan gate passed'

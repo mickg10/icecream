@@ -51,11 +51,13 @@ fi
     $ldflags $boost_ldflags \
     "$test_srcdir/p50cacheservice.cpp" \
     "$test_srcdir/../cache/p50_cache_service.cpp" \
+    "$test_srcdir/../cache/p50_sidecar_lifecycle_apply_override.cpp" \
     "$test_srcdir/../client/p50_route_owner.cpp" \
     "$test_srcdir/../client/p50_zstd_sender.cpp" \
     "$build_dir/../cache/libp50endpointtesthooks.a" \
     "$build_dir/../cache/libp50endpoint.a" \
     "$build_dir/../cache/libp50input.a" \
+    "$build_dir/../cache/libp50ownerwatchdog.a" \
     "$build_dir/../cache/libprotocol50.a" \
     "$build_dir/../cache/libp50localtransport.a" \
     "$build_dir/../services/.libs/libicecc.a" \

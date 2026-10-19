@@ -1,6 +1,7 @@
 #!/bin/sh
 # Focused standalone ASan/UBSan/LSan gate.  It deliberately compiles only
-# protocol, digest, InputRecordStore, and the attachment core.
+# protocol, digest, InputRecordStore with its InputBufferPool, and the
+# attachment core.
 set -eu
 
 root=${ICECC_TEST_TOP_SRCDIR:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -20,6 +21,7 @@ zstd_libs=${ICECC_TEST_LIBZSTD_LIBS:--lzstd}
     "$root/unittests/p50_input_attachment_test.cpp" \
     "$root/unittests/support/p50_input_attachment.cpp" \
     "$root/cache/p50_input_record.cpp" \
+    "$root/cache/p50_input_buffer_pool.cpp" \
     "$root/cache/protocol50.cpp" "$root/services/digest128.cpp" \
     $ldflags -o "$build/p50_input_attachment_test" $zstd_libs $xxhash_libs
 ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=1:halt_on_error=1} \
