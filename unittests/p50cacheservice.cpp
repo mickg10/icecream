@@ -4805,7 +4805,6 @@ void test_attempt2_release_preserves_live_sibling() {
     };
 
     FrontTear front(f_runtime, kFStoreGeneration);
-    const auto clock = sidecar::process_monotonic_clock_identity();
     constexpr size_t kSiblingSource = 2U << 20;
     const auto transfer = [&](uint64_t identity, size_t size,
                               std::chrono::milliseconds budget) {
@@ -4818,14 +4817,10 @@ void test_attempt2_release_preserves_live_sibling() {
         const std::string label =
             "attempt2-tear-" + std::to_string(identity) + "\n";
         std::copy(label.begin(), label.end(), source.begin());
-        const auto absolute =
-            sidecar::AbsoluteMonotonicDeadline::from_steady_time_point(
-                std::chrono::steady_clock::now() + budget,
-                clock.clock_domain_id, clock.time_namespace_id);
         return c_runtime.transfer_source_on_owner(
             source_transfer_request(front.port(), identity,
                                     CACHE_PROFILE_P29V1),
-            absolute,
+            std::chrono::steady_clock::now() + budget,
             local::HandoffFd(source_file("p50-attempt2-tear", source)));
     };
 
