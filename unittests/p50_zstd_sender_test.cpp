@@ -1044,6 +1044,77 @@ void test_busy_reopen_completes_cut_body() {
     CHECK(open_fd_count() == descriptors);
 }
 
+// The first attempt is cut mid-BODY -- its TX_BEGIN reached F -- and the
+// retry's reopen is refused before the wire.  The refusal must not erase the
+// first attempt's BEGIN: F may hold a mid-transaction route, so the
+// exhaustion quarantines the route (sticky replacement) instead of retiring
+// route-locally, and the next transfer on the sender never touches F.
+void test_refused_retry_after_begin_quarantines_route() {
+    asio::io_context context;
+    tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
+    Publications publications;
+    P50ServerEndpoint server(Id128::from_u64(7097), route_caps(), nullptr, nullptr,
+                             publishing_config(publications));
+    asio::thread_pool reopen_pool(1);
+    ZstdSourceTransferConfig sender_config = route_config();
+    sender_config.reopen = reopen_on(reopen_pool);
+    P50ZstdSourceSender sender(Id128::from_u64(7096), PrepareRequestKey{112, 1},
+                               sender_config);
+    // Incompressible, so the encoded BODY is far longer than the cut.
+    std::vector<uint8_t> source(256 * 1024);
+    uint32_t state = 0x85ebca6b;
+    for (uint8_t& byte : source) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<uint8_t>(state);
+    }
+    const size_t descriptors = open_fd_count();
+    std::optional<CutRelay> relay;
+    relay.emplace(acceptor.local_endpoint(), 64 * 1024);
+    ScriptedConnections connections({Step::Relay, Step::Refused},
+                                    acceptor.local_endpoint(), relay->endpoint());
+    auto server_run = asio::co_spawn(context, server.accept_one(acceptor),
+                                     asio::use_future);
+    auto transfer = asio::co_spawn(
+        context,
+        sender.transfer_route(connections.factory(), PrepareRequestKey{9501, 1},
+                              std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                              source),
+        asio::use_future);
+    context.run();
+    const auto result = transfer.get();
+    CHECK(server_run.get().status != ServerRunStatus::Completed);
+    CHECK(relay->forwarded() == 64 * 1024);
+    CHECK(result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(result.attempts == 2);
+    CHECK(result.replacement_required);
+    CHECK(!result.committed_input.has_value());
+    CHECK(publications.count == 0);
+    CHECK(connections.calls().size() == 2);
+
+    unsigned later_connections = 0;
+    context.restart();
+    auto later = asio::co_spawn(
+        context,
+        sender.transfer_route(
+            ConnectedFdFactory{[&later_connections](auto) {
+                ++later_connections;
+                return -1;
+            }},
+            PrepareRequestKey{9501, 2},
+            std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
+        asio::use_future);
+    context.run();
+    const auto later_result = later.get();
+    CHECK(later_result.status == ZstdSourceTransferStatus::Unavailable);
+    CHECK(later_result.replacement_required);
+    CHECK(later_connections == 0);
+    relay.reset();
+    reopen_pool.join();
+    CHECK(open_fd_count() == descriptors);
+}
+
 // gcc 11 destroys a prvalue optional<ReopenExecutor> bound to
 // open_connection's reference parameter twice, over-releasing the executor's
 // shared outstanding counter once per reopen-path open.  Drive both reopen
@@ -1322,6 +1393,7 @@ int main() {
     test_factory_cannot_extend_absolute_deadline();
     test_busy_reopen_recovers_lost_final_commit();
     test_busy_reopen_completes_cut_body();
+    test_refused_retry_after_begin_quarantines_route();
     test_reopen_executor_releases_each_open_exactly_once();
     test_perpetual_busy_ends_at_original_deadline();
     test_late_reopen_is_abandoned_at_deadline();

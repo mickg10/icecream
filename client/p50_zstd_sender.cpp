@@ -683,6 +683,13 @@ P50ZstdSourceSender::transfer_bytes(
         co_return impl_->replacement(ZstdSourceTransferStatus::InvalidRequest,
                                      explicit_route);
     }
+    // Across BOTH attempts: whether any transactional byte of this transfer
+    // (its TX_BEGIN write phase) ever reached the wire. Only a transfer that
+    // never wrote BEGIN on either attempt left the route's F-side state
+    // untouched, so only its exhaustion is route-local -- see the attempt==2
+    // branch below. Sticky: a later attempt that fails before the wire does
+    // not undo an earlier attempt's BEGIN.
+    bool wrote_begin = false;
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
         if (Clock::now() >= deadline) {
             ZstdSourceTransferResult result =
@@ -692,12 +699,6 @@ P50ZstdSourceSender::transfer_bytes(
             co_return result;
         }
         ClientRunResult run;
-        // Across BOTH attempts: whether any transactional byte of this
-        // transfer (its TX_BEGIN write phase) ever reached the wire. A run
-        // that never wrote BEGIN changed nothing about the route's F-side
-        // state, so its exhaustion is route-local -- see the attempt==2
-        // branch below.
-        bool wrote_begin = false;
         try {
             EndpointIoControl io_control;
             io_control.stall_stage = stall_stage.get();
@@ -706,7 +707,7 @@ P50ZstdSourceSender::transfer_bytes(
                 run = co_await impl_->endpoint->run(
                     std::get<boost::asio::ip::tcp::endpoint>(target), prepared,
                     io_control, deadline);
-                wrote_begin = run.wrote_begin;
+                wrote_begin = wrote_begin || run.wrote_begin;
                 if (impl_->endpoint->has_pipeline_poison()) {
                     // Step 4d: retire this handle's own uncommitted P29V1
                     // route state before anything below treats this attempt
@@ -752,16 +753,16 @@ P50ZstdSourceSender::transfer_bytes(
                     capacity_wait = std::min(2 * capacity_wait, kCapacityWaitMax);
                 }
                 if (connected_fd < 0) {
+                    // The connect/arm round trip itself failed: no endpoint
+                    // code ran, so nothing of THIS attempt reached the wire
+                    // (an earlier attempt's BEGIN still counts).
                     run.status = Clock::now() >= deadline
                                      ? ClientRunStatus::DeadlineExceeded
                                      : ClientRunStatus::Disconnected;
-                    // The connect/arm round trip itself failed: no endpoint
-                    // code ran, so nothing of this attempt reached the wire.
-                    wrote_begin = false;
                 } else {
                     run = co_await impl_->endpoint->run_adopted_fd(
                         connected_fd, prepared, io_control, deadline);
-                    wrote_begin = run.wrote_begin;
+                    wrote_begin = wrote_begin || run.wrote_begin;
                     if (impl_->endpoint->has_pipeline_poison()) {
                         // Step 4d: same retirement as the other branch above.
                         impl_->authority->abandon_route(prepared);
