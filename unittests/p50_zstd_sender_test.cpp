@@ -872,7 +872,7 @@ private:
 // the last step.  Records the thread each call ran on.
 class ScriptedConnections {
 public:
-    enum class Step { Server, Relay, Busy, LateServer };
+    enum class Step { Server, Relay, Busy, LateServer, Refused };
 
     ScriptedConnections(std::vector<Step> steps, tcp::endpoint server,
                         tcp::endpoint relay = {})
@@ -896,6 +896,8 @@ public:
             case Step::LateServer:
                 std::this_thread::sleep_for(std::chrono::milliseconds(400));
                 return connect_fd(server_);
+            case Step::Refused:
+                return -1;
             }
             return -1;
         };
@@ -1040,6 +1042,68 @@ void test_busy_reopen_completes_cut_body() {
     relay.reset();
     reopen_pool.join();
     CHECK(open_fd_count() == descriptors);
+}
+
+// gcc 11 destroys a prvalue optional<ReopenExecutor> bound to
+// open_connection's reference parameter twice, over-releasing the executor's
+// shared outstanding counter once per reopen-path open.  Drive both reopen
+// shapes -- a refused retry's attempt 2 and a BUSY capacity wait -- then
+// destroy the sender: every temporary copy must be gone by then.
+void test_reopen_executor_releases_each_open_exactly_once() {
+    auto outstanding = std::make_shared<std::atomic<size_t>>(0);
+    // Extra references keep the control block alive through a regression, so
+    // the count CHECK below compares live numbers, never freed memory.
+    const std::array<std::shared_ptr<std::atomic<size_t>>, 3> keepers{
+        outstanding, outstanding, outstanding};
+    {
+        asio::io_context context;
+        asio::thread_pool reopen_pool(1);
+        ZstdSourceTransferConfig sender_config = route_config();
+        sender_config.reopen =
+            ReopenExecutor{reopen_pool.get_executor(), outstanding, 8};
+        P50ZstdSourceSender sender(Id128::from_u64(7141), PrepareRequestKey{141, 1},
+                                   sender_config);
+        const std::vector<uint8_t> source{'r', 'e', 'o', 'p', 'e', 'n'};
+
+        // Attempt 2 reopens after attempt 1's inline refusal.
+        ScriptedConnections refused({Step::Refused, Step::Refused},
+                                    tcp::endpoint{});
+        auto first = asio::co_spawn(
+            context,
+            sender.transfer_route(refused.factory(), PrepareRequestKey{9601, 1},
+                                  std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                                  source),
+            asio::use_future);
+        context.run();
+        const auto first_result = first.get();
+        CHECK(first_result.status == ZstdSourceTransferStatus::RetryExhausted);
+        CHECK(first_result.attempts == 2);
+        CHECK(!first_result.replacement_required);
+        CHECK(first_result.route_local_failure);
+        CHECK(refused.calls().size() == 2);
+
+        // A BUSY capacity wait reopens inside attempt 1, then attempt 2
+        // reopens again; each open returns its credit exactly once.
+        context.restart();
+        ScriptedConnections busy({Step::Busy, Step::Refused}, tcp::endpoint{});
+        auto second = asio::co_spawn(
+            context,
+            sender.transfer_route(busy.factory(), PrepareRequestKey{9601, 2},
+                                  std::chrono::steady_clock::now() + std::chrono::seconds(10),
+                                  source),
+            asio::use_future);
+        context.run();
+        const auto second_result = second.get();
+        CHECK(second_result.status == ZstdSourceTransferStatus::RetryExhausted);
+        CHECK(second_result.attempts == 2);
+        CHECK(!second_result.replacement_required);
+        CHECK(second_result.route_local_failure);
+        CHECK(busy.calls().size() == 3);
+        reopen_pool.join();
+    }
+    CHECK(*outstanding == 0);
+    // Exactly the test's own references remain: `outstanding` plus keepers.
+    CHECK(outstanding.use_count() == 1 + static_cast<long>(keepers.size()));
 }
 
 // A reopen that meets BUSY until the original deadline ends there, neither
@@ -1258,6 +1322,7 @@ int main() {
     test_factory_cannot_extend_absolute_deadline();
     test_busy_reopen_recovers_lost_final_commit();
     test_busy_reopen_completes_cut_body();
+    test_reopen_executor_releases_each_open_exactly_once();
     test_perpetual_busy_ends_at_original_deadline();
     test_late_reopen_is_abandoned_at_deadline();
     test_reopen_credits_bound_blocked_and_queued_opens();

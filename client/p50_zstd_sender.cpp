@@ -723,9 +723,13 @@ P50ZstdSourceSender::transfer_bytes(
                 auto capacity_wait = kCapacityWaitMin;
                 for (bool reopen = attempt > 1;; reopen = true) {
                     try {
+                        // gcc 11 destroys a prvalue bound to a coroutine's
+                        // reference parameter twice; name it first.
+                        const std::optional<ReopenExecutor> reopen_executor =
+                            reopen ? impl_->config.reopen : std::nullopt;
                         connected_fd = co_await open_connection(
                             std::get<ConnectedFdFactory>(target), deadline,
-                            reopen ? impl_->config.reopen : std::nullopt);
+                            reopen_executor);
                     } catch (...) {
                         report_swallowed_exception("open", attempt);
                         ZstdSourceTransferResult result =
