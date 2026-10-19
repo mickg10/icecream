@@ -515,7 +515,7 @@ void test_long_lived_relationship_owner() {
     CHECK(third_result.status == ZstdSourceTransferStatus::Committed);
     CHECK(third_result.committed_input->tu_seq.value == 2);
 
-    // A bounded connection failure poisons only its own relationship owner.
+    // A bounded connection failure retires only its own route, locally.
     P50CRouteOwner failed_owner(config());
     const auto failed_route = relationship(111, 211, 1);
     context.restart();
@@ -534,48 +534,61 @@ void test_long_lived_relationship_owner() {
     context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(failed_result.replacement_required);
+    CHECK(failed_result.attempts == 2);
+    // Both attempts were refused before the wire: nothing reached F, so the
+    // exhaustion stays route-local instead of quarantining the relationship.
+    CHECK(!failed_result.replacement_required);
+    CHECK(failed_result.route_local_failure);
     CHECK(failed_connections == 2);
-    unsigned poisoned_connections = 0;
+    unsigned refused_connections = 0;
     const auto other_failed_route = relationship(111, 212, 1);
     context.restart();
-    auto poisoned = asio::co_spawn(
+    auto refused = asio::co_spawn(
         context,
         failed_owner.transfer(
             other_failed_route, {7012, 1},
-            ConnectedFdFactory{[&poisoned_connections](auto) {
-                ++poisoned_connections;
+            ConnectedFdFactory{[&refused_connections](auto) {
+                ++refused_connections;
                 return -1;
             }},
             std::chrono::steady_clock::now() + std::chrono::seconds(10),
             std::span<const uint8_t>(third)),
         asio::use_future);
     context.run();
-    const auto poisoned_result = poisoned.get();
-    CHECK(poisoned_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(poisoned_result.replacement_required);
-    CHECK(poisoned_result.route_local_failure);
-    CHECK(poisoned_connections == 2);
+    const auto refused_result = refused.get();
+    CHECK(refused_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(refused_result.attempts == 2);
+    // The other relationship's refusal never reached F either, so it retires
+    // route-locally too: no quarantine, and the relationship stays usable.
+    CHECK(!refused_result.replacement_required);
+    CHECK(refused_result.route_local_failure);
+    CHECK(refused_connections == 2);
     CHECK(failed_owner.owner_count() == 2 && failed_owner.owns(other_failed_route));
     context.restart();
     auto sticky = asio::co_spawn(
         context,
         failed_owner.transfer(
             other_failed_route, {7012, 2},
-            ConnectedFdFactory{[&poisoned_connections](auto) {
-                ++poisoned_connections;
+            ConnectedFdFactory{[&refused_connections](auto) {
+                ++refused_connections;
                 return -1;
             }},
             std::chrono::steady_clock::now() + std::chrono::seconds(10),
             std::span<const uint8_t>(third)),
         asio::use_future);
     context.run();
-    CHECK(sticky.get().replacement_required);
-    CHECK(poisoned_connections == 2);
+    const auto sticky_result = sticky.get();
+    CHECK(sticky_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(sticky_result.attempts == 2);
+    // No latch: the same relationship simply runs its two refused attempts
+    // again, so the cumulative count doubles.
+    CHECK(!sticky_result.replacement_required);
+    CHECK(sticky_result.route_local_failure);
+    CHECK(refused_connections == 4);
     // failed_route's own transfer already reached a terminal, non-Committed
-    // result (RetryExhausted) and is not in flight, so its orphaned
-    // preparation is dead by construction: reset_f_store_exact may now
-    // force-discard it instead of refusing forever. other_failed_route (a
+    // result (RetryExhausted) and is not in flight; its route-local exit also
+    // released the preparation entry, so reset_f_store_exact finds nothing
+    // orphaned and retires the dead route at once. other_failed_route (a
     // different F store) is a different relationship and route key, and is
     // untouched by resetting guid 211 -- only the one dead route goes cold.
     CHECK(failed_owner.reset_f_store_exact(Id128::from_u64(211), 1));
@@ -723,12 +736,15 @@ void test_p29v1_retry_and_reset_owner() {
     context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(failed_result.replacement_required);
+    CHECK(failed_result.attempts == 2);
+    // Both attempts refused before the wire: route-local, no quarantine.
+    CHECK(!failed_result.replacement_required);
+    CHECK(failed_result.route_local_failure);
     CHECK(failed_connections == 2);
-    // The orphaned preparation left by this terminal, non-in-flight
-    // RetryExhausted is dead by construction; reset_f_store_exact can now
-    // force-discard it instead of refusing forever (see the design note
-    // above P50CRouteOwner::reset_f_store_exact). The healthy `owner` above
+    // The route-local exit released this terminal, non-in-flight transfer's
+    // preparation entry, so reset_f_store_exact finds nothing orphaned and
+    // retires the dead route at once (see the design note above
+    // P50CRouteOwner::reset_f_store_exact). The healthy `owner` above
     // is a different P50CRouteOwner instance and stays untouched.
     CHECK(failed_owner.reset_f_store_exact(Id128::from_u64(251), 1));
     CHECK(!failed_owner.owns(failed_route));
@@ -1191,14 +1207,19 @@ void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
     context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(failed_result.replacement_required);
+    CHECK(failed_result.attempts == 2);
+    // Both attempts refused before the wire: route-local, no quarantine, so
+    // the owner is not marked for whole-sidecar replacement by this.
+    CHECK(!failed_result.replacement_required);
+    CHECK(failed_result.route_local_failure);
     CHECK(connections == 2);
     CHECK(owner.owns(route_v1));
     CHECK(owner.owns(other_route) && owner.owner_count() == 2);
 
     // bind_route_endpoint_identity observes generation 2 at the same
-    // host:port and retires the dead generation-1 identity. The owner is
-    // not marked for whole-sidecar replacement by this.
+    // host:port and retires the dead generation-1 identity. The failed
+    // transfer's own route-local exit released its preparation entry, so
+    // the reset retires the route without a force-discard.
     CHECK(owner.reset_f_store_exact(Id128::from_u64(701), 1));
     CHECK(!owner.owns(route_v1));
     CHECK(owner.owns(other_route));
@@ -1206,7 +1227,7 @@ void test_reset_f_store_exact_discards_orphaned_superseded_incarnation() {
     // The fresh route to the new incarnation succeeds normally. TU_SEQ keeps
     // allocating from the shared C authority, not from a rewound base: seq 1
     // was already spent on route_v1's own prepare_for_route (it runs once,
-    // before the connection retry loop that then exhausts and discards it),
+    // before the connection retry loop that then exhausts and releases it),
     // so the next allocation here is seq 2, not seq 1.
     const auto route_v2 = relationship(301, 701, 2);
     server.reset_store(Id128::from_u64(701));

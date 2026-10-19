@@ -404,28 +404,33 @@ void test_route_failure_requires_cold_replacement() {
     failed_context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(failed_result.replacement_required);
+    CHECK(failed_result.attempts == 2);
+    // Neither attempt reached the wire, so the exhaustion retires the route
+    // locally instead of quarantining the retained sender.
+    CHECK(!failed_result.replacement_required);
+    CHECK(failed_result.route_local_failure);
     CHECK(failed_connections == 2);
 
-    // The ambiguous preparation is sticky.  A later wrapper cannot reuse the
-    // old sender and must not open another F connection.
-    unsigned poisoned_connections = 0;
-    asio::io_context poisoned_context;
-    auto poisoned = asio::co_spawn(
-        poisoned_context,
+    // No sticky latch: the same sender admits the exact request again, and
+    // the refused factory is simply retried to the same exhaustion.
+    unsigned retried_connections = 0;
+    asio::io_context retried_context;
+    auto retried = asio::co_spawn(
+        retried_context,
         sender.transfer_route(
-            ConnectedFdFactory{[&poisoned_connections](auto) {
-                ++poisoned_connections;
+            ConnectedFdFactory{[&retried_connections](auto) {
+                ++retried_connections;
                 return -1;
             }}, request,
             std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
-    poisoned_context.run();
-    const auto poisoned_result = poisoned.get();
-    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
-    CHECK(poisoned_result.replacement_required);
-    CHECK(poisoned_result.attempts == 0);
-    CHECK(poisoned_connections == 0);
+    retried_context.run();
+    const auto retried_result = retried.get();
+    CHECK(retried_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(retried_result.attempts == 2);
+    CHECK(!retried_result.replacement_required);
+    CHECK(retried_result.route_local_failure);
+    CHECK(retried_connections == 2);
 
     // Whole-sidecar replacement creates a new C store and authority.  That
     // cold owner can admit the assignment and begins at TU0.
@@ -595,29 +600,34 @@ void test_explicit_route_retry_is_bounded_then_replaced() {
     failed_context.run();
     const auto failed_result = failed.get();
     CHECK(failed_result.status == ZstdSourceTransferStatus::RetryExhausted);
-    CHECK(failed_result.replacement_required);
     CHECK(failed_result.attempts == 2);
+    // Both attempts were refused before the wire: nothing reached F, so the
+    // exhaustion stays route-local instead of quarantining the sender.
+    CHECK(!failed_result.replacement_required);
+    CHECK(failed_result.route_local_failure);
     CHECK(failed_connections == 2);
 
-    // Once both same-operation attempts fail, neither the exact request nor a
-    // successor may touch F through this retained sender.
-    unsigned poisoned_connections = 0;
-    asio::io_context poisoned_context;
-    auto poisoned = asio::co_spawn(
-        poisoned_context,
+    // No sticky latch: a successor request on the same sender simply runs its
+    // own two refused attempts.
+    unsigned successor_connections = 0;
+    asio::io_context successor_context;
+    auto successor_refused = asio::co_spawn(
+        successor_context,
         sender.transfer_route(
-            ConnectedFdFactory{[&poisoned_connections](auto) {
-                ++poisoned_connections;
+            ConnectedFdFactory{[&successor_connections](auto) {
+                ++successor_connections;
                 return -1;
             }},
             PrepareRequestKey{8002, 178},
             std::chrono::steady_clock::now() + std::chrono::seconds(10), source),
         asio::use_future);
-    poisoned_context.run();
-    const auto poisoned_result = poisoned.get();
-    CHECK(poisoned_result.status == ZstdSourceTransferStatus::Unavailable);
-    CHECK(poisoned_result.replacement_required);
-    CHECK(poisoned_connections == 0);
+    successor_context.run();
+    const auto successor_refused_result = successor_refused.get();
+    CHECK(successor_refused_result.status == ZstdSourceTransferStatus::RetryExhausted);
+    CHECK(successor_refused_result.attempts == 2);
+    CHECK(!successor_refused_result.replacement_required);
+    CHECK(successor_refused_result.route_local_failure);
+    CHECK(successor_connections == 2);
 
     asio::io_context context;
     tcp::acceptor acceptor(context, {asio::ip::address_v4::loopback(), 0});
