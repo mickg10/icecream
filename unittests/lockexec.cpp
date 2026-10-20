@@ -19,17 +19,24 @@
     binary in --held mode, whose first act IN THE POST-EXEC IMAGE is to
     report the inherited lock fd and block.  Readiness is therefore only
     signalled after the exec the lock must survive.  One holder runs with
-    stdin closed, so its lock rides descriptor 0 -- the valid fd an
-    earlier version of the fix skipped -- and its report proves fd 0
-    really is the lock (asserted on the reported number, not inferred).
+    stdin closed and acquires through a ONE-slot view of the pool: the
+    queued wait opens every slot file up front, so through the full
+    two-slot view the mixed start offset would pick which file gets
+    locked and the lock would ride fd 3 or so -- descriptor 0 only half
+    the time.  Through one slot the only slot file is also the next
+    open() after close(0), so its lock deterministically rides descriptor
+    0 -- the valid fd an earlier version of the fix skipped -- and its
+    report proves fd 0 really is the lock (asserted on the reported
+    number, not inferred).
 
       1. two holders take both slots and exec;
       2. a third acquisition (--waiter) must BLOCK: if either slot's lock
          died at exec, it completes and the gate fails;
       3. killing the exec'd holders unblocks the waiter: exit, and
-         nothing less, releases a slot.  (The waiter blocks on a
-         pid-derived slot, so a single targeted kill cannot be asserted;
-         holders are released one at a time and the property claimed is
+         nothing less, releases a slot.  (The waiter waits on the pool's
+         queue lock, and which freed slot it takes is not knowable in
+         advance, so a single targeted kill cannot be asserted; holders
+         are released one at a time and the property claimed is
          release-on-exit, nothing stronger.)
 */
 
@@ -225,6 +232,10 @@ static void cleanup(void)
         const std::string base = tempdir + "/local_lock";
         unlink(base.c_str());
         unlink((base + "1").c_str());
+        // The queued wait may create the pool's queue lock file in this
+        // private dir; without this unlink the rmdir below would
+        // silently fail and litter /tmp.
+        unlink((base + "_queue").c_str());
         rmdir(tempdir.c_str());
         tempdir.clear();
     }
@@ -300,11 +311,15 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    char fdbuf[16], slotbuf[16];
+    char fdbuf[16];
     snprintf(fdbuf, sizeof(fdbuf), "%d", pipefd[1]);
-    snprintf(slotbuf, sizeof(slotbuf), "%d", SLOTS);
 
-    auto spawn = [&](int slot, const char *mode, const char *extra) -> pid_t {
+    /* slot is the ownership slot; slots is the pool size that child sees
+       (the stdin-closed holder acquires through a one-slot view so its
+       lock deterministically rides fd 0).  */
+    auto spawn = [&](int slot, const char *mode, int slots, const char *extra) -> pid_t {
+        char slotbuf[16];
+        snprintf(slotbuf, sizeof(slotbuf), "%d", slots);
         sigset_t old;
         if (!block_handled(&old)) {
             mask_failure_abort("spawn/block");
@@ -342,32 +357,44 @@ int main(int argc, char **argv)
         _exit(7);
     };
 
-    /* 1. two holders; the first with stdin closed.  Reports arrive from
-       the post-exec image and carry the lock fd.  */
-    spawn(0, "--holder", "1");
-    spawn(1, "--holder", "0");
-    if (pids[0] < 0 || pids[1] < 0) {
+    /* 1. two holders; the FIRST with stdin closed, acquiring through a
+       ONE-slot view so its only slot file is also the next open() after
+       close(0): its lock rides fd 0 deterministically.  It must be in
+       place before the second holder spawns: the second holder sees the
+       full two-slot pool and necessarily takes slot 1, leaving the
+       waiter nothing.  Reports arrive from the post-exec image and
+       carry the lock fd.  */
+    spawn(0, "--holder", 1, "1");
+    if (pids[0] < 0) {
         perror("fork");
         cleanup();
         return 2;
     }
+    const std::string first = read_report(pipefd[0], 30);
+    const bool first_is_fd0 = first.size() >= 2 && first[0] == 'H' &&
+                              atoi(first.c_str() + 1) == 0;
+    spawn(1, "--holder", 2, "0");
+    if (pids[1] < 0) {
+        perror("fork");
+        cleanup();
+        return 2;
+    }
+    const std::string second = read_report(pipefd[0], 30);
     bool saw_fd0 = false;
     int reports = 0;
-    for (int i = 0; i < 2; ++i) {
-        const std::string r = read_report(pipefd[0], 30);
-        if (r.size() >= 2 && r[0] == 'H') {
-            ++reports;
-            if (atoi(r.c_str() + 1) == 0) {
-                saw_fd0 = true;
-            }
-        }
+    if (first_is_fd0) {
+        ++reports;
+        saw_fd0 = true;
+    }
+    if (second.size() >= 2 && second[0] == 'H') {
+        ++reports;
     }
     check(reports == 2, "both holders reported from their post-exec image");
     check(saw_fd0, "the stdin-closed holder's lock really rides descriptor 0");
 
     /* 2. both slots held by exec'd processes: a further acquisition must
        block.  */
-    spawn(2, "--waiter", nullptr);
+    spawn(2, "--waiter", SLOTS, nullptr);
     if (pids[2] < 0) {
         perror("fork");
         cleanup();

@@ -161,8 +161,6 @@ static bool dcc_open_lockfile(const string &fname, int &plockfd)
     return true;
 }
 
-static bool dcc_lock_host_slot(string fname, int lock, bool block);
-
 int dcc_locked_fd()
 {
     return lock_fd;
@@ -195,20 +193,18 @@ bool dcc_lock_keep_across_exec()
     return true;
 }
 
-/* ICECC_LOCAL_LOCK_QUEUE (default off): a work-conserving wait for a slot.
+/* The local slot wait is work-conserving: a waiter never commits to one
+   slot.  The historical wait did -- it blocked on the single slot chosen
+   as getpid() % slots, and a build tool spawns its compiler wrappers with
+   a fixed pid stride, so the blocked waiters piled onto a fraction of the
+   slots while the others were released into a void: on a 24-CPU client
+   under a -j600 build, /proc/locks showed ~125 waiters spread over only
+   12-14 of the 24 slots, and slots sat free while waiters existed in
+   30-60% of the busy samples -- the local preprocessor running at roughly
+   half its slot capacity exactly when the farm was starved for
+   preprocessed sources.
 
-   The historical wait blocks on ONE slot, chosen as getpid() % slots.  A
-   build tool spawns its compiler wrappers with a fixed pid stride, so the
-   blocked waiters pile onto a fraction of the slots while the others are
-   released into a void: on a 24-CPU client under a -j600 build, /proc/locks
-   showed ~125 waiters spread over only 12-14 of the 24 slots, and slots
-   sat free while waiters existed in 30-60% of the busy samples -- the local
-   preprocessor running at roughly half its slot capacity exactly when the
-   farm was starved for preprocessed sources.
-
-   Queued mode keeps the same slot files (a legacy waiter and a queued one
-   contend for the same pool) and the same release-on-exit semantics, but a
-   waiter never commits to one slot:
+   The queue protocol, on the same slot files as the historical wait:
      1. scan every slot non-blocking from a well-mixed starting offset;
      2. if all are busy, block on the pool's queue lock (`local_lock_queue`,
         an fcntl lock like the slots, so a dead waiter frees it);
@@ -218,12 +214,22 @@ bool dcc_lock_keep_across_exec()
    One poller per pool keeps the cost to ~24 fcntl calls per millisecond
    while any freed slot is reused within about a millisecond.  New arrivals
    may take a free slot in step 1 ahead of the queue; that only keeps the
-   pool busier.  */
-static bool dcc_lock_queue_enabled()
-{
-    const char *env = getenv("ICECC_LOCAL_LOCK_QUEUE");
-    return env != nullptr && *env != '\0' && strcmp(env, "0") != 0;
-}
+   pool busier.
+
+   Older icecc binaries that still block on a single slot contend for the
+   same pool: the slot files, the lock dir and the fcntl lock type are
+   unchanged, and they never open the queue file.
+
+   If the queue lock itself cannot be taken -- the queue file cannot be
+   opened, or fcntl fails with anything but EINTR -- the waiter logs it
+   once and degrades to polling the same millisecond rescan WITHOUT the
+   queue: still work-conserving, at the price of one poller per such
+   waiter instead of one per pool.  A slot whose fcntl fails with a
+   persistent non-busy error (ENOLCK, EIO, ...) is logged once, closed
+   and dropped from the waiter's pool; once no slot fd is left the wait
+   gives up and returns false (callers fail with EXIT_DISTCC_FAILED),
+   exactly as the historical wait did on its one bad slot.  No path ever
+   returns to the historical single-slot wait.  */
 
 static unsigned dcc_lock_spread_offset()
 {
@@ -270,6 +276,11 @@ static bool dcc_lock_try_slots(vector<int> &fds, unsigned start)
 #endif
            ) {
             log_error() << "lock slot " << slot << " failed: " << strerror(errno) << endl;
+            /* A persistent non-busy error (ENOLCK, EIO, ...) would spin the
+               rescan and relog every millisecond forever: close the fd and
+               drop the slot from this waiter's pool, exactly once.  */
+            ::close(fds[slot]);
+            fds[slot] = -1;
         }
     }
     return false;
@@ -304,22 +315,55 @@ static bool dcc_lock_host_queued(const string &fname, int max_cpu)
         return true;
     }
 
+    /* Block for the queue lock unless it cannot be taken at all.  EINTR
+       from a stray signal is retried; any other failure logs once and
+       degrades this waiter to the same millisecond rescan WITHOUT the
+       queue (one poller per waiter instead of one per pool) rather than
+       ever returning to a single-slot wait.  */
     int queue_fd = -1;
-    if (!dcc_open_lockfile(fname + "_queue", queue_fd) || queue_fd == -1 ||
-        sys_lock(queue_fd, true) != 0) {
-        // No queue: fall back to the historical wait on one slot.
-        if (queue_fd != -1) {
-            ::close(queue_fd);
+    if (dcc_open_lockfile(fname + "_queue", queue_fd) && queue_fd != -1) {
+        bool held = false;
+        for (;;) {
+            if (sys_lock(queue_fd, true) == 0) {
+                held = true;
+                break;
+            }
+            if (errno != EINTR) {
+                log_error() << "lock " << fname << "_queue failed: "
+                            << strerror(errno) << endl;
+                break;
+            }
         }
-        close_rest();
-        return dcc_lock_host_slot(fname, static_cast<int>(start % max_cpu), true);
+        if (!held) {
+            ::close(queue_fd);
+            queue_fd = -1;
+        }
     }
     bool got = false;
     while (!(got = dcc_lock_try_slots(fds, ++start))) {
+        bool any_open = false;
+        for (int fd : fds) {
+            if (fd != -1) {
+                any_open = true;
+                break;
+            }
+        }
+        if (!any_open) {
+            /* Every slot fd was dropped (persistent lock error) or closed:
+               the pool is dead for this waiter, and polling it would spin
+               forever.  Fail like the historical wait did on its one bad
+               slot -- callers map false to EXIT_DISTCC_FAILED.  */
+            if (queue_fd != -1) {
+                ::close(queue_fd);
+            }
+            return false;
+        }
         struct timespec pause = {0, 1000000};
         nanosleep(&pause, nullptr);
     }
-    ::close(queue_fd); // releases the queue to the next waiter
+    if (queue_fd != -1) {
+        ::close(queue_fd); // releases the queue to the next waiter
+    }
     close_rest();
     return got;
 }
@@ -346,18 +390,7 @@ bool dcc_lock_host_at(const string &lockdir, int max_cpu)
     if (max_cpu < 1) {
         max_cpu = 1;
     }
-    if (dcc_lock_queue_enabled()) {
-        return dcc_lock_host_queued(fname, max_cpu);
-    }
-    // To ensure better distribution, select a "random" starting slot.
-    int lock_offset = getpid();
-    // First try if any slot is free.
-    for( int lock = 0; lock < max_cpu; ++lock ) {
-        if( dcc_lock_host_slot( fname, ( lock + lock_offset ) % max_cpu, false ))
-            return true;
-    }
-    // If not, block on the first selected one.
-    return dcc_lock_host_slot( fname, lock_offset % max_cpu, true );
+    return dcc_lock_host_queued(fname, max_cpu);
 }
 
 bool dcc_lock_host()
@@ -376,44 +409,6 @@ bool dcc_lock_host()
     int max_cpu = 1;
     dcc_ncpus(&max_cpu);
     return dcc_lock_host_at(dir, max_cpu);
-}
-
-bool dcc_lock_host_slot(string fname, int lock, bool block)
-{
-    if( lock > 0 ) { // 1st keep without the 0 for backwards compatibility
-        char num[ 20 ];
-        sprintf( num, "%d", lock );
-        fname += num;
-    }
-
-    int fd = 0;
-    if (!dcc_open_lockfile(fname, fd)) {
-        return false;
-    }
-
-    if (sys_lock(fd, block) == 0) {
-        lock_fd = fd;
-        return true;
-    }
-
-    switch (errno) {
-#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
-    case EWOULDBLOCK:
-#endif
-    case EAGAIN:
-    case EACCES: /* HP-UX and Cygwin give this for exclusion */
-        if( block )
-            trace() << fname << " is busy" << endl;
-        break;
-    default:
-        log_error() << "lock " << fname << " failed: " << strerror(errno) << endl;
-        break;
-    }
-
-    if ((-1 == ::close(fd)) && (errno != EBADF)){
-        log_perror("close failed");
-    }
-    return false;
 }
 
 bool color_output_possible()
