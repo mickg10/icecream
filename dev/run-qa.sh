@@ -330,15 +330,17 @@ else
         # The qa container IS root with a bridge IP and a short /tmp (the
         # sun_path-bound unix sockets need it); this stage only adds the gates.
         # Serial: completionflow is wall-clock-heavy and timing-sensitive.
-        # The six remote-compile e2e tests execute the BUILT daemons as the
-        # unprivileged run_as_user; the worker daemon needs CAP_SYS_CHROOT to
-        # accept remote compiles (chroot into the env), which an unprivileged
-        # start cannot get by any other means.  setcap the binaries as ROOT
-        # (this stage is exempt from runuser, like native-root-check) so the
-        # tests themselves can run as nobody.  libcap-ng then drops to the
-        # test account inside, exactly as production does from root.
+        # The six remote-compile e2e tests (seven counting the preprocess-
+        # first gate added to the TESTS list below) execute the BUILT
+        # daemons as the unprivileged run_as_user; the worker daemon needs
+        # CAP_SYS_CHROOT to accept remote compiles (chroot into the env),
+        # which an unprivileged start cannot get by any other means.  setcap
+        # the binaries as ROOT (this stage is exempt from runuser, like
+        # native-root-check) so the tests themselves can run as nobody.
+        # libcap-ng then drops to the test account inside, exactly as
+        # production does from root.
         # Skip (not fail) when the built binaries are absent (a harness
-        # dry-run) or setcap is missing from the image: the six e2e tests
+        # dry-run) or setcap is missing from the image: the same e2e tests
         # themselves will fail loudly on a cap-less daemon, and a hard
         # exit here would mask THAT message with a setcap one.
         run_stage native-e2e-setcap bash -c '
@@ -351,7 +353,7 @@ else
             done
         ' _ "$BUILD"
         if [[ "$native_e2e_setcap_status" == 77 ]]; then
-            echo "native-e2e-setcap skipped (missing setcap or built binaries); the six e2e tests will report the cap-less daemon themselves" >&2
+            echo "native-e2e-setcap skipped (missing setcap or built binaries); the e2e tests will report the cap-less daemon themselves" >&2
         elif [[ "$native_e2e_setcap_status" != 0 ]]; then
             echo "native-e2e-check skipped: setcap FAILED (see native-e2e-setcap.log)" >&2
         fi
@@ -362,7 +364,7 @@ else
             # recursive check, never by plain `make all`.
             run_stage native-e2e-check env "${e2e_exports[@]}" \
                 make -C "$BUILD" -j"$JOBS" check \
-                TESTS="remoteice-quick.sh p50assignment-remote.sh p50sourcearm-live-run.sh p50daemonpositive-run.sh p50compilee2e-run.sh p50completionflow-run.sh"
+                TESTS="remoteice-quick.sh p50assignment-remote.sh p50sourcearm-live-run.sh p50daemonpositive-run.sh p50compilee2e-run.sh p50ppfirst-run.sh p50completionflow-run.sh"
             # The clang leg of p50compilee2e: the fd-defect class is
             # clang-only (gcc ignores closed std fds; clang's
             # FixupStandardFileDescriptors dies in a /dev/null-less chroot),

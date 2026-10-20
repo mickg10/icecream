@@ -121,7 +121,7 @@ extern int analyse_argv(const char * const *argv, CompileJob &job, bool icerun,
                         std::list<std::string> *extrafiles);
 
 /* In cpp.cpp.  */
-extern pid_t call_cpp(CompileJob &job, int fdwrite, int fdread = -1);
+extern pid_t call_cpp(CompileJob &job, int fdwrite, int fderr = -1);
 
 /* In local.cpp.  */
 extern int build_local(CompileJob &job, MsgChannel *daemon, struct rusage *usage = 0);

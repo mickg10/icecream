@@ -479,7 +479,7 @@ done
 cache_seen=0; legacy_seen=0
 grep -E 'ZSTD_TU|CACHE_SESSION' "$work/cdaemon.log" "$work/client-"*.log \
   "$work/client-debug-"*.log >/dev/null 2>&1 && cache_seen=1 || :
-grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
+grep -E 'write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' \
   "$work/cdaemon.log" "$work/client-"*.log "$work/client-debug-"*.log \
   >/dev/null 2>&1 && legacy_seen=1 || :
 printf 'S4_CACHE_OBSERVED=%s\nS4_LEGACY_OBSERVED=%s\n' "$cache_seen" "$legacy_seen"
@@ -648,7 +648,7 @@ def worker_cache_observed(log: str) -> bool:
 
 def worker_legacy_observed(log: str) -> bool:
     return bool(re.search(
-        r"write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|"
+        r"write_fd_to_server preprocessed|building myself|"
         r"building_local|local build forced|fallback_local",
         log,
     ))

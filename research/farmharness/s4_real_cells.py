@@ -358,7 +358,7 @@ if [ "$TOPOLOGY" = c1f2 ] || [ "$TOPOLOGY" = c1f4 ]; then
     all_logs="$WORK/scheduler.log $WORK/fdaemon.log $WORK/fdaemon2.log $WORK/fdaemon3.log $WORK/fdaemon4.log $WORK/cdaemon.log $WORK/client-1.log $WORK/client-2.log $WORK/client-3.log $WORK/client-4.log"
     cache_seen=0; legacy_seen=0; f1_seen=0; f2_seen=0
     grep -E 'ZSTD_TU|CACHE_SESSION' $all_logs >/dev/null 2>&1 && cache_seen=1 || :
-    grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
+    grep -E 'write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
     grep -E 'BEGIN: .*server=s4-f([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && f1_seen=1 || :
     grep -E 'BEGIN: .*server=s4-f2([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && f2_seen=1 || :
     f3_seen=0; f4_seen=0
@@ -434,7 +434,7 @@ cmp -s "$REMOTE_OBJ" "$LOCAL_OBJ" || { echo 'S4_STATUS=FAIL reason=object-not-by
 all_logs="$WORK/scheduler.log $WORK/fdaemon.log $WORK/cdaemon.log $WORK/client.log $WORK/client-debug.log"
 cache_seen=0; legacy_seen=0; remote_seen=0
 grep -E 'ZSTD_TU|CACHE_SESSION' $all_logs >/dev/null 2>&1 && cache_seen=1 || :
-grep -E 'write_fd_to_server from cpp|write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
+grep -E 'write_fd_to_server preprocessed|building myself|building_local|local build forced|client_exception|fallback_local' $all_logs >/dev/null 2>&1 && legacy_seen=1 || :
 grep -E 'BEGIN: .*server=s4-f([ (]|$)' "$WORK/scheduler.log" >/dev/null 2>&1 && remote_seen=1 || :
 [ "$remote_seen" -eq 1 ] || {
     echo 'S4_REMOTE_COMPILE=0'

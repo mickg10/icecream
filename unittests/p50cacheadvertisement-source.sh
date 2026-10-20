@@ -308,7 +308,7 @@ require_count 1 'Each build_remote() call owns one fresh scheduler assignment at
 fresh_attempt_clear_line=$(grep -n -F \
     'job.clearCompileInputIdentity();' "$src/client/remote.cpp" | head -n 1 | cut -d: -f1)
 first_local_branch_line=$(grep -n -F \
-    'if (!maybe_build_local(local_daemon, usecs, job, ret)) {' \
+    'if (!maybe_build_local(local_daemon, usecs, job, ret,' \
     "$src/client/remote.cpp" | head -n 1 | cut -d: -f1)
 if test -z "$fresh_attempt_clear_line" || test -z "$first_local_branch_line" || \
         test "$fresh_attempt_clear_line" -ge "$first_local_branch_line"; then

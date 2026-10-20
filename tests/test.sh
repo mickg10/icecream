@@ -503,7 +503,10 @@ compare_outputs()
 #   - split_dwarf - compilation is done with -gsplit-dwarf
 #   - no_dwo - compilation with -gsplit-dwarfs results in no .dwo file
 #   - noresetlogs - will not use reset_logs at the start (needs to be done explicitly before calling run_ice)
-#   - remoteabort - remote compilation will abort (as a result of local processing failing and remote daemon killing the remote compiler)
+#   - cppfail - the local preprocessor fails before the GetCS assignment request:
+#               no assignment is minted and the worker never sees the job;
+#               gcc recovers through Error 103 and a local rebuild, clang
+#               returns the plain cpp exit status (no rebuild)
 #   - remotefail - remote compilation fails after local preprocessing succeeds, followed by an expected remote exit code
 #   - nostderrcheck - will not compare stderr output
 #   - unusedmacrohack - hack for Wunused-macros test
@@ -551,9 +554,13 @@ run_ice()
         noresetlogs=1
         shift
     fi
-    remoteabort=
-    if test "$1" = "remoteabort"; then
-        remoteabort=1
+    # The local preprocessor fails before the GetCS request: no assignment is
+    # ever minted, the worker never sees the job, and the client recovers
+    # per compiler (gcc: Error 103 and a local rebuild; clang: plain cpp
+    # exit status, no rebuild).
+    cppfail=
+    if test "$1" = "cppfail"; then
+        cppfail=1
         shift
     fi
     remotefail=
@@ -608,9 +615,22 @@ run_ice()
     check_logs_for_generic_errors $localrebuildforlog
     check_everything_is_idle
     if test "$remote_type" = "remote"; then
-        check_log_message icecc "building myself, but telling localhost"
-        if test -z "$localrebuild"; then
-            check_log_error icecc "<building_local>"
+        if test -n "$cppfail"; then
+            # The cpp failure precedes GetCS, so the scheduler-local fast
+            # path is never reached either; the recovery is the client's.
+            check_log_error icecc "building myself, but telling localhost"
+            if test -n "$using_gcc"; then
+                check_log_message icecc "local build forced by remote exception: Error 103 - local cpp invocation failed, trying to recompile locally"
+                check_log_message icecc "<building_local>"
+            else
+                check_log_error icecc "local build forced"
+                check_log_error icecc "<building_local>"
+            fi
+        else
+            check_log_message icecc "building myself, but telling localhost"
+            if test -z "$localrebuild"; then
+                check_log_error icecc "<building_local>"
+            fi
         fi
     else
         check_log_message icecc "<building_local>"
@@ -641,26 +661,43 @@ run_ice()
         check_logs_for_generic_errors $localrebuildforlog
         check_everything_is_idle
         if test "$remote_type" = "remote"; then
-            check_log_message icecc "Have to use host 127.0.0.1:10246"
-            if test -z "$localrebuild"; then
-                check_log_error icecc "<building_local>"
-            fi
-            if test -n "$remoteabort"; then
-                check_log_message remoteice1 "Remote compilation aborted with exit code"
-                check_log_error remoteice1 "Remote compilation completed with exit code 0"
-                check_log_error remoteice1 "Remote compilation exited with exit code"
-            elif test -n "$remotefail"; then
-                check_log_message remoteice1 "Remote compilation exited with exit code $remote_exit_code"
-                check_log_error remoteice1 "Remote compilation aborted with with exit code"
-                check_log_error remoteice1 "Remote compilation exited with exit code 0"
-            elif test -n "$output"; then
-                check_log_message remoteice1 "Remote compilation completed with exit code 0"
+            if test -n "$cppfail"; then
+                # The cpp failure precedes GetCS: no assignment is minted,
+                # so the worker log stays empty and the client recovers
+                # per compiler without ever naming a remote host.
+                check_log_error icecc "Have to use host 127.0.0.1:10246"
+                if test -n "$using_gcc"; then
+                    check_log_message icecc "local build forced by remote exception: Error 103 - local cpp invocation failed, trying to recompile locally"
+                    check_log_message icecc "<building_local>"
+                else
+                    # Clang returns the plain cpp exit status: no 103,
+                    # no local rebuild.
+                    check_log_error icecc "local build forced"
+                    check_log_error icecc "<building_local>"
+                fi
                 check_log_error remoteice1 "Remote compilation aborted with exit code"
+                check_log_error remoteice1 "Remote compilation completed with exit code 0"
                 check_log_error remoteice1 "Remote compilation exited with exit code"
             else
-                check_log_message remoteice1 "Remote compilation exited with exit code $expected_exit"
-                check_log_error remoteice1 "Remote compilation completed with exit code 0"
-                check_log_error remoteice1 "Remote compilation aborted with exit code"
+                check_log_message icecc "Have to use host 127.0.0.1:10246"
+                if test -z "$localrebuild"; then
+                    check_log_error icecc "<building_local>"
+                fi
+            fi
+            if test -z "$cppfail"; then
+                if test -n "$remotefail"; then
+                    check_log_message remoteice1 "Remote compilation exited with exit code $remote_exit_code"
+                    check_log_error remoteice1 "Remote compilation aborted with with exit code"
+                    check_log_error remoteice1 "Remote compilation exited with exit code 0"
+                elif test -n "$output"; then
+                    check_log_message remoteice1 "Remote compilation completed with exit code 0"
+                    check_log_error remoteice1 "Remote compilation aborted with exit code"
+                    check_log_error remoteice1 "Remote compilation exited with exit code"
+                else
+                    check_log_message remoteice1 "Remote compilation exited with exit code $expected_exit"
+                    check_log_error remoteice1 "Remote compilation completed with exit code 0"
+                    check_log_error remoteice1 "Remote compilation aborted with exit code"
+                fi
             fi
             if test -n "$split_dwarf"; then
                 if test -z "$no_dwo" && test -z "$remote_dwo_exists"; then
@@ -2215,7 +2252,7 @@ fi
 run_ice "$testdir/testdefine.o" "remote" 0 $TESTCXX -Wall -Werror -DICECREAM_TEST_DEFINE=test -c testdefine.cpp -o "$testdir/"testdefine.o
 run_ice "$testdir/testdefine.o" "remote" 0 $TESTCXX -Wall -Werror -D ICECREAM_TEST_DEFINE=test -c testdefine.cpp -o "$testdir/"testdefine.o
 
-run_ice "" "remote" 300 "localrebuild" "remoteabort" "nostderrcheck" $TESTCXX -c nonexistent.cpp
+run_ice "" "remote" 300 "localrebuild" "cppfail" "nostderrcheck" $TESTCXX -c nonexistent.cpp
 
 if test -e /bin/true; then
     run_ice "" "local" 0 /bin/true
@@ -2232,14 +2269,16 @@ run_ice "$testdir/unusedmacro.o" "remote" 0 "unusedmacrohack" $TESTCXX -Wall -Wu
 
 if test -n "$using_gcc"; then
     # These all break because of -fdirectives-only bugs, check we manage to build them somehow.
-    run_ice "$testdir/countermacro.o" "remote" 0 "localrebuild" "remoteabort" "nostderrcheck" $TESTCC -Wall -Werror -c countermacro.c -o "$testdir"/countermacro.o
+    # The broken cpp now fails before the GetCS request (cppfail): gcc recovers
+    # through Error 103 and a local rebuild, and the worker never sees the job.
+    run_ice "$testdir/countermacro.o" "remote" 0 "localrebuild" "cppfail" "nostderrcheck" $TESTCC -Wall -Werror -c countermacro.c -o "$testdir"/countermacro.o
 
     # Unsure when this started working, but it was sometime after version 9
     gcc_version=`$TESTCXX --version | grep -oE '([[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+)$' | cut -d. -f1`
     if $TESTCXX -std=c++11 -fsyntax-only -Werror -c rawliterals.cpp 2>/dev/null; then
         echo "$gcc_version"
         if test "$gcc_version" -lt 10; then
-            run_ice "$testdir/rawliterals.o" "remote" 0 "localrebuild" "remoteabort" "nostderrcheck" $TESTCXX -std=c++11 -Wall -Werror -c rawliterals.cpp -o "$testdir"/rawliterals.o
+            run_ice "$testdir/rawliterals.o" "remote" 0 "localrebuild" "cppfail" "nostderrcheck" $TESTCXX -std=c++11 -Wall -Werror -c rawliterals.cpp -o "$testdir"/rawliterals.o
         else
             run_ice "$testdir/rawliterals.o" "remote" 0 $TESTCXX -std=c++11 -Wall -Werror -c rawliterals.cpp -o "$testdir"/rawliterals.o
         fi
@@ -2296,7 +2335,7 @@ if test -z "$debug_fission_disabled"; then
         run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" "no_dwo" $TESTCC -Wall -Werror -gsplit-dwarf -c plain.c -o "$testdir/"plain.o
         run_ice "$testdir/plain.o" "remote" 0 "split_dwarf" "no_dwo" $TESTCC -Wall -Werror -gsplit-dwarf -c plain.c -o "../../../../../../../..$testdir/plain.o"
     fi
-    run_ice "" "remote" 300 "localrebuild" "split_dwarf" "remoteabort" "nostderrcheck" $TESTCXX -gsplit-dwarf -c nonexistent.cpp
+    run_ice "" "remote" 300 "localrebuild" "split_dwarf" "cppfail" "nostderrcheck" $TESTCXX -gsplit-dwarf -c nonexistent.cpp
 fi
 
 if test -z "$chroot_disabled"; then

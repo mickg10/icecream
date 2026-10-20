@@ -34,6 +34,10 @@
 #include <string.h>
 #include <errno.h>
 #include <assert.h>
+#include <signal.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "client.h"
 
@@ -59,18 +63,27 @@ bool dcc_is_preprocessed(const string &sfile)
 }
 
 /**
- * If the input filename is a plain source file rather than a
- * preprocessed source file, then preprocess it to a temporary file
- * and return the name in @p cpp_fname.
+ * Fork the local preprocessor (or /bin/cat for an already-preprocessed
+ * input) with its stdout dup2'd onto @p fdwrite, and return the child's
+ * pid.  The parent closes @p fdwrite (and @p fderr) before returning,
+ * so the output is complete only after the caller waits for the returned
+ * pid: the preprocessor may still be running when we return.  Every
+ * caller waits before reading the output.
  *
- * The preprocessor may still be running when we return; you have to
- * wait for @p cpp_fid to exit before the output is complete.  This
- * allows us to overlap opening the TCP socket, which probably doesn't
- * use many cycles, with running the preprocessor.
+ * @p fderr, when not -1, is dup2'd onto the child's STDERR_FILENO first:
+ * the pre-GetCS capture buffers the preprocessor's diagnostics there and
+ * replays them where the old order would have printed them.  -1 (the
+ * default) inherits the terminal stderr, which is what every caller but
+ * the capture wants.
  **/
-pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
+pid_t call_cpp(CompileJob &job, int fdwrite, int fderr)
 {
     flush_debug();
+    /* For the capture child only (fderr > -1): the parent's pid, recorded
+       before the fork so the child can tell a dead parent from a reparented
+       one.  [[maybe_unused]]: the torepeat>1 caller (fderr == -1) and
+       non-Linux builds never read it. */
+    [[maybe_unused]] const pid_t parent_pid = fderr > -1 ? ::getpid() : -1;
     pid_t pid = fork();
 
     if (pid == -1) {
@@ -79,9 +92,14 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
     }
 
     if (pid != 0) {
-        /* Parent.  Close the write fd.  */
+        /* Parent.  Close the write fds.  */
         if (fdwrite > -1) {
             if ((-1 == close(fdwrite)) && (errno != EBADF)){
+                log_perror("close() failed");
+            }
+        }
+        if (fderr > -1) {
+            if ((-1 == close(fderr)) && (errno != EBADF)){
                 log_perror("close() failed");
             }
         }
@@ -89,12 +107,32 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
         return pid;
     }
 
-    /* Child.  Close the read fd, in case we have one.  */
-    if (fdread > -1) {
-        if ((-1 == close(fdread)) && (errno != EBADF)){
-            log_perror("close failed");
-        }
+    /* Only the pre-GetCS capture passes fderr, and only the capture can
+       orphan its cpp: the client that forked it may be killed (ctrl-C,
+       OOM) before waitpid, leaving the preprocessor running to completion
+       into a buffer nobody will ever read.  Arm the death signal for that
+       child so it dies with the client; every other caller waits for its
+       cpp and keeps the historical behaviour.  The getppid() check closes
+       the fork-vs-prctl race: if the parent already died, the signal would
+       never arrive.  It must compare against the parent pid recorded
+       BEFORE the fork -- never against 1: an icecc client that is itself
+       PID 1 (docker entrypoint, unshared namespace) would otherwise see
+       getppid()==1 on every capture and skip exec'ing cpp, shipping an
+       empty preprocessed source as success, and a subreaper (tini,
+       systemd --user) reparents orphans to itself, not to 1, so ==1
+       would miss the race it exists to close.  The exit status is
+       nonzero: a mis-fire must surface as a cpp failure (and a local
+       rebuild), never as a successful empty preprocess. */
+#ifdef __linux__
+    if (fderr > -1) {
+#ifdef PR_SET_PDEATHSIG
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) != 0)
+            log_perror("prctl PR_SET_PDEATHSIG failed");
+        if (::getppid() != parent_pid)
+            _exit(127);
+#endif
     }
+#endif
 
     int ret = dcc_ignore_sigpipe(0);
 
@@ -194,6 +232,13 @@ pid_t call_cpp(CompileJob &job, int fdwrite, int fdread)
         argstxt += argv[ i ];
     }
     trace() << "preparing source to send: " << argstxt << endl;
+
+    if (fderr > -1 && fderr != STDERR_FILENO) {
+        /* Ignore failure */
+        close(STDERR_FILENO);
+        dup2(fderr, STDERR_FILENO);
+        close(fderr);
+    }
 
     if (fdwrite != STDOUT_FILENO) {
         /* Ignore failure */

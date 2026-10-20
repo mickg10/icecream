@@ -1239,14 +1239,18 @@ CANONICAL_STAGE_ORDER: List[Tuple[str, str]] = [
     ("scheduler", "usecs_sent"),
     ("cdaemon", "usecs_recv"),
     ("cdaemon", "usecs_relayed"),
-    # ICECC_P50_PREPROCESS_FIRST runs the local preprocessor before the
-    # GetCS request, so these precede every scheduler stage for that client.
+    # The client preprocesses before the GetCS request unconditionally, so
+    # these precede every scheduler stage for every torepeat==1 client.
     # They are keyed pre-assignment (epoch 0, wire_id = the client pid) and
     # carry the preprocess_first=1 extra; the pairing below still holds
     # because first_start -> first_done is causal.
     # source_prepare_first_failed (preprocessor died before GetCS) is
     # deliberately omitted -- like fdaemon.child_exit -- rather than paired
     # with a stage it can never follow.
+    # source_prepare_done below is kept for historical traces from older
+    # binaries: current clients emit only source_prepare_start at the
+    # source stage (the preprocessed file is opened, not produced), and the
+    # done half of the pairing is source_prepare_first_done above.
     ("iceccclient", "source_prepare_first_start"),
     ("iceccclient", "source_prepare_first_done"),
     ("iceccclient", "source_prepare_start"),

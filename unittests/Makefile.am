@@ -64,9 +64,10 @@ TESTS += p50cacheservice-fcapacity-run.sh
 # and the K=2 storm (the 2026-10-09 admission-race fixes: F pre-park + C
 # dispatch gap).
 TESTS += p50cacheservice-routepipe-run.sh
-# ICECC_P50_PREPROCESS_FIRST client gate: preprocessed-byte identity
-# (capture seam, flag OFF vs ON), legacy end-to-end with the pre-captured
-# source, cpp-failure parity, and the scheduler-local selection row.
+# Preprocess-first client gate (the pre-GetCS capture is unconditional):
+# preprocessed-byte identity (capture seam vs a direct local cpp), legacy
+# end-to-end with the pre-captured source, cpp-failure parity (incl. the
+# gcc Error-103 local-rebuild recovery), and the scheduler-local row.
 TESTS += p50ppfirst-run.sh
 TESTS += assignment_identity_test
 TESTS += \

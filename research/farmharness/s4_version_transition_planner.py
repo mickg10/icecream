@@ -82,7 +82,7 @@ HARNESS_INVENTORY: dict[str, Any] = {
     },
     "byte_exact_fields": ["S4_REMOTE_COMPILE", "S4_BYTE_IDENTICAL"],
     "legacy_transport_markers": [
-        "write_fd_to_server from cpp", "write_fd_to_server preprocessed",
+        "write_fd_to_server preprocessed",
         "building_local", "local build forced", "fallback_local",
     ],
     "p50_cache_cell": "s50-c50-f50",
