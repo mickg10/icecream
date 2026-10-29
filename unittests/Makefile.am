@@ -47,6 +47,9 @@ TESTS += p50-runtime-evidence-test.py
 # stdfd regression (the remote-compile fd bug): workit-level (farm-free) and
 # daemon-level (starts the real daemon with 1/2 closed).
 TESTS += stdfdworkit stdfdsanitize-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh p50remote-failreport.sh p50sidecarrefusal-run.sh p50statejsonl-warn.sh
+# Environment store: a second transfer of an environment never erases the
+# live one (root: root-started daemons).
+TESTS += envstore-run.sh
 
 stdfdworkit_SOURCES = stdfdworkit.cpp
 TESTS += p50completionrecord-sanitize.sh
@@ -202,7 +205,7 @@ p50cachefdseam_LDADD = ../services/libicecc.la
 p50readyadvertisement_LDADD = ../cache/libp50sidecar.a
 digest128bench_LDADD = ../services/libicecc.la
 
-check_PROGRAMS = testargs lockexec lockqueue backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest stagetracetest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner stdfdworkit
+check_PROGRAMS = envstore_xfer testargs lockexec lockqueue backpressure schedpolicy utf8test statewritertest schedbp daemonlogin daemonbatch cachehandoffdaemon daemoncachedispatch p50daemoncachedispatch p49daemon p49scheduler connectivity fastesttest hallflowtest armedadmissiontest stagetracetest jobidalloctest inputpump compilerinput p49assignment p50assignment p50cacheadvertisement p50cachesession p50wire p50slice0 p50zstd p50zstdwindow p50inputrecord p50inputrecordlate p50inputrecordreopen p50inputattachment p50endpoint p50endpointcancel p50localtransport p50sidecarsupervisor p50readyadvertisement p50cacheservice p50fdhandoff digest128bench p50zstdsender p50compilebinding p50routeowner stdfdworkit
 check_PROGRAMS += s3persistence
 check_PROGRAMS += dumpmachinecache
 check_PROGRAMS += p50s3realprocess
@@ -442,6 +445,8 @@ schedbp_SOURCES = schedbp.cpp
 # Login-attempt/ConfCS activation lifecycle gate (issue #4 G4).
 daemonlogin_SOURCES = daemonlogin.cpp
 daemonlogin_LDADD = ../services/libicecc.la
+envstore_xfer_SOURCES = envstore_xfer.cpp
+envstore_xfer_LDADD = ../services/libicecc.la
 cachehandoffdaemon_SOURCES = cachehandoffdaemon.cpp
 cachehandoffdaemon_LDADD = ../services/libicecc.la
 cachehandoffdaemon_DEPENDENCIES = ../daemon/iceccd ../cache/icecc-cache-service
@@ -624,6 +629,7 @@ connectivity_DEPENDENCIES = conn_shim.so
 CLEANFILES = sndbuf_shim.so conn_shim.so readyclose_shim.so schedbp-scheduler-*.log
 EXTRA_DIST = sndbuf_shim.c conn_shim.c readyclose_shim.c connectivity-run.sh schedbp-quick.sh schedstress-quick.sh remoteice-quick.sh p50assignment-remote.sh daemonlogin-run.sh daemonbatch-run.sh cachehandoffdaemon-run.sh daemoncachedispatch-run.sh p49daemon-run.sh p49scheduler-run.sh boost-prefix-scope.sh
 EXTRA_DIST += codec_golden_compare.h
+EXTRA_DIST += envstore-run.sh envstore_fakecc.c
 
 EXTRA_DIST += p50_trace_check.sh p50assignment-source.sh p50cacheadvertisement-source.sh p50cachesession-source.sh p50daemoncachedispatch-source.sh p50daemoncachedispatch-sanitize.sh p50localtransport-source.sh p50localtransport-sanitize.sh p50sidecarsupervisor-source.sh p50inputattachment-source.sh p50inputattachment-mutants.sh p50_input_attachment_sanitize.sh p50readyadvertisement-source.sh p50readyadvertisement-mutants.sh p50endpoint-source.sh p50fdhandoff-source.sh p50cacheservice-source.sh p50cacheservice-sanitize.sh p50fdhandoff-sanitize.sh p50inputfd-source.sh p50inputfd-sanitize.sh p50inputlifecycle-source.sh p50inputlifecycle-sanitize.sh packagebuilderdeps.sh p50daemonpositive-source.sh p50daemonpositive-run.sh p50zstdsender-source.sh
 EXTRA_DIST += releaseidentity-source.sh
