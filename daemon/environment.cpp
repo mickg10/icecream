@@ -23,6 +23,7 @@
 #include <config.h>
 #include "environment.h"
 #include <logging.h>
+#include <ctype.h>
 #include <errno.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -33,6 +34,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <vector>
 
 #include "comm.h"
 #include "env_install_check.h"
@@ -80,6 +82,20 @@ size_t sumup_dir(const string &dir)
     return res;
 }
 
+bool is_env_link_temp_name(const string &name)
+{
+    const string::size_type pos = name.rfind(".tmp.");
+    if (pos == string::npos || pos + 5 == name.size()) {
+        return false;
+    }
+    for (string::size_type i = pos + 5; i < name.size(); ++i) {
+        if (!isdigit(static_cast<unsigned char>(name[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void list_target_dirs(const string &current_target, const string &targetdir, Environments &envs)
 {
     DIR *envdir = opendir(targetdir.c_str());
@@ -90,6 +106,12 @@ static void list_target_dirs(const string &current_target, const string &targetd
 
     for (struct dirent *ent = readdir(envdir); ent; ent = readdir(envdir)) {
         string dirname = ent->d_name;
+
+        // A name being replaced: <name>.tmp.<n> -> store/<hash>, about to be
+        // renamed over <name>.  Never a name of its own.
+        if (is_env_link_temp_name(dirname)) {
+            continue;
+        }
 
         if (access(string(targetdir + "/" + dirname + "/usr/bin/as").c_str(), X_OK) == 0) {
             envs.push_back(make_pair(current_target, dirname));
@@ -399,7 +421,8 @@ static int copy_data(struct archive *ar, struct archive *aw)
 pid_t start_install_environment(const std::string &basename, const std::string &target,
                                 const std::string &name, MsgChannel *c,
                                 int &pipe_to_child, int &pipe_from_child, FileChunkMsg *&fmsg,
-                                uid_t user_uid, gid_t user_gid, int extract_priority)
+                                uid_t user_uid, gid_t user_gid, int extract_priority,
+                                const std::string &staging_dir)
 {
     log_info() << "start_install_environment: " << basename << " target "<<target << " Name: " << name << endl;
     if (!name.size()) {
@@ -436,15 +459,21 @@ pid_t start_install_environment(const std::string &basename, const std::string &
         return 0;
     }
 
-    dirname = dirname + "/" + name;
+    // The name is only a label (a symlink published after the unpack);
+    // the tree is unpacked into a private staging dir in store/.tmp/.
+    if (!ensure_env_store_dirs(basename, user_uid, user_gid)) {
+        return 0;
+    }
+
+    dirname = staging_dir;
 
     if (mkdir(dirname.c_str(), 0770)) {
-        log_perror("mkdir name") << "\t" << dirname << endl;
+        log_perror("mkdir staging") << "\t" << dirname << endl;
         return 0;
     }
 
     if (chown(dirname.c_str(), user_uid, user_gid) || chmod(dirname.c_str(), 0770)) {
-        log_perror("chown,chmod name") << "\t" << dirname << endl;
+        log_perror("chown,chmod staging") << "\t" << dirname << endl;
         return 0;
     }
 
@@ -611,10 +640,8 @@ pid_t start_install_environment(const std::string &basename, const std::string &
 }
 
 
-size_t finalize_install_environment(const std::string &basename, const std::string &target,
-                                    uid_t user_uid, gid_t user_gid)
+size_t finalize_install_environment(const std::string &dirname, uid_t user_uid, gid_t user_gid)
 {
-    string dirname = basename + "/target=" + target;
     errno = 0;
     mkdir((dirname + "/tmp").c_str(), 01775);
     ignore_result(chown((dirname + "/tmp").c_str(), user_uid, user_gid));
@@ -666,6 +693,91 @@ void remove_environment_files(const string &basename, const string &env)
     ostringstream errmsg;
     errmsg << "execv " << argv[0] << " failed";
     log_perror(errmsg.str());
+    _exit(-1);
+}
+
+string env_store_dir(const string &basedir)
+{
+    return basedir + "/store";
+}
+
+string env_store_tmp_dir(const string &basedir)
+{
+    return basedir + "/store/.tmp";
+}
+
+static bool ensure_owned_dir(const string &dir, mode_t mode, uid_t user_uid, gid_t user_gid)
+{
+    if (mkdir(dir.c_str(), mode) && errno != EEXIST) {
+        log_perror("mkdir") << "\t" << dir << endl;
+        return false;
+    }
+
+    if (chown(dir.c_str(), user_uid, user_gid) || chmod(dir.c_str(), mode)) {
+        log_perror("chown,chmod") << "\t" << dir << endl;
+        return false;
+    }
+
+    return true;
+}
+
+bool ensure_env_store_dirs(const string &basedir, uid_t user_uid, gid_t user_gid)
+{
+    return ensure_owned_dir(env_store_dir(basedir), 0775, user_uid, user_gid)
+        && ensure_owned_dir(env_store_tmp_dir(basedir), 0770, user_uid, user_gid);
+}
+
+// A background child must not keep the daemon's sockets open: a client
+// connection the daemon closes would otherwise not see EOF until rm exits.
+static void close_inherited_fds()
+{
+    std::vector<int> fds;
+
+    if (DIR *d = opendir("/proc/self/fd")) {
+        const int self = dirfd(d);
+
+        while (dirent *ent = readdir(d)) {
+            if (isdigit(static_cast<unsigned char>(ent->d_name[0]))) {
+                const int fd = atoi(ent->d_name);
+
+                if (fd > STDERR_FILENO && fd != self) {
+                    fds.push_back(fd);
+                }
+            }
+        }
+
+        closedir(d);
+    } else {
+        for (int fd = STDERR_FILENO + 1; fd < 1024; ++fd) {
+            fds.push_back(fd);
+        }
+    }
+
+    for (int fd : fds) {
+        close(fd);
+    }
+}
+
+pid_t start_remove_tree(const string &path)
+{
+    log_info() << "removing env tree " << path << endl;
+    flush_debug();
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        log_perror("failed to fork");
+        return -1;
+    }
+
+    if (pid) {
+        return pid;
+    }
+
+    // child
+    reset_debug();
+    close_inherited_fds();
+    execl("/bin/rm", "/bin/rm", "-rf", "--", path.c_str(), (char *)nullptr);
+    log_perror("execl /bin/rm failed");
     _exit(-1);
 }
 
@@ -767,6 +879,18 @@ bool verify_env(MsgChannel *client, const string &basedir, const string &target,
     if (::access(string(dirname + "/bin/true").c_str(), X_OK) < 0) {
         error_client(client, dirname + "/bin/true is not executable, installed environment removed?");
         log_error() << "I don't have environment " << env << "(" << target << ") to verify." << endl;
+        return false;
+    }
+
+    return verify_env_dir(client, dirname, user_uid, user_gid);
+}
+
+// Run the tree's bundled bin/true chrooted into dirname.
+bool verify_env_dir(MsgChannel *client, const string &dirname, uid_t user_uid, gid_t user_gid)
+{
+    if (::access(string(dirname + "/bin/true").c_str(), X_OK) < 0) {
+        error_client(client, dirname + "/bin/true is not executable");
+        log_error() << dirname << "/bin/true is not executable" << endl;
         return false;
     }
 

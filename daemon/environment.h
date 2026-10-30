@@ -41,13 +41,27 @@ extern pid_t start_install_environment(const std::string &basename,
                                        const std::string &name,
                                        MsgChannel *c, int& pipe_to_child, int& pipe_from_child,
                                        FileChunkMsg*& fmsg,
-                                       uid_t user_uid, gid_t user_gid, int extract_priority);
-extern size_t finalize_install_environment(const std::string &basename, const std::string &target,
+                                       uid_t user_uid, gid_t user_gid, int extract_priority,
+                                       const std::string &staging_dir);
+extern size_t finalize_install_environment(const std::string &dirname,
                                            uid_t user_uid, gid_t user_gid);
 extern void remove_environment_files(const std::string &basedir, const std::string &env);
 extern void remove_native_environment_files(const std::string &env);
 extern void chdir_to_environment(MsgChannel *c, const std::string &dirname, uid_t user_uid, gid_t user_gid);
 extern bool verify_env(MsgChannel *c, const std::string &basedir, const std::string &target,
                        const std::string &env, uid_t user_uid, gid_t user_gid);
+extern bool verify_env_dir(MsgChannel *c, const std::string &dirname, uid_t user_uid, gid_t user_gid);
+
+/* Content-addressed environment store (see Daemon::reconcile_env_store):
+     store/<hash>/            complete, verified trees, never modified
+     store/.tmp/              staging + trash
+     target=<platform>/<name> -> ../store/<hash>   (relative symlink)
+   <hash> is the XXH3-128 digest (32 hex) of the received stream.  */
+extern std::string env_store_dir(const std::string &basedir);
+extern std::string env_store_tmp_dir(const std::string &basedir);
+extern bool ensure_env_store_dirs(const std::string &basedir, uid_t user_uid, gid_t user_gid);
+extern pid_t start_remove_tree(const std::string &path);
+extern bool is_env_link_temp_name(const std::string &name);
+extern size_t sumup_dir(const std::string &dir);
 
 #endif

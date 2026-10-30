@@ -111,6 +111,7 @@
 #include <comm.h>
 #include "load.h"
 #include "environment.h"
+#include "digest128.h"
 #include "platform.h"
 #include "util.h"
 #include "getifaddrs.h"
@@ -851,6 +852,13 @@ public:
     uint64_t status_since_msec;
     uint64_t last_waitforcs_msec;
     uint64_t env_bytes_received;
+    // TOINSTALL/WAITINSTALL: XXH3-128 digest of the received environment
+    // stream and the store/.tmp/ staging dir this install owns.
+    std::unique_ptr<icecc::Digest128Builder> env_digest;
+    string env_staging;
+    // A started compile: the store/<hash> tree the job's env name resolved
+    // to when it started (the chroot).  Reconcile never deletes it.
+    string env_tree;
     uint32_t last_known_job_id;
     string status_why;
     string local_reason;
@@ -1330,6 +1338,20 @@ struct ReceivedEnvironment {
     ReceivedEnvironment() : last_use( 0 ), size( 0 ) {}
     time_t last_use;
     size_t size; // directory size
+    string hash; // store/<hash> the name points to
+};
+
+/* Environment-store counters, shown in dump_internals().  */
+struct EnvStoreCounters {
+    unsigned long installs = 0;          // trees published under a name
+    unsigned long duplicate_hits = 0;    // install whose tree already existed
+    unsigned long repoints = 0;          // a name changed content
+    unsigned long unpack_failures = 0;   // unpack failed or install cancelled
+    unsigned long verify_failures = 0;   // bin/true failed before publish
+    unsigned long evictions = 0;         // names unlinked for the cache limit
+    unsigned long damaged_unlinks = 0;   // names unlinked: compiler did not start
+    unsigned long reconcile_runs = 0;
+    unsigned long long bytes_freed = 0;  // tree bytes handed to rm
 };
 
 struct JobHistoryEntry {
@@ -1466,6 +1488,14 @@ struct Daemon {
     // Installed environments received from other nodes. The key is
     // (job->targetPlatform() + "/" job->environmentVersion()).
     map<string, ReceivedEnvironment> received_environments;
+    // Published store trees: hash -> directory size.  cache_size counts these
+    // (and the native environments), not names.
+    map<string, size_t> env_trees;
+    // Background rm -rf children of the store, by pid -> trash path.
+    map<pid_t, string> env_trash;
+    unsigned long env_store_seq;
+    time_t last_env_reconcile;
+    EnvStoreCounters env_counters;
     // Map of native environments, the basic one(s) containing just the compiler
     // and possibly more containing additional files (such as compiler plugins).
     // The key is the compiler name and a concatenated list of the additional files
@@ -1607,6 +1637,8 @@ struct Daemon {
         new_client_id = 0;
         next_scheduler_connect = 0;
         cache_size = 0;
+        env_store_seq = 0;
+        last_env_reconcile = 0;
         cache_adapter_start_attempted = false;
         cache_adapter_compat_violation_logged = false;
         next_p50_arm_observation_id = 1;
@@ -1775,6 +1807,14 @@ struct Daemon {
     void check_cache_size(const string &new_env);
     void remove_native_environment(const string& env_key);
     void remove_environment(const string& env_key);
+    void reconcile_env_store(const string &protect = string());
+    bool publish_env(Client *client, const string &env_key);
+    string env_link_path(const string &env_key) const;
+    string env_link_hash(const string &env_key) const;
+    string resolve_env_tree(const string &env_key) const;
+    bool point_env_name(const string &env_key, const string &hash);
+    void trash_env_path(const string &path);
+    size_t referenced_cache_bytes() const;
     bool create_env_finished(string env_key);
 
     void maybe_dump_state();
@@ -6430,6 +6470,44 @@ string Daemon::dump_internals() const
                 + ", size " + toString(it.second.size) + "\n";
     }
 
+    // Environment store: per name, the tree it points to (hash12), the
+    // tree's size, last-use age and the jobs running in it right now.
+    {
+        const time_t now = time(nullptr);
+        size_t store_bytes = 0;
+        for (const auto &tree : env_trees) {
+            store_bytes += tree.second;
+        }
+        result += "  Environments: names=" + toString(received_environments.size())
+            + " trees=" + toString(env_trees.size()) + " store_bytes=" + toString(store_bytes)
+            + " trash_in_flight=" + toString(env_trash.size())
+            + " cache_limit=" + toString(cache_size_limit) + "\n";
+        for (const auto &it : received_environments) {
+            unsigned running = 0;
+            for (const auto &c : clients) {
+                const Client *client = c.second;
+                if (!client->env_tree.empty() && client->job
+                        && client->job->targetPlatform() + "/" + client->job->environmentVersion()
+                           == it.first) {
+                    ++running;
+                }
+            }
+            result += "    Env " + it.first + " -> " + it.second.hash.substr(0, 12)
+                + " size=" + toString(it.second.size)
+                + " last_use_age=" + toString(it.second.last_use ? now - it.second.last_use : -1)
+                + "s running=" + toString(running) + "\n";
+        }
+        result += "  EnvStore: installs=" + toString(env_counters.installs)
+            + " duplicate_hits=" + toString(env_counters.duplicate_hits)
+            + " repoints=" + toString(env_counters.repoints)
+            + " unpack_failures=" + toString(env_counters.unpack_failures)
+            + " verify_failures=" + toString(env_counters.verify_failures)
+            + " evictions=" + toString(env_counters.evictions)
+            + " damaged_unlinks=" + toString(env_counters.damaged_unlinks)
+            + " reconcile_runs=" + toString(env_counters.reconcile_runs)
+            + " bytes_freed=" + toString(env_counters.bytes_freed) + "\n";
+    }
+
     result += "  Current kids: " + toString(current_kids) + " (max: " + toString(max_kids) + ")\n";
     result += "  Active preprocess jobs: " + toString(preprocess_active_processes)
               + " (max: " + toString(max_preprocess_kids) + ")\n";
@@ -7324,18 +7402,29 @@ bool Daemon::handle_transfer_env(Client *client, EnvTransferMsg *emsg)
     int pipe_to_child = -1;
     FileChunkMsg *fmsg = nullptr;
 
+    // Make room first.  The install itself never touches the name or the
+    // store until its tree is complete and verified (publish_env()).
+    reconcile_env_store();
+    const string staging = env_store_tmp_dir(envbasedir) + "/" + toString(getpid())
+        + "." + toString(++env_store_seq);
+
     pid_t pid = start_install_environment(envbasedir, target, emsg->name, client->channel,
-                    pipe_to_child, pipe_from_child, fmsg, user_uid, user_gid, nice_level);
+                    pipe_to_child, pipe_from_child, fmsg, user_uid, user_gid, nice_level,
+                    staging);
 
     if( pid <= 0 ) {
+        // The child never started; drop a staging dir it may have created.
+        trash_env_path(staging);
         delete fmsg;
-        remove_environment_files(envbasedir, target + "/" + emsg->name);
+        ++env_counters.unpack_failures;
         handle_end(client, 144);
         return false;
     }
 
     client->set_status(Client::TOINSTALL, "handle_transfer_env: receiving environment");
     client->env_bytes_received = 0;
+    client->env_digest = std::make_unique<icecc::Digest128Builder>();
+    client->env_staging = staging;
     client->outfile = target + "/" + emsg->name;
     register_child(pid, getpgid(pid) > 0 ? getpgid(pid) : pid,
                    ChildRecord::ENV_INSTALL, client->client_id);
@@ -7370,6 +7459,9 @@ bool Daemon::handle_file_chunk_env(Client *client, Msg *msg)
     if (*msg == Msg::FILE_CHUNK) {
         FileChunkMsg *fcmsg = static_cast<FileChunkMsg *>(msg);
         client->env_bytes_received += fcmsg->len;
+        // The store key is the hash of the stream as received, whatever
+        // the child manages to unpack of it.
+        client->env_digest->append(std::span<const uint8_t>(fcmsg->buffer, fcmsg->len));
         ssize_t len = fcmsg->len;
         off_t off = 0;
 
@@ -7487,28 +7579,18 @@ bool Daemon::finish_transfer_env(Client *client, bool cancel)
         current_kids--;
     }
 
-    size_t installed_size = 0;
-    if( !cancel ) {
-        installed_size = finalize_install_environment(envbasedir, client->outfile,
-                            user_uid, user_gid);
-        log_info() << "installed_size: " << installed_size << endl;
+    if (cancel) {
+        ++env_counters.unpack_failures;
+        trash_env_path(client->env_staging);
+    } else {
+        publish_env(client, client->outfile);
     }
-    if( installed_size == 0 )
-        remove_environment_files(envbasedir, client->outfile);
+    // This install no longer owns its staging dir: publish_env() renamed
+    // it into the store or trashed it.
+    client->env_staging.clear();
 
     client->set_status(Client::UNKNOWN, cancel ? "finish_transfer_env: canceled" : "finish_transfer_env: done");
-    string current = client->outfile;
     client->outfile.clear();
-
-    if (installed_size) {
-        cache_size += installed_size;
-        received_environments[current].last_use = time(nullptr);
-        received_environments[current].size = installed_size;
-        log_info() << "installed " << current << " size: " << installed_size
-                    << " all: " << cache_size << endl;
-    }
-
-    check_cache_size(current);
 
     bool r = reannounce_environments(); // do that before the file compiles
 
@@ -7523,7 +7605,10 @@ void Daemon::check_cache_size(const string &new_env)
 {
     time_t now = time(nullptr);
 
-    while (cache_size > cache_size_limit) {
+    // Unlinking a name frees nothing by itself; reconcile_env_store()
+    // deletes a tree once no name and no running job refers to it.  So
+    // count only the bytes something still refers to.
+    while (referenced_cache_bytes() > cache_size_limit) {
         string oldest_received;
         string oldest_native;
         // I don't dare to use (time_t)-1
@@ -7542,6 +7627,10 @@ void Daemon::check_cache_size(const string &new_env)
 
             // ignore recently used envs (they might be in use _right_ now)
             int keep_timeout = 200;
+            // Test-only: envstore-run.sh evicts without waiting 200 s.
+            if (const char *keep = getenv("ICECC_TEST_ENV_KEEP_SECS")) {
+                keep_timeout = atoi(keep);
+            }
 
             if (it.second.last_use < oldest_time && now - it.second.last_use > keep_timeout) {
                 bool env_currently_in_use = false;
@@ -7553,7 +7642,10 @@ void Daemon::check_cache_size(const string &new_env)
                             || it2->second->status == Client::WAITINSTALL
                             || it2->second->status == Client::WAITFORCHILD) {
 
-                        assert(it2->second->job);
+                        // An installing client has no job yet.
+                        if (!it2->second->job) {
+                            continue;
+                        }
                         string envforjob = it2->second->job->targetPlatform() + "/"
                                            + it2->second->job->environmentVersion();
 
@@ -7604,10 +7696,12 @@ void Daemon::check_cache_size(const string &new_env)
             break;
         }
 
-        if (!oldest_native.empty())
+        if (!oldest_native.empty()) {
             remove_native_environment(oldest_native);
-        else
+        } else {
+            ++env_counters.evictions;
             remove_environment(oldest_received);
+        }
     }
 }
 
@@ -7631,12 +7725,344 @@ void Daemon::remove_native_environment(const string& env_key)
 void Daemon::remove_environment(const string& env_key)
 {
     assert(!env_key.empty());
-    remove_environment_files(envbasedir, env_key);
+    // A name is only a label: unlink it.  Its tree (and the bytes in
+    // cache_size) go when reconcile_env_store() finds nothing refers to it.
+    const string link = env_link_path(env_key);
+    struct stat st;
+    if (lstat(link.c_str(), &st) == 0 && S_ISLNK(st.st_mode) && unlink(link.c_str()) != 0) {
+        log_perror("unlink environment name") << "\t" << link << endl;
+    }
     const ReceivedEnvironment& env = received_environments[env_key];
     trace() << "removing " << envbasedir << "/target=" << env_key << " " << env.size << endl;
-    assert( cache_size >= env.size );
-    cache_size -= env.size;
     received_environments.erase(env_key);
+}
+
+string Daemon::env_link_path(const string &env_key) const
+{
+    return envbasedir + "/target=" + env_key;
+}
+
+/* The hash a name points to, from the link itself ("" if it is not a link
+   into the store). */
+string Daemon::env_link_hash(const string &env_key) const
+{
+    char buf[PATH_MAX];
+    const ssize_t n = readlink(env_link_path(env_key).c_str(), buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        return string();
+    }
+    const string target(buf, n);
+    static const string prefix = "../store/";
+    if (target.compare(0, prefix.size(), prefix) != 0
+            || target.size() == prefix.size()
+            || target.find('/', prefix.size()) != string::npos) {
+        return string();
+    }
+    return target.substr(prefix.size());
+}
+
+/* use(job): the store tree a name resolves to right now ("" if none). */
+string Daemon::resolve_env_tree(const string &env_key) const
+{
+    const string hash = env_link_hash(env_key);
+    if (hash.empty()) {
+        return string();
+    }
+    const string tree = env_store_dir(envbasedir) + "/" + hash;
+    struct stat st;
+    if (stat(tree.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return string();
+    }
+    return tree;
+}
+
+/* Point a name at store/<hash>: a fresh <name>.tmp.<n> symlink renamed over
+   <name>, so a reader sees the old target or the new one, never neither.
+   (No RENAME_EXCHANGE: the farm still runs 3.10 kernels.)  */
+bool Daemon::point_env_name(const string &env_key, const string &hash)
+{
+    const string link = env_link_path(env_key);
+    const string old_hash = env_link_hash(env_key);
+    if (old_hash == hash) {
+        received_environments[env_key].hash = hash;
+        return true;
+    }
+    if (!old_hash.empty()) {
+        ++env_counters.repoints;
+        log_warning() << "environment " << env_key << " CHANGED CONTENT: store/"
+                      << old_hash.substr(0, 12) << " -> store/" << hash.substr(0, 12)
+                      << " (same name, different tarball); jobs already running keep"
+                      << " the old tree" << endl;
+    }
+    const string tmp = link + ".tmp." + toString(++env_store_seq);
+    if (symlink(("../store/" + hash).c_str(), tmp.c_str()) != 0) {
+        log_perror("symlink environment name") << "\t" << tmp << endl;
+        return false;
+    }
+    if (rename(tmp.c_str(), link.c_str()) != 0) {
+        log_perror("rename environment name") << "\t" << tmp << " -> " << link << endl;
+        unlink(tmp.c_str());
+        return false;
+    }
+    received_environments[env_key].hash = hash;
+    return true;
+}
+
+/* Move path into store/.tmp/ as trash and rm -rf it in a background child.
+   The rename is what takes it out of the store; the rm is just cleanup. */
+void Daemon::trash_env_path(const string &path)
+{
+    struct stat st;
+    if (lstat(path.c_str(), &st) != 0) {
+        return;
+    }
+    const string trash = env_store_tmp_dir(envbasedir) + "/trash." + toString(getpid()) + "."
+        + toString(++env_store_seq);
+    if (rename(path.c_str(), trash.c_str()) != 0) {
+        log_perror("rename to trash") << "\t" << path << " -> " << trash << endl;
+        return;
+    }
+    const pid_t pid = start_remove_tree(trash);
+    if (pid > 0) {
+        register_child(pid, getpgid(pid) > 0 ? getpgid(pid) : pid, ChildRecord::OTHER, 0);
+        env_trash[pid] = trash;
+    }
+}
+
+/* install(name, stream), after the unpack child succeeded and END arrived:
+   bin/true check, rename to store/<hash>, point the name.  Any
+   failure trashes the staging dir; the name and the store are
+   untouched.  A duplicate of a tree already in the store is not checked
+   again (it was when it was published): its staging dir is trashed and the
+   name pointed at the existing tree. */
+bool Daemon::publish_env(Client *client, const string &env_key)
+{
+    const string staging = client->env_staging;
+    if (staging.empty()) {
+        return false;
+    }
+    if (!client->env_digest) {
+        trash_env_path(staging);
+        return false;
+    }
+    const string hash = icecc::digest128_hex(client->env_digest->finish());
+    const string tree = env_store_dir(envbasedir) + "/" + hash;
+    struct stat tree_st;
+    bool duplicate = stat(tree.c_str(), &tree_st) == 0;
+    if (!duplicate) {
+        const size_t installed_size = finalize_install_environment(staging, user_uid, user_gid);
+        log_info() << "installed_size: " << installed_size << endl;
+        if (installed_size == 0) {
+            ++env_counters.unpack_failures;
+            trash_env_path(staging);
+            return false;
+        }
+        if (!verify_env_dir(client->channel, staging, user_uid, user_gid)) {
+            ++env_counters.verify_failures;
+            log_error() << "environment " << env_key << " (" << hash.substr(0, 12)
+                        << ") failed its bin/true check; not installed" << endl;
+            trash_env_path(staging);
+            return false;
+        }
+        log_info() << "environment " << env_key << " (" << hash.substr(0, 12)
+                   << ") passed its bin/true check" << endl;
+        if (rename(staging.c_str(), tree.c_str()) == 0) {
+            env_trees[hash] = installed_size;
+            cache_size += installed_size;
+        } else if (errno == EEXIST || errno == ENOTEMPTY) {
+            duplicate = true;
+        } else {
+            log_perror("rename environment into the store") << "\t" << staging << " -> " << tree << endl;
+            trash_env_path(staging);
+            return false;
+        }
+    }
+    if (duplicate) {
+        // Same content already published (a concurrent or earlier install
+        // won): ours is a duplicate.
+        ++env_counters.duplicate_hits;
+        log_info() << "environment " << env_key << " already in the store as "
+                   << hash.substr(0, 12) << ", dropping the duplicate" << endl;
+        trash_env_path(staging);
+        if (!env_trees.count(hash)) {
+            env_trees[hash] = sumup_dir(tree);
+            cache_size += env_trees[hash];
+        }
+    }
+
+    if (!point_env_name(env_key, hash)) {
+        return false;
+    }
+    ReceivedEnvironment &env = received_environments[env_key];
+    env.last_use = time(nullptr);
+    env.size = env_trees[hash];
+    ++env_counters.installs;
+    log_info() << "installed " << env_key << " -> store/" << hash.substr(0, 12) << " size: "
+               << env.size << " all: " << cache_size << endl;
+    return true;
+}
+
+/* cache_size minus the trees nothing refers to any more (they are about
+   to be deleted). */
+size_t Daemon::referenced_cache_bytes() const
+{
+    set<string> refs;
+    for (const auto &it : received_environments) {
+        if (!it.second.hash.empty()) {
+            refs.insert(it.second.hash);
+        }
+    }
+    for (const auto &it : clients) {
+        const string &tree = it.second->env_tree;
+        if (!tree.empty()) {
+            refs.insert(tree.substr(tree.rfind('/') + 1));
+        }
+    }
+    size_t bytes = cache_size;
+    for (const auto &it : env_trees) {
+        if (!refs.count(it.first) && bytes >= it.second) {
+            bytes -= it.second;
+        }
+    }
+    return bytes;
+}
+
+static vector<string> list_dir_names(const string &dir)
+{
+    vector<string> names;
+    if (DIR *d = opendir(dir.c_str())) {
+        while (dirent *ent = readdir(d)) {
+            if (strcmp(ent->d_name, ".") && strcmp(ent->d_name, "..")) {
+                names.push_back(ent->d_name);
+            }
+        }
+        closedir(d);
+    }
+    return names;
+}
+
+/* reconcile(): the only place trees are deleted.  Runs at start, every
+   ~10 min, and before each install. */
+void Daemon::reconcile_env_store(const string &protect)
+{
+    ++env_counters.reconcile_runs;
+    last_env_reconcile = time(nullptr);
+    if (!ensure_env_store_dirs(envbasedir, user_uid, user_gid)) {
+        return;
+    }
+    const string store = env_store_dir(envbasedir);
+    const string tmp = env_store_tmp_dir(envbasedir);
+    bool changed = false;
+
+    // 1. store/.tmp/ is garbage unless a live install (or a live rm) owns it.
+    for (auto it = env_trash.begin(); it != env_trash.end();) {
+        if (child_registry.count(it->first)) {
+            ++it;
+        } else {
+            it = env_trash.erase(it);
+        }
+    }
+    set<string> owned;
+    for (const auto &it : clients) {
+        if (!it.second->env_staging.empty()) {
+            owned.insert(it.second->env_staging);
+        }
+    }
+    for (const auto &it : env_trash) {
+        owned.insert(it.second);
+    }
+    for (const string &name : list_dir_names(tmp)) {
+        if (!owned.count(tmp + "/" + name)) {
+            trash_env_path(tmp + "/" + name);
+        }
+    }
+
+    // 2. Names: drop links whose tree is gone and leftover <name>.tmp.<n>
+    // links; any real directory under target=* is not ours any more.
+    for (const string &dirname : list_dir_names(envbasedir)) {
+        if (dirname.compare(0, 7, "target=") != 0) {
+            continue;
+        }
+        const string platform = dirname.substr(7);
+        const string tdir = envbasedir + "/" + dirname;
+        for (const string &name : list_dir_names(tdir)) {
+            const string path = tdir + "/" + name;
+            const string key = platform + "/" + name;
+            struct stat st;
+            if (lstat(path.c_str(), &st) != 0) {
+                continue;
+            }
+            if (S_ISLNK(st.st_mode)) {
+                if (is_env_link_temp_name(name)) {
+                    unlink(path.c_str());
+                    continue;
+                }
+                const string hash = env_link_hash(key);
+                if (hash.empty() || resolve_env_tree(key).empty()) {
+                    log_info() << "environment name " << key << " points nowhere; unlinked" << endl;
+                    unlink(path.c_str());
+                    received_environments.erase(key);
+                    changed = true;
+                } else {
+                    received_environments[key].hash = hash;
+                }
+            } else if (S_ISDIR(st.st_mode)) {
+                log_warning() << "real directory " << path << " under target=; removed" << endl;
+                trash_env_path(path);
+                received_environments.erase(key);
+                changed = true;
+            } else {
+                unlink(path.c_str());
+            }
+        }
+    }
+    for (auto it = received_environments.begin(); it != received_environments.end();) {
+        if (env_link_hash(it->first).empty()) {
+            it = received_environments.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // 3. The cache limit (today's LRU semantics; unlinks names only).
+    const unsigned long evictions_before = env_counters.evictions;
+    check_cache_size(protect);
+    if (env_counters.evictions != evictions_before) {
+        changed = true;
+    }
+
+    // 4. Delete every tree no name points to and no running job is inside.
+    set<string> refs;
+    for (const auto &it : received_environments) {
+        refs.insert(it.second.hash);
+    }
+    for (const auto &it : clients) {
+        const string &tree = it.second->env_tree;
+        if (!tree.empty()) {
+            refs.insert(tree.substr(tree.rfind('/') + 1));
+        }
+    }
+    for (const string &hash : list_dir_names(store)) {
+        if (hash == ".tmp" || refs.count(hash)) {
+            continue;
+        }
+        size_t size = 0;
+        auto tree = env_trees.find(hash);
+        if (tree != env_trees.end()) {
+            size = tree->second;
+            env_trees.erase(tree);
+            cache_size = cache_size >= size ? cache_size - size : 0;
+        }
+        log_info() << "store/" << hash.substr(0, 12) << " unreferenced; deleting (" << size
+                   << " bytes)" << endl;
+        trash_env_path(store + "/" + hash);
+        env_counters.bytes_freed += size;
+    }
+
+    // 5.
+    if (changed && scheduler && !reannounce_environments()) {
+        log_warning() << "failed reannounce environments after reconcile" << endl;
+    }
 }
 
 bool Daemon::handle_get_native_env(Client *client, GetNativeEnvMsg *msg)
@@ -7766,7 +8192,7 @@ bool Daemon::create_env_finished(string env_key)
 
     env.last_use = time(nullptr);
     env.size = installed_size;
-    check_cache_size(env.name);
+    reconcile_env_store(env.name);
 
     for (Clients::const_iterator it = clients.begin(); it != clients.end(); ++it) {
         if (it->second->pending_create_env == env_key)
@@ -8426,7 +8852,10 @@ void Daemon::handle_old_request()
                 handle_end(client, 146);
                 continue;
             }
-            pid = handle_connection(envbasedir, job, client->channel, sock,
+            // use(job): resolve the name once; the job runs in that tree
+            // even if the name is re-pointed or evicted meanwhile.
+            client->env_tree = resolve_env_tree(envforjob);
+            pid = handle_connection(client->env_tree, job, client->channel, sock,
                                     mem_limit, user_uid, user_gid,
                                     effective_input_fd,
                                     std::move(compiler_input_source));
@@ -8584,7 +9013,16 @@ bool Daemon::handle_compile_done(Client *client)
     string envforjob = client->job->targetPlatform() + "/" + client->job->environmentVersion();
     received_environments[envforjob].last_use = time(nullptr);
     if(end_status == EXIT_COMPILER_MISSING) { // Environment damaged?
-        remove_environment(envforjob);
+        // The compiler could not even be exec'd from this tree: unlink the
+        // name (only if it still points at the tree the job used).  The tree
+        // goes at the next reconcile; the next job reinstalls the name.
+        if (!client->env_tree.empty()
+                && resolve_env_tree(envforjob) == client->env_tree) {
+            log_warning() << "environment " << envforjob << " (" << client->env_tree
+                          << ") could not start its compiler; unlinking the name" << endl;
+            ++env_counters.damaged_unlinks;
+            remove_environment(envforjob);
+        }
         if( !reannounce_environments())
             log_warning() << "failed reannounce environments after failed compile " << client->job->jobID() << endl;
     }
@@ -10892,6 +11330,13 @@ void Daemon::answer_client_requests()
         return;    /* a STATS send can close the established session */
     }
 
+    if (time(nullptr) - last_env_reconcile >= 600) {
+        reconcile_env_store();
+        if (finish_scheduler_loss_if_needed()) {
+            return;    /* the reannounce can close the established session */
+        }
+    }
+
     vector< pollfd > pollfds;
     pollfds.reserve(fd2client.size() + pending_client_admissions.size() + 6);
     pollfd pfd; // tmp varible
@@ -12404,6 +12849,7 @@ int main(int argc, char **argv)
     if (!cleanup_cache(d.envbasedir, d.user_uid, d.user_gid)) {
         return 1;
     }
+    d.reconcile_env_store();
 
     list<string> nl = get_netnames(200, d.scheduler_port);
     trace() << "Netnames:" << endl;

@@ -201,7 +201,7 @@ static void report_fork_hygiene_failure(int& out_fd, CompileJob* job,
     out_fd = -1;
 }
 
-int handle_connection(const string &basedir, CompileJob *job,
+int handle_connection(const string &env_tree, CompileJob *job,
                       MsgChannel *client, int &out_fd,
                       unsigned int mem_limit, uid_t user_uid, gid_t user_gid,
                       int compiler_input_fd,
@@ -351,9 +351,11 @@ int handle_connection(const string &basedir, CompileJob *job,
 
     try {
         if (job->environmentVersion().size()) {
-            string dirname = basedir + "/target=" + job->targetPlatform() + "/" + job->environmentVersion();
+            // The store tree the daemon resolved the job's env name to
+            // (empty when the name resolved to nothing).
+            string dirname = env_tree;
 
-            if (::access(string(dirname + "/usr/bin/as").c_str(), X_OK) < 0) {
+            if (dirname.empty() || ::access(string(dirname + "/usr/bin/as").c_str(), X_OK) < 0) {
                 error_client(client, dirname + "/usr/bin/as is not executable, installed environment removed?");
                 log_error() << "I don't have environment " << job->environmentVersion() << "(" << job->targetPlatform() << ") " << job->jobID() << endl;
                 // The scheduler didn't listen to us, or maybe something has removed the files.
