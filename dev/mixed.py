@@ -93,6 +93,15 @@ def _case_specs(current: str, legacy: str) -> tuple[dict[str, str], ...]:
          "client": current},
         {"name": "p43-client", "scheduler": current, "worker": current,
          "client": legacy},
+        # ICECC_P50_MODE=off on one client invocation: against a stock worker,
+        # from a stock client (which ignores it), and on a cache-armed current
+        # farm, where the job must go remote and not be P50.
+        {"name": "p50off-p43-worker", "scheduler": current, "worker": legacy,
+         "client": current, "p50_mode": "off"},
+        {"name": "p50off-p43-client", "scheduler": current, "worker": current,
+         "client": legacy, "p50_mode": "off"},
+        {"name": "p50off-current", "scheduler": current, "worker": current,
+         "client": current, "p50_mode": "off", "cache": "1"},
     )
 
 
@@ -116,13 +125,17 @@ def _run_case(
     case: dict[str, object] = {"name": name, "status": "FAIL", "images": spec.copy()}
     profile = spec.get("profile", "")
     strict_p50 = bool(profile)
+    # Cache sidecars on the worker and the client daemon: always for strict P50,
+    # and for a non-strict case that must prove P50 is skipped on a P50 farm.
+    cache_farm = strict_p50 or bool(spec.get("cache"))
+    p50_off = spec.get("p50_mode") == "off"
     scheduler_log_dir = root / "scheduler-logs"
     scheduler_log_dir.mkdir()
     worker_log_dir = root / "worker-logs"
     worker_log_dir.mkdir()
     client_log_dir = root / "client-logs"
     client_log_dir.mkdir()
-    if strict_p50:
+    if cache_farm:
         scheduler_log_dir.chmod(0o1777)
     total_memory_mb = memory_gb * 1024
     scheduler_memory_mb = max(128, total_memory_mb // 8)
@@ -165,12 +178,12 @@ def _run_case(
         worker_cache_args = (
             "--cache-service /opt/icecream/sbin/icecc-cache-service "
             "--cache-runtime-dir /var/cache/icecream/runtime-worker "
-            if strict_p50 else ""
+            if cache_farm else ""
         )
         worker_script = (
             "runtime_uid=$(id -u nobody); runtime_gid=$(id -g nobody); "
             "install -d -m 1777 /var/cache/icecream/envs /var/log/icecream && "
-            + ("install -d -m 700 /var/cache/icecream/runtime-worker && " if strict_p50 else "")
+            + ("install -d -m 700 /var/cache/icecream/runtime-worker && " if cache_farm else "")
             + "chown -R \"$runtime_uid:$runtime_gid\" /var/cache/icecream && exec "
             "/opt/icecream/sbin/iceccd -n \"$1\" -s scheduler "
             "-N qa-worker -m \"$2\" -u nobody -b /var/cache/icecream/envs "
@@ -227,10 +240,10 @@ def _run_case(
                 "set -eu",
                 "runtime_uid=$(id -u nobody); runtime_gid=$(id -g nobody)",
                 "install -d -m 1777 /var/cache/icecream/envs /var/log/icecream",
-                *(["install -d -m 700 /var/cache/icecream/runtime-client"] if strict_p50 else []),
+                *(["install -d -m 700 /var/cache/icecream/runtime-client"] if cache_farm else []),
                 "chown -R \"$runtime_uid:$runtime_gid\" /var/cache/icecream",
                 "cache_args=()",
-                *(["cache_args=(--cache-service /opt/icecream/sbin/icecc-cache-service --cache-runtime-dir /var/cache/icecream/runtime-client)"] if strict_p50 else []),
+                *(["cache_args=(--cache-service /opt/icecream/sbin/icecc-cache-service --cache-runtime-dir /var/cache/icecream/runtime-client)"] if cache_farm else []),
                 "/opt/icecream/sbin/iceccd -n \"$ICECC_NETNAME\" -s scheduler -N qa-client -m 0 "
                 "--no-remote -u nobody -l /qa-logs/client-daemon.log -vvv \"${cache_args[@]}\" &",
                 "daemon=$!",
@@ -256,6 +269,8 @@ def _run_case(
         env = ["--env", f"ICECC_NETNAME={network}", "--env", f"ICECC_CLIENT_VERSION={version}"]
         if strict_p50:
             env += ["--env", f"ICECC_P50_PROFILE={profile}"]
+        if p50_off:
+            env += ["--env", "ICECC_P50_MODE=off"]
         run.call(
             "client-compile",
             ["run", "--pull=never", "--name", client, "--label", expected,
@@ -277,6 +292,29 @@ def _run_case(
         if REMOTE_COMPILE_RE.search(worker_text) is None:
             raise MixedError(f"{name}: worker log does not prove successful remote compilation")
         evidence: dict[str, object] = {}
+        if p50_off:
+            # Remote and successful (proven above), and not P50: neither the
+            # client nor the worker shows any step of the P50 compile path.
+            if ("source committed for P50 CompileFile" in client_log
+                    or "P50 compiler connection" in client_log):
+                raise MixedError(f"{name}: client log shows P50 activity with the switch off")
+            if "P50 CompileFile attached exact" in worker_text:
+                raise MixedError(f"{name}: worker log shows a P50 input with the switch off")
+            if (spec["client"] == spec["scheduler"]
+                    and "ICECC_P50_MODE=off: not requesting P50" not in client_log):
+                raise MixedError(f"{name}: client did not log skipping P50")
+            evidence = {"p50_off": True, "p50_skipped": True}
+            if cache_farm:
+                scheduler_evidence = run.call("scheduler-evidence", ["logs", scheduler])
+                scheduler_text = scheduler_evidence.stdout + scheduler_evidence.stderr
+                scheduler_file = scheduler_log_dir / "scheduler.log"
+                if scheduler_file.is_file():
+                    scheduler_text += scheduler_file.read_text(encoding="utf-8", errors="replace")
+                if not re.search(r"RELOGIN qa-worker.*cache=\S+.*cache_profiles=", scheduler_text):
+                    raise MixedError(
+                        f"{name}: scheduler log does not prove the worker advertised a cache"
+                    )
+                evidence["cache_sidecar_advertisement"] = True
         if strict_p50:
             scheduler_evidence = run.call("scheduler-evidence", ["logs", scheduler])
             scheduler_text = scheduler_evidence.stdout + scheduler_evidence.stderr

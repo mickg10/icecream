@@ -34,6 +34,8 @@ if args[:2] == ['inspect', '--format']:
 if args[:1] == ['logs'] and any(arg.endswith('-worker') for arg in args):
     print('Remote compilation completed with exit code 0')
     joined = ' '.join(args)
+    if 'p50off-' in joined:
+        raise SystemExit(0)
     profile = ('ZSTD_TU' if {str(wrong_profile)} else
                'ZSTD_ROUTE' if 'p50-zstd-route' in joined else
                'ZSTD_TU' if 'p50-zstd-tu' in joined else 'P29V1')
@@ -52,7 +54,9 @@ if args[:1] == ['run'] and '--network-alias' not in args:
     profile = next((arg.split('=', 1)[1] for arg in args if arg.startswith('ICECC_P50_PROFILE=')), 'P29V1')
     p50 = ('P50 assignment identity bound for job 1\\n' + profile + ' source committed for P50 CompileFile\\n'
            if is_p50 else '')
-    (log_dir / 'icecc.log').write_text('Have to use host ' + host + ':10245 - Job ID: 1\\n' + p50)
+    skipped = ('ICECC_P50_MODE=off: not requesting P50 for this invocation\\n'
+               if 'ICECC_P50_MODE=off' in args and 'icecream-dev:current' in args else '')
+    (log_dir / 'icecc.log').write_text(skipped + 'Have to use host ' + host + ':10245 - Job ID: 1\\n' + p50)
     print('ICECREAM_MIXED_OK')
     raise SystemExit(0)
 if args[:1] == ['network'] and len(args) > 1 and args[1] == 'create':
@@ -90,6 +94,7 @@ def test_mixed_runner_covers_native_and_both_cross_generation_roles(tmp_path: Pa
     assert summary["status"] == "PASS"
     assert [case["name"] for case in summary["cases"]] == [
         "p50-p29v1", "p50-zstd-tu", "p50-zstd-route", "p43-worker", "p43-client",
+        "p50off-p43-worker", "p50off-p43-client", "p50off-current",
     ]
     assert all(case["status"] == "PASS" for case in summary["cases"])
     assert [case.get("selected_profile") for case in summary["cases"][:3]] == [
@@ -105,12 +110,13 @@ def test_mixed_runner_covers_native_and_both_cross_generation_roles(tmp_path: Pa
         and command[command.index("--network-alias") + 1] == "worker"
     ]
     assert worker_images == ["icecream-dev:current", "icecream-dev:current",
-                             "icecream-dev:current", "icecream-dev:p43", "icecream-dev:current"]
+                             "icecream-dev:current", "icecream-dev:p43", "icecream-dev:current",
+                             "icecream-dev:p43", "icecream-dev:current", "icecream-dev:current"]
     client_runs = [
         command for command in commands
         if command[:1] == ["run"] and "--network-alias" not in command
     ]
-    assert len(client_runs) == 5
+    assert len(client_runs) == 8
     assert all("--pull=never" in command for command in commands if command[:1] == ["run"])
     for command in (item for item in commands if item[:1] == ["run"]):
         image_index = next(i for i, arg in enumerate(command) if arg.startswith("icecream-dev:"))
@@ -122,13 +128,25 @@ def test_mixed_runner_covers_native_and_both_cross_generation_roles(tmp_path: Pa
         int(command[command.index("--memory") + 1][:-1])
         for command in commands if command[:1] == ["run"]
     ]
-    assert len(memory_caps) == 15
+    assert len(memory_caps) == 24
     assert all(sum(memory_caps[offset:offset + 3]) <= 8 * 1024
                for offset in range(0, len(memory_caps), 3))
     assert all("--cap-add" in command and "SYS_CHROOT" in command
                for command in commands if command[:1] == ["run"] and "worker" in command)
     assert all("--no-remote" in " ".join(command) and "-m 0" in " ".join(command)
                for command in client_runs)
+    off_cases = [case for case in summary["cases"] if case["name"].startswith("p50off-")]
+    assert all(case["p50_off"] is True and case["p50_skipped"] is True for case in off_cases)
+    assert off_cases[-1]["cache_sidecar_advertisement"] is True
+    off_client_runs = [
+        command for command in client_runs if any("p50off-" in arg for arg in command)
+    ]
+    assert len(off_client_runs) == 3
+    assert all("ICECC_P50_MODE=off" in command for command in off_client_runs)
+    assert not any("ICECC_P50_MODE" in " ".join(command)
+                   for command in client_runs if command not in off_client_runs)
+    assert not any("ICECC_P50_C1F1_REQUIRED=1" in " ".join(command)
+                   for command in off_client_runs)
     current_case_commands = [
         " ".join(command) for command in commands
         if command[:1] == ["run"] and "icecream-qa-" in " ".join(command)
@@ -144,12 +162,13 @@ def test_mixed_runner_covers_native_and_both_cross_generation_roles(tmp_path: Pa
                for command in current_case_commands)
     assert not any(command[:2] in (["system", "prune"], ["container", "prune"])
                    for command in commands)
-    assert len([command for command in commands if command[:2] == ["network", "create"]]) == 5
-    assert len([command for command in commands if command[:2] == ["network", "rm"]]) == 5
-    assert len([command for command in commands if command[:1] == ["rm"]]) == 15
+    assert len([command for command in commands if command[:2] == ["network", "create"]]) == 8
+    assert len([command for command in commands if command[:2] == ["network", "rm"]]) == 8
+    assert len([command for command in commands if command[:1] == ["rm"]]) == 24
     assert all((output / name / "source/probe.cpp").is_file()
                for name in ("p50-p29v1", "p50-zstd-tu", "p50-zstd-route",
-                            "p43-worker", "p43-client"))
+                            "p43-worker", "p43-client", "p50off-p43-worker",
+                            "p50off-p43-client", "p50off-current"))
 
 
 def test_docker_failure_is_recorded_and_only_owned_resources_are_cleaned(tmp_path: Path) -> None:
