@@ -322,7 +322,7 @@ else
                 "ICECC_P50_C1F1_WORKER_SCHEDULER_HOST=$e2e_host_ip" \
                 TMPDIR=/tmp ICEFARM_TMPDIR=/tmp \
                 make -C "$BUILD/unittests" -j"$JOBS" \
-                check TESTS="p50cacheservice p50cacheservice-sanitize.sh p50sourcearm-live-run.sh p50daemonpositive-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh envstore-run.sh p50remote-failreport.sh p50sidecarrefusal-run.sh p50statejsonl-warn.sh"
+                check TESTS="p50cacheservice p50cacheservice-sanitize.sh p50sourcearm-live-run.sh p50daemonpositive-run.sh stdfdsanitize-sidecar.sh envchardev.c.sh envstore-run.sh p50modeoff-run.sh p50remote-failreport.sh p50sidecarrefusal-run.sh p50statejsonl-warn.sh"
         fi
         # The six END-TO-END REMOTE-COMPILE tests skipped in every release QA
         # (they need root, a real non-loopback IP and the opt-in env gates) --

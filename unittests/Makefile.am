@@ -72,6 +72,10 @@ TESTS += p50cacheservice-routepipe-run.sh
 # end-to-end with the pre-captured source, cpp-failure parity (incl. the
 # gcc Error-103 local-rebuild recovery), and the scheduler-local row.
 TESTS += p50ppfirst-run.sh
+# Per-invocation P50 off switch: ICECC_P50_MODE in the client wrapper, proven
+# from the daemon logs (baseline, off, next invocation, bogus value, strict
+# conflict, remote-required).
+TESTS += p50modeoff-run.sh
 TESTS += assignment_identity_test
 TESTS += \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
@@ -665,6 +669,7 @@ EXTRA_DIST += p50daemoncontrol-source.sh p50daemoncontrol-mutants.sh \
 EXTRA_DIST += p50cacheservice-fcapacity-run.sh
 EXTRA_DIST += p50cacheservice-routepipe-run.sh
 EXTRA_DIST += p50ppfirst-run.sh
+EXTRA_DIST += p50modeoff-run.sh
 EXTRA_DIST += p50endpointcancel-run.sh \
 	p50endpoint-mutants.sh p50profile-digest-mutants.sh p50inputrecord-mutants.sh \
 	p50endpoint-sanitize.sh
