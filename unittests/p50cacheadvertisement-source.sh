@@ -292,8 +292,12 @@ require_count 1 'bool p50_retry_attempted = false;' client/main.cpp \
     'the fresh P50 reassignment has one wrapper-global retry budget'
 require_count 1 'error.errorCode != 106 || p50_retry_attempted' client/main.cpp \
     'only the first authenticated P50 loss can request reassignment'
-require_count 1 '!p50_retry_attempted || strict_p50,' client/main.cpp \
+require_count 1 '(!p50_retry_attempted || strict_p50),' client/main.cpp \
     'a normal retry sends canonical absence while a strict retry requests P50 again'
+require_count 1 'p50_cache_mode_allows_p50(p50_mode)' client/main.cpp \
+    'the wrapper reads ICECC_P50_MODE once, with the daemon rule, per invocation'
+require_count 1 'p50_allowed &&' client/main.cpp \
+    'an invocation with ICECC_P50_MODE off sends canonical absence on every attempt'
 require_count 1 'strict_p50 && !error.hasRetryAvoidEndpoint()' client/main.cpp \
     'strict Error106 without an exact failed endpoint fails closed'
 require_count 1 'p50_retry_avoid_host = error.retryAvoidHost;' client/main.cpp \
