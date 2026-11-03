@@ -109,19 +109,61 @@ tar -tzf "$workdir/env.tgz" | grep -q "dev/null" || fail "fixture lacks dev/null
 mkdir -p "$workdir/envsA" "$workdir/envsB" "$workdir/homeA" "$workdir/homeB"
 chown -R "$icecc_user" "$workdir"
 
+# Probe-bound ports, not the defaults: the scheduler's 8765 (and the daemons'
+# 10245/10246) are also taken by other tests in the same parallel root stage
+# (p50remote-failreport.sh starts a scheduler on 8765), and the loser dies at
+# bind.  The scheduler binds its port AND port+1, so probe the pair; the
+# daemons then name it with -s instead of finding it by broadcast, on a real
+# (non-loopback) address as the scheduler registers daemons by peer address.
+# 45000-49999 is disjoint from the other e2e tests' bands.
+sched_addr=$(hostname -I 2>/dev/null | awk '{print $1}')
+case "$sched_addr" in
+""|127.*) echo "envchardev: skipping (no non-loopback IPv4 address)" >&2; exit 77 ;;
+esac
+ports=$(python3 - $$ <<'PY'
+import socket, sys
+def free(*ports):
+    socks = []
+    try:
+        for port in ports:
+            sock = socket.socket()
+            socks.append(sock)
+            sock.bind(("", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in socks:
+            sock.close()
+for port in range(45000 + int(sys.argv[1]) % 4000, 49990):
+    if free(port, port + 1, port + 2, port + 3):
+        print(port, port + 2, port + 3)
+        raise SystemExit(0)
+raise SystemExit("no free ports in 45000-49999")
+PY
+) || fail "no free scheduler/daemon ports"
+set -- $ports
+sched_port=$1 portA=$2 portB=$3
+
 # ICECC_TEST_SOCKET on EACH daemon pins its unix socket (a root-started
 # daemon with CAP_SYS_CHROOT binds the DEFAULT /var/run/icecc path, NOT
 # $HOME/.iceccd.socket -- and both daemons would race the same default;
 # the client below connects to daemon A's pinned path).
-ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$SCHEDULER" -vvv -n envchardevnet -l "$workdir/sched.log" &
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$SCHEDULER" -vvv -p "$sched_port" -n envchardevnet -l "$workdir/sched.log" &
 sched_pid=$!
 sleep 1
-ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$ICECCD" -vv -n envchardevnet -N localnode -p 10245 \
-    -b "$workdir/envsA" -l "$workdir/daemonA.log" &
+ICECC_TEST_SOCKET="$workdir/a.sock" HOME="$workdir/homeA" "$ICECCD" -vv -n envchardevnet -N localnode -p "$portA" \
+    -s "$sched_addr:$sched_port" -b "$workdir/envsA" -l "$workdir/daemonA.log" &
 daemonA_pid=$!
-ICECC_TEST_SOCKET="$workdir/b.sock" HOME="$workdir/homeB" "$ICECCD" -vv -n envchardevnet -N remotenode -p 10246 \
-    -b "$workdir/envsB" -l "$workdir/daemonB.log" &
+ICECC_TEST_SOCKET="$workdir/b.sock" HOME="$workdir/homeB" "$ICECCD" -vv -n envchardevnet -N remotenode -p "$portB" \
+    -s "$sched_addr:$sched_port" -b "$workdir/envsB" -l "$workdir/daemonB.log" &
 daemonB_pid=$!
+# With -s the daemons connect on their own timer (a few seconds), not at the
+# first broadcast: wait for BOTH logins, then the 4s+ eligibility settle.
+for _ in $(seq 1 60); do
+    [ "$(grep -c 'login ' "$workdir/sched.log" 2>/dev/null)" -ge 2 ] && break
+    sleep 0.5
+done
 sleep 5
 for pid in $sched_pid $daemonA_pid $daemonB_pid; do
     kill -0 "$pid" 2>/dev/null || fail "a daemon exited early: $(tail -3 "$workdir"/*.log 2>/dev/null)"
