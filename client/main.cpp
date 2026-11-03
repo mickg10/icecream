@@ -213,6 +213,8 @@ static void dcc_show_usage()
         "                              If set to \"disable\", just exec the real compiler, but without\n"
         "                              notifying the daemon and only run one job at a time.\n"
         "   ICECC_VERSION              use a specific icecc environment, see icecc-create-env\n"
+        "   ICECC_P50_MODE             unset or \"on\": request P50 cache assignments (default); any\n"
+        "                              other value, e.g. \"off\": do not request P50 for this invocation.\n"
         "   ICECC_DEBUG                [info | warning | debug]\n"
         "                              sets verboseness of icecream client.\n"
         "   ICECC_LOGFILE              if set, additional debug information is logged to the specified file\n"
@@ -726,13 +728,28 @@ int main(int argc, char **argv)
                 getenv("ICECC_P50_C1F1_REQUIRED") != nullptr;
             const bool remote_required_retry =
                 getenv("ICECC_REMOTE_REQUIRED") != nullptr;
+            /* ICECC_P50_MODE, read here only: anything but unset/`on` makes
+               this invocation omit the cache request, exactly the canonical
+               absence the bounded legacy retry uses. */
+            const char *p50_mode = getenv("ICECC_P50_MODE");
+            const bool p50_allowed = p50_cache_mode_allows_p50(p50_mode);
+            if (!p50_allowed) {
+                if (strict_p50) {
+                    throw client_error(
+                        22, "Error 22 - ICECC_P50_C1F1_REQUIRED conflicts with ICECC_P50_MODE=" +
+                                string(p50_mode));
+                }
+                trace() << "ICECC_P50_MODE=" << p50_mode
+                        << ": not requesting P50 for this invocation" << endl;
+            }
             bool p50_retry_attempted = false;
             string p50_retry_avoid_host;
             uint32_t p50_retry_avoid_port = 0;
             for (;;) {
                 try {
                     ret = build_remote(job, local_daemon, envs, rate,
-                                       !p50_retry_attempted || strict_p50,
+                                       p50_allowed &&
+                                           (!p50_retry_attempted || strict_p50),
                                        p50_retry_avoid_host,
                                        p50_retry_avoid_port);
                     break;

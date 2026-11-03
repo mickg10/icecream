@@ -520,12 +520,20 @@ inline bool p50_cache_client_request_is_valid(
    Protocol-50 clients run the retained revision-one profiles by default;
    exact `off` is the kill switch.  An explicit value other than `on`/`off`
    is malformed and fails closed rather than guessing operator intent. */
+/* The one definition of ICECC_P50_MODE for both processes: unset or exactly
+   `on` allows P50; any other value (including an empty string) does not.  The
+   daemon applies it per host, the client wrapper per invocation. */
+inline bool p50_cache_mode_allows_p50(const char *mode) noexcept
+{
+    return mode == nullptr || std::string_view(mode) == "on";
+}
+
 inline P50CacheClientCapability p50_cache_client_capability_from_mode(
     const char *mode, int wrapper_protocol) noexcept
 {
     if (wrapper_protocol < PROTOCOL_VERSION_CACHE_ADVERTISEMENT)
         return {};
-    if (mode != nullptr && std::string_view(mode) != "on")
+    if (!p50_cache_mode_allows_p50(mode))
         return {};
     return {CACHE_WIRE_REVISION, CACHE_ADVERTISABLE_PROFILE_MASK};
 }

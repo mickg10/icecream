@@ -38,6 +38,11 @@ An explicit `ICECC_P50_PROFILE` request is exact; `OFF` suppresses cache
 assignment. P29 v0, GRZ and streaming experiment labels are not alternatives
 that a failed transaction can silently select.
 
+P50 can be switched off at three levels: the daemon's `ICECC_P50_MODE` (per
+host), the scheduler's `ICECC_P50_PROFILE=OFF` (the whole farm) and the client
+wrapper's `ICECC_P50_MODE=off` (one invocation: the wrapper omits the cache
+request, as for the legacy retry). Unset or `on` is on; any other value is off.
+
 On a protocol-50 scheduler link, Login appends three network-order u32 words:
 cache endpoint port, CacheWire revision, and profile mask. Absence is exactly
 `(0, 0, 0)`. Presence requires port 1..65535, revision 1 and a nonempty known
